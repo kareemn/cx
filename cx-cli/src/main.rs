@@ -21,10 +21,23 @@ enum Commands {
         /// Search query
         query: String,
     },
+    /// Inspect a symbol's edges
+    Inspect {
+        /// Symbol name to inspect
+        symbol: String,
+    },
+    /// Show edge summary or list edges
+    Edges {
+        /// Filter by edge kind (e.g., Calls, Imports, Contains)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Max edges to show
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
 }
 
 fn main() {
-    // Reset SIGPIPE to default behavior so piping to `head` etc. exits cleanly
     #[cfg(unix)]
     {
         unsafe {
@@ -39,6 +52,8 @@ fn main() {
         Commands::Init => commands::init::run(&root),
         Commands::Context => commands::context::run(&root),
         Commands::Search { ref query } => commands::search::run(&root, query),
+        Commands::Inspect { ref symbol } => commands::inspect::run(&root, symbol),
+        Commands::Edges { ref kind, limit } => commands::edges::run(&root, kind.as_deref(), limit),
     };
 
     if let Err(e) = result {
