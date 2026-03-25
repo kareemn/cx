@@ -1,3 +1,4 @@
+pub mod connection_patterns;
 pub mod database;
 pub mod dockerfile;
 pub mod envvar;

@@ -60,10 +60,25 @@ const CAPTURE_TYPE_DEF: &str = "type.def";
 const CAPTURE_PKG_NAME: &str = "pkg.name";
 const CAPTURE_PKG_DEF: &str = "pkg.def";
 
+// Connection pattern capture names
+const CAPTURE_ENDPOINT_PATH: &str = "endpoint.path";
+const CAPTURE_ENDPOINT_DEF: &str = "endpoint.def";
+const CAPTURE_ENDPOINT_METHOD: &str = "endpoint.method";
+const CAPTURE_HTTP_CALL_URL: &str = "http_call.url";
+const CAPTURE_HTTP_CALL_SITE: &str = "http_call.site";
+const CAPTURE_WS_PATH: &str = "ws.path";
+const CAPTURE_WS_DEF: &str = "ws.def";
+const CAPTURE_MQ_TOPIC: &str = "mq.topic";
+const CAPTURE_MQ_PUBLISH: &str = "mq.publish";
+const CAPTURE_MQ_SUBSCRIBE: &str = "mq.subscribe";
+const CAPTURE_ENVVAR_NAME: &str = "envvar.name";
+const CAPTURE_ENVVAR_SITE: &str = "envvar.site";
+
 /// UniversalExtractor processes tree-sitter query matches into ExtractionResult
 /// using standardized capture names.
 pub struct UniversalExtractor {
     query: tree_sitter::Query,
+    // Symbol capture indices
     func_name_idx: Option<u32>,
     func_def_idx: Option<u32>,
     call_name_idx: Option<u32>,
@@ -75,6 +90,20 @@ pub struct UniversalExtractor {
     type_def_idx: Option<u32>,
     pkg_name_idx: Option<u32>,
     pkg_def_idx: Option<u32>,
+    // Connection pattern capture indices
+    endpoint_path_idx: Option<u32>,
+    endpoint_def_idx: Option<u32>,
+    #[allow(dead_code)]
+    endpoint_method_idx: Option<u32>,
+    http_call_url_idx: Option<u32>,
+    http_call_site_idx: Option<u32>,
+    ws_path_idx: Option<u32>,
+    ws_def_idx: Option<u32>,
+    mq_topic_idx: Option<u32>,
+    mq_publish_idx: Option<u32>,
+    mq_subscribe_idx: Option<u32>,
+    envvar_name_idx: Option<u32>,
+    envvar_site_idx: Option<u32>,
 }
 
 impl UniversalExtractor {
@@ -104,6 +133,19 @@ impl UniversalExtractor {
             type_def_idx: find_capture(CAPTURE_TYPE_DEF),
             pkg_name_idx: find_capture(CAPTURE_PKG_NAME),
             pkg_def_idx: find_capture(CAPTURE_PKG_DEF),
+            // Connection pattern captures
+            endpoint_path_idx: find_capture(CAPTURE_ENDPOINT_PATH),
+            endpoint_def_idx: find_capture(CAPTURE_ENDPOINT_DEF),
+            endpoint_method_idx: find_capture(CAPTURE_ENDPOINT_METHOD),
+            http_call_url_idx: find_capture(CAPTURE_HTTP_CALL_URL),
+            http_call_site_idx: find_capture(CAPTURE_HTTP_CALL_SITE),
+            ws_path_idx: find_capture(CAPTURE_WS_PATH),
+            ws_def_idx: find_capture(CAPTURE_WS_DEF),
+            mq_topic_idx: find_capture(CAPTURE_MQ_TOPIC),
+            mq_publish_idx: find_capture(CAPTURE_MQ_PUBLISH),
+            mq_subscribe_idx: find_capture(CAPTURE_MQ_SUBSCRIBE),
+            envvar_name_idx: find_capture(CAPTURE_ENVVAR_NAME),
+            envvar_site_idx: find_capture(CAPTURE_ENVVAR_SITE),
             query,
         })
     }
@@ -128,6 +170,12 @@ impl UniversalExtractor {
 
         // Collect import paths for creating Imports edges
         let mut import_paths: Vec<String> = Vec::new();
+
+        // Connection pattern collections for second-pass edge resolution
+        let mut endpoint_defs: Vec<(NodeId, usize)> = Vec::new();
+        let mut http_call_defs: Vec<(NodeId, usize)> = Vec::new();
+        let mut mq_defs: Vec<(NodeId, usize, EdgeKind)> = Vec::new();
+        let mut envvar_defs: Vec<(NodeId, usize)> = Vec::new();
 
         // Single pass: collect definitions and call sites
         let mut cursor = tree_sitter::QueryCursor::new();
@@ -217,6 +265,122 @@ impl UniversalExtractor {
                     .unwrap_or(0);
                 call_sites.push((call_name.to_string(), byte_offset));
             }
+
+            // ─── Connection pattern captures ───────────────────────────
+
+            // HTTP Endpoint detection (@endpoint.path + @endpoint.def)
+            if let Some(path_text) = self.capture_text(self.endpoint_path_idx, m, file.source) {
+                let path_clean = path_text.trim_matches(|c: char| c == '"' || c == '\'' || c == '`');
+                let name_id = strings.intern(path_clean);
+                let node_id = *id_counter;
+                *id_counter += 1;
+                let mut node = Node::new(node_id, NodeKind::Endpoint, name_id);
+                node.sub_kind = 0; // HTTP
+                node.file = file.path;
+                node.repo = file.repo_id;
+                if let Some(def_node) = self.capture_node(self.endpoint_def_idx, m) {
+                    node.line = def_node.start_position().row as u32 + 1;
+                    endpoint_defs.push((node_id, def_node.start_byte()));
+                }
+                result.nodes.push(node);
+            }
+
+            // WebSocket Endpoint detection (@ws.path + @ws.def)
+            if let Some(ws_path) = self.capture_text(self.ws_path_idx, m, file.source) {
+                let path_clean = ws_path.trim_matches(|c: char| c == '"' || c == '\'' || c == '`');
+                let name_id = strings.intern(path_clean);
+                let node_id = *id_counter;
+                *id_counter += 1;
+                let mut node = Node::new(node_id, NodeKind::Endpoint, name_id);
+                node.sub_kind = 1; // WebSocket
+                node.file = file.path;
+                node.repo = file.repo_id;
+                if let Some(def_node) = self.capture_node(self.ws_def_idx, m) {
+                    node.line = def_node.start_position().row as u32 + 1;
+                    endpoint_defs.push((node_id, def_node.start_byte()));
+                }
+                result.nodes.push(node);
+            } else if self.capture_node(self.ws_def_idx, m).is_some()
+                && self.capture_text(self.endpoint_path_idx, m, file.source).is_none()
+            {
+                // WS upgrade/accept call without explicit path
+                let name_id = strings.intern("websocket");
+                let node_id = *id_counter;
+                *id_counter += 1;
+                let mut node = Node::new(node_id, NodeKind::Endpoint, name_id);
+                node.sub_kind = 1; // WebSocket
+                node.file = file.path;
+                node.repo = file.repo_id;
+                if let Some(def_node) = self.capture_node(self.ws_def_idx, m) {
+                    node.line = def_node.start_position().row as u32 + 1;
+                    endpoint_defs.push((node_id, def_node.start_byte()));
+                }
+                result.nodes.push(node);
+            }
+
+            // HTTP Client call detection (@http_call.url + @http_call.site)
+            if let Some(url_text) = self.capture_text(self.http_call_url_idx, m, file.source) {
+                let url_clean = url_text.trim_matches(|c: char| c == '"' || c == '\'' || c == '`');
+                let name_id = strings.intern(url_clean);
+                let node_id = *id_counter;
+                *id_counter += 1;
+                let mut node = Node::new(node_id, NodeKind::Endpoint, name_id);
+                node.sub_kind = 0; // HTTP
+                node.file = file.path;
+                node.repo = file.repo_id;
+                if let Some(site_node) = self.capture_node(self.http_call_site_idx, m) {
+                    node.line = site_node.start_position().row as u32 + 1;
+                    http_call_defs.push((node_id, site_node.start_byte()));
+                }
+                result.nodes.push(node);
+            }
+
+            // Message Queue detection (@mq.topic + @mq.publish/@mq.subscribe)
+            if let Some(topic_text) = self.capture_text(self.mq_topic_idx, m, file.source) {
+                let is_publish = self.capture_node(self.mq_publish_idx, m).is_some();
+                let is_subscribe = self.capture_node(self.mq_subscribe_idx, m).is_some();
+                if is_publish || is_subscribe {
+                    let topic_clean =
+                        topic_text.trim_matches(|c: char| c == '"' || c == '\'' || c == '`');
+                    let name_id = strings.intern(topic_clean);
+                    let node_id = *id_counter;
+                    *id_counter += 1;
+                    let mut node = Node::new(node_id, NodeKind::Endpoint, name_id);
+                    node.sub_kind = 3; // Message Queue
+                    node.file = file.path;
+                    node.repo = file.repo_id;
+                    let (edge_kind, def_node) = if is_publish {
+                        (EdgeKind::Publishes, self.capture_node(self.mq_publish_idx, m))
+                    } else {
+                        (
+                            EdgeKind::Subscribes,
+                            self.capture_node(self.mq_subscribe_idx, m),
+                        )
+                    };
+                    if let Some(dn) = def_node {
+                        node.line = dn.start_position().row as u32 + 1;
+                        mq_defs.push((node_id, dn.start_byte(), edge_kind));
+                    }
+                    result.nodes.push(node);
+                }
+            }
+
+            // Environment variable detection (@envvar.name + @envvar.site)
+            if let Some(name_text) = self.capture_text(self.envvar_name_idx, m, file.source) {
+                let name_clean =
+                    name_text.trim_matches(|c: char| c == '"' || c == '\'' || c == '`');
+                let name_id = strings.intern(name_clean);
+                let node_id = *id_counter;
+                *id_counter += 1;
+                let mut node = Node::new(node_id, NodeKind::Resource, name_id);
+                node.file = file.path;
+                node.repo = file.repo_id;
+                if let Some(site_node) = self.capture_node(self.envvar_site_idx, m) {
+                    node.line = site_node.start_position().row as u32 + 1;
+                    envvar_defs.push((node_id, site_node.start_byte()));
+                }
+                result.nodes.push(node);
+            }
         }
 
         // Second pass: resolve call edges
@@ -241,6 +405,54 @@ impl UniversalExtractor {
                         .edges
                         .push(EdgeInput::new(caller_id, target_id, EdgeKind::Calls));
                 }
+            }
+        }
+
+        // Resolve Exposes edges: enclosing function → endpoint
+        for &(endpoint_id, byte_offset) in &endpoint_defs {
+            if let Some(&(_, caller_id, _, _)) = defined_symbols
+                .iter()
+                .find(|(_, _, start, end)| *start <= byte_offset && byte_offset < *end)
+            {
+                result
+                    .edges
+                    .push(EdgeInput::new(caller_id, endpoint_id, EdgeKind::Exposes));
+            }
+        }
+
+        // Resolve Connects edges: enclosing function → http_call target
+        for &(target_id, byte_offset) in &http_call_defs {
+            if let Some(&(_, caller_id, _, _)) = defined_symbols
+                .iter()
+                .find(|(_, _, start, end)| *start <= byte_offset && byte_offset < *end)
+            {
+                result
+                    .edges
+                    .push(EdgeInput::new(caller_id, target_id, EdgeKind::Connects));
+            }
+        }
+
+        // Resolve Publishes/Subscribes edges: enclosing function → topic
+        for &(topic_id, byte_offset, edge_kind) in &mq_defs {
+            if let Some(&(_, caller_id, _, _)) = defined_symbols
+                .iter()
+                .find(|(_, _, start, end)| *start <= byte_offset && byte_offset < *end)
+            {
+                result
+                    .edges
+                    .push(EdgeInput::new(caller_id, topic_id, edge_kind));
+            }
+        }
+
+        // Resolve Configures edges: enclosing function → envvar
+        for &(envvar_id, byte_offset) in &envvar_defs {
+            if let Some(&(_, caller_id, _, _)) = defined_symbols
+                .iter()
+                .find(|(_, _, start, end)| *start <= byte_offset && byte_offset < *end)
+            {
+                result
+                    .edges
+                    .push(EdgeInput::new(caller_id, envvar_id, EdgeKind::Configures));
             }
         }
 

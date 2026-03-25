@@ -50,16 +50,25 @@ pub const CPP_QUERY: &str = include_str!("../queries/cpp-symbols.scm");
 
 /// Create a UniversalExtractor for a given language.
 /// Returns None if no query is available for this language yet.
+///
+/// Combines the language's symbol query with connection pattern queries
+/// (HTTP server/client, WebSocket, message queue, env var detection).
 pub fn extractor_for_language(lang: Language) -> Option<UniversalExtractor> {
     let ts_lang = lang.ts_language();
-    let query_src = match lang {
+    let symbol_query = match lang {
         Language::Go => GO_QUERY,
         Language::Python => PYTHON_QUERY,
         Language::TypeScript => TYPESCRIPT_QUERY,
         Language::C => C_QUERY,
         Language::Cpp => CPP_QUERY,
     };
-    UniversalExtractor::new(&ts_lang, query_src).ok()
+    let conn_queries = crate::connection_patterns::connection_queries(lang);
+    if conn_queries.is_empty() {
+        UniversalExtractor::new(&ts_lang, symbol_query).ok()
+    } else {
+        let combined = format!("{}\n{}", symbol_query, conn_queries);
+        UniversalExtractor::new(&ts_lang, &combined).ok()
+    }
 }
 
 #[cfg(test)]
