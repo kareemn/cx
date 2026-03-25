@@ -71,8 +71,7 @@ impl KindIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::csr::{CsrGraph, EdgeInput};
-    use crate::graph::edges::EdgeKind;
+    use crate::graph::csr::CsrGraph;
     use crate::graph::string_interner::StringInterner;
 
     #[test]

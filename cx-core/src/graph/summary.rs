@@ -159,7 +159,6 @@ impl SummaryGraph {
 mod tests {
     use super::*;
     use crate::graph::bitvec::BitVec;
-    use crate::graph::edges::ALL_EDGES;
 
     /// Build test graph: 3 Deployables (A, B, C) each with 100 symbols.
     /// Symbols in A call symbols in B. Symbols in B call symbols in C.
