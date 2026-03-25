@@ -1,5 +1,9 @@
 pub mod discovery;
 pub mod envvar_resolution;
+pub mod helm_env_resolution;
+pub mod image_resolution;
 pub mod k8s_dns;
 pub mod proto_matching;
+pub mod rest_resolution;
 pub mod resolver;
+pub mod websocket_resolution;

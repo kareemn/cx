@@ -84,6 +84,10 @@ const CAPTURE_MQ_SUBSCRIBE: &str = "mq.subscribe";
 const CAPTURE_ENVVAR_NAME: &str = "envvar.name";
 const CAPTURE_ENVVAR_SITE: &str = "envvar.site";
 
+// Resource detection capture names (Redis, GCS, OpenAI SDK, etc.)
+const CAPTURE_RESOURCE_NAME: &str = "resource.name";
+const CAPTURE_RESOURCE_DEF: &str = "resource.def";
+
 // Variable reference capture names (for local constant propagation)
 const CAPTURE_ENDPOINT_PATH_VAR: &str = "endpoint.path_var";
 const CAPTURE_HTTP_CALL_URL_VAR: &str = "http_call.url_var";
@@ -154,6 +158,33 @@ impl LocalConstantMap {
     }
 }
 
+/// Check if a file path matches the Next.js App Router API route convention.
+fn is_nextjs_api_route(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+    if stem != "route" || !matches!(ext, "ts" | "tsx" | "js" | "jsx") {
+        return false;
+    }
+    // Must contain "app/api/" in the path
+    path.contains("app/api/")
+}
+
+/// Extract the API route path from a Next.js App Router file path.
+/// e.g., "src/app/api/users/[id]/route.ts" → "/api/users/[id]"
+fn nextjs_route_path(path: &str) -> String {
+    if let Some(idx) = path.find("app/api/") {
+        let suffix = &path[idx + 4..]; // skip "app/" → "api/..."
+        let route_dir = std::path::Path::new(suffix)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "api".to_string());
+        format!("/{}", route_dir)
+    } else {
+        "/api".to_string()
+    }
+}
+
 /// UniversalExtractor processes tree-sitter query matches into ExtractionResult
 /// using standardized capture names.
 pub struct UniversalExtractor {
@@ -184,6 +215,9 @@ pub struct UniversalExtractor {
     mq_subscribe_idx: Option<u32>,
     envvar_name_idx: Option<u32>,
     envvar_site_idx: Option<u32>,
+    // Resource detection capture indices (Redis, GCS, OpenAI SDK, etc.)
+    resource_name_idx: Option<u32>,
+    resource_def_idx: Option<u32>,
     // Variable reference capture indices (for constant propagation)
     endpoint_path_var_idx: Option<u32>,
     http_call_url_var_idx: Option<u32>,
@@ -234,6 +268,9 @@ impl UniversalExtractor {
             mq_subscribe_idx: find_capture(CAPTURE_MQ_SUBSCRIBE),
             envvar_name_idx: find_capture(CAPTURE_ENVVAR_NAME),
             envvar_site_idx: find_capture(CAPTURE_ENVVAR_SITE),
+            // Resource detection captures
+            resource_name_idx: find_capture(CAPTURE_RESOURCE_NAME),
+            resource_def_idx: find_capture(CAPTURE_RESOURCE_DEF),
             // Variable reference captures
             endpoint_path_var_idx: find_capture(CAPTURE_ENDPOINT_PATH_VAR),
             http_call_url_var_idx: find_capture(CAPTURE_HTTP_CALL_URL_VAR),
@@ -515,6 +552,35 @@ impl UniversalExtractor {
                 result.nodes.push(node);
             }
 
+            // Resource detection (@resource.name + @resource.def) — Redis, GCS, OpenAI SDK, etc.
+            // @resource.def is required; @resource.name is optional (fallback to "resource")
+            if self.capture_node(self.resource_def_idx, m).is_some() {
+                let name_text = self.capture_text(self.resource_name_idx, m, file.source);
+                let name_clean = name_text
+                    .map(|t| t.trim_matches(|c: char| c == '"' || c == '\'' || c == '`'))
+                    .unwrap_or("resource");
+                let name_id = strings.intern(name_clean);
+                let node_id = *id_counter;
+                *id_counter += 1;
+                let mut node = Node::new(node_id, NodeKind::Resource, name_id);
+                node.file = file.path;
+                node.repo = file.repo_id;
+                if let Some(def_node) = self.capture_node(self.resource_def_idx, m) {
+                    node.line = def_node.start_position().row as u32 + 1;
+                    // Resolve Connects edge from enclosing function
+                    let byte_offset = def_node.start_byte();
+                    if let Some(&(_, caller_id, _, _)) = defined_symbols
+                        .iter()
+                        .find(|(_, _, start, end)| *start <= byte_offset && byte_offset < *end)
+                    {
+                        result
+                            .edges
+                            .push(EdgeInput::new(caller_id, node_id, EdgeKind::Connects));
+                    }
+                }
+                result.nodes.push(node);
+            }
+
             // ─── Variable reference captures (for constant propagation) ──
             if let Some(var_name) = self.capture_text(self.endpoint_path_var_idx, m, file.source) {
                 let byte_offset = self
@@ -716,6 +782,36 @@ impl UniversalExtractor {
                 result
                     .edges
                     .push(EdgeInput::new(pkg_id, import_node_id, EdgeKind::Imports));
+            }
+        }
+
+        // Next.js App Router API route detection:
+        // Files at app/api/**/route.{ts,tsx} with exported GET/POST/PUT/DELETE/PATCH
+        // functions should create Endpoint nodes.
+        if is_nextjs_api_route(file.path_str) {
+            let route_path = nextjs_route_path(file.path_str);
+            for &(name_id, symbol_id, _, _) in &defined_symbols {
+                let name = strings.get(name_id);
+                if matches!(name, "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS") {
+                    let endpoint_name = format!("{} {}", name, route_path);
+                    let ep_name_id = strings.intern(&endpoint_name);
+                    let ep_id = *id_counter;
+                    *id_counter += 1;
+                    let mut ep_node = Node::new(ep_id, NodeKind::Endpoint, ep_name_id);
+                    ep_node.sub_kind = 0; // HTTP
+                    ep_node.file = file.path;
+                    ep_node.repo = file.repo_id;
+                    // Use the symbol's line number
+                    let sym_node = result.nodes.iter().find(|n| n.id == symbol_id);
+                    if let Some(sn) = sym_node {
+                        ep_node.line = sn.line;
+                    }
+                    result.nodes.push(ep_node);
+                    // Exposes edge: handler function → endpoint
+                    result
+                        .edges
+                        .push(EdgeInput::new(symbol_id, ep_id, EdgeKind::Exposes));
+                }
             }
         }
 
@@ -1064,6 +1160,410 @@ void S2SClient::on_connect(int ec, int ep) {
             "should resolve C++ variable to string literal via constant propagation: got {:?}",
             endpoints
         );
+    }
+
+    // ─── WebSocket client detection tests ───────────────────────────
+
+    #[test]
+    fn go_websocket_dial() {
+        let (result, strings) = extract_go(
+            r#"package main
+
+import "github.com/gorilla/websocket"
+
+func connect() {
+    conn, _, _ := websocket.Dial("ws://localhost:8080/ws", nil)
+    _ = conn
+}
+"#,
+            "client.go",
+        );
+        let endpoints: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Endpoint as u8 && n.sub_kind == 1)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            endpoints.iter().any(|e| e.contains("ws://localhost:8080/ws")),
+            "should detect websocket.Dial() client: got {:?}",
+            endpoints
+        );
+    }
+
+    #[test]
+    fn go_websocket_upgrade_server() {
+        let (result, strings) = extract_go(
+            r#"package main
+
+import "github.com/gorilla/websocket"
+
+var upgrader = websocket.Upgrader{}
+
+func handler() {
+    conn, _ := upgrader.Upgrade(w, r, nil)
+    _ = conn
+}
+"#,
+            "server.go",
+        );
+        let endpoints: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Endpoint as u8 && n.sub_kind == 1)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            endpoints.contains(&"websocket"),
+            "should detect upgrader.Upgrade() server: got {:?}",
+            endpoints
+        );
+    }
+
+    // ─── Resource detection tests ─────────────────────────────────────
+
+    #[test]
+    fn go_redis_detection() {
+        let (result, strings) = extract_go(
+            r#"package main
+
+import "github.com/go-redis/redis"
+
+func initRedis() {
+    client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+    _ = client
+}
+"#,
+            "cache.go",
+        );
+        let resources: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Resource as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            resources.contains(&"redis"),
+            "should detect redis.NewClient(): got {:?}",
+            resources
+        );
+        // Should have a Connects edge from initRedis → redis resource
+        let has_connects = result.edges.iter().any(|e| e.kind == EdgeKind::Connects);
+        assert!(has_connects, "should have Connects edge to redis resource");
+    }
+
+    #[test]
+    fn go_storage_detection() {
+        let (result, strings) = extract_go(
+            r#"package main
+
+import "cloud.google.com/go/storage"
+
+func initStorage() {
+    client, _ := storage.NewClient(ctx)
+    _ = client
+}
+"#,
+            "storage.go",
+        );
+        let resources: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Resource as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            resources.contains(&"storage"),
+            "should detect storage.NewClient(): got {:?}",
+            resources
+        );
+    }
+
+    #[test]
+    fn go_openai_sdk_detection() {
+        let (result, strings) = extract_go(
+            r#"package main
+
+import "github.com/openai/openai-go"
+
+func callLLM() {
+    client := openai.NewClient(option.WithBaseURL(baseURL))
+    _ = client
+}
+"#,
+            "llm.go",
+        );
+        let resources: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Resource as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            resources.contains(&"openai"),
+            "should detect openai.NewClient(): got {:?}",
+            resources
+        );
+    }
+
+    /// Helper: parse TypeScript source and extract
+    fn extract_ts(source: &str, path: &str) -> (ExtractionResult, StringInterner) {
+        let lang: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(source.as_bytes(), None).unwrap();
+        let extractor =
+            crate::grammars::extractor_for_language(crate::grammars::Language::TypeScript).unwrap();
+        let mut strings = StringInterner::new();
+        let path_id = strings.intern(path);
+        let file = ParsedFile {
+            tree,
+            source: source.as_bytes(),
+            path: path_id,
+            path_str: path,
+            repo_id: 0,
+        };
+        let mut id = 0u32;
+        let result = extractor.extract(&file, &mut strings, &mut id);
+        (result, strings)
+    }
+
+    #[test]
+    fn ts_websocket_client() {
+        let (result, strings) = extract_ts(
+            r#"function connect() {
+    const ws = new WebSocket('ws://localhost:8080/translate');
+}
+"#,
+            "client.ts",
+        );
+        let endpoints: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Endpoint as u8 && n.sub_kind == 1)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            endpoints.iter().any(|e| e.contains("ws://localhost:8080/translate")),
+            "should detect new WebSocket(url): got {:?}",
+            endpoints
+        );
+    }
+
+    #[test]
+    fn ts_redis_detection() {
+        let (result, strings) = extract_ts(
+            r#"function initCache() {
+    const redis = new Redis({ host: 'localhost' });
+}
+"#,
+            "cache.ts",
+        );
+        let resources: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Resource as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            resources.contains(&"Redis"),
+            "should detect new Redis(): got {:?}",
+            resources
+        );
+    }
+
+    #[test]
+    fn ts_storage_detection() {
+        let (result, strings) = extract_ts(
+            r#"function initGCS() {
+    const storage = new Storage();
+}
+"#,
+            "storage.ts",
+        );
+        let resources: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Resource as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            resources.contains(&"Storage"),
+            "should detect new Storage(): got {:?}",
+            resources
+        );
+    }
+
+    /// Helper: parse Python source and extract
+    fn extract_py(source: &str, path: &str) -> (ExtractionResult, StringInterner) {
+        let lang: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(source.as_bytes(), None).unwrap();
+        let extractor =
+            crate::grammars::extractor_for_language(crate::grammars::Language::Python).unwrap();
+        let mut strings = StringInterner::new();
+        let path_id = strings.intern(path);
+        let file = ParsedFile {
+            tree,
+            source: source.as_bytes(),
+            path: path_id,
+            path_str: path,
+            repo_id: 0,
+        };
+        let mut id = 0u32;
+        let result = extractor.extract(&file, &mut strings, &mut id);
+        (result, strings)
+    }
+
+    #[test]
+    fn py_fastapi_routes() {
+        let (result, strings) = extract_py(
+            r#"from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.post("/inference")
+def inference():
+    pass
+
+@app.get("/ready")
+def ready():
+    pass
+"#,
+            "main.py",
+        );
+        let endpoints: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Endpoint as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            endpoints.iter().any(|e| e.contains("/inference")),
+            "should detect @app.post('/inference'): got {:?}",
+            endpoints
+        );
+        assert!(
+            endpoints.iter().any(|e| e.contains("/ready")),
+            "should detect @app.get('/ready'): got {:?}",
+            endpoints
+        );
+    }
+
+    #[test]
+    fn py_redis_detection() {
+        let (result, strings) = extract_py(
+            r#"import aioredis
+
+def init_cache():
+    client = aioredis.from_url("redis://localhost:6379")
+"#,
+            "cache.py",
+        );
+        let resources: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Resource as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            resources.contains(&"aioredis"),
+            "should detect aioredis.from_url(): got {:?}",
+            resources
+        );
+    }
+
+    #[test]
+    fn py_openai_sdk_detection() {
+        let (result, strings) = extract_py(
+            r#"import openai
+
+def call_llm():
+    client = openai.OpenAI(base_url="http://internal-llm:8080")
+"#,
+            "llm.py",
+        );
+        let resources: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Resource as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            resources.contains(&"openai"),
+            "should detect openai.OpenAI(): got {:?}",
+            resources
+        );
+    }
+
+    // ─── Next.js API route detection tests ──────────────────────────
+
+    #[test]
+    fn nextjs_api_route_detection() {
+        let (result, strings) = extract_ts(
+            r#"export async function GET(request: Request) {
+    return Response.json({ ok: true });
+}
+
+export async function POST(request: Request) {
+    return Response.json({ created: true });
+}
+
+function helper() {}
+"#,
+            "src/app/api/users/route.ts",
+        );
+        let endpoints: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Endpoint as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            endpoints.iter().any(|e| e.contains("GET") && e.contains("/api/users")),
+            "should detect GET /api/users endpoint: got {:?}",
+            endpoints
+        );
+        assert!(
+            endpoints.iter().any(|e| e.contains("POST") && e.contains("/api/users")),
+            "should detect POST /api/users endpoint: got {:?}",
+            endpoints
+        );
+        // helper() should NOT become an endpoint
+        assert!(
+            !endpoints.iter().any(|e| e.contains("helper")),
+            "helper should not be an endpoint: got {:?}",
+            endpoints
+        );
+    }
+
+    #[test]
+    fn nextjs_api_route_with_dynamic_segment() {
+        let (result, strings) = extract_ts(
+            r#"export async function DELETE(request: Request) {
+    return Response.json({ deleted: true });
+}
+"#,
+            "src/app/api/users/[id]/route.ts",
+        );
+        let endpoints: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Endpoint as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            endpoints.iter().any(|e| e.contains("DELETE") && e.contains("/api/users/[id]")),
+            "should detect DELETE /api/users/[id] endpoint: got {:?}",
+            endpoints
+        );
+    }
+
+    #[test]
+    fn non_nextjs_route_file_not_detected() {
+        let (result, _strings) = extract_ts(
+            r#"export function GET() { return 'ok'; }
+"#,
+            "src/routes/route.ts",
+        );
+        let endpoints: Vec<_> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Endpoint as u8)
+            .collect();
+        assert!(
+            endpoints.is_empty(),
+            "should NOT detect endpoints in non-app/api route file"
+        );
+    }
+
+    #[test]
+    fn nextjs_route_path_helper() {
+        assert_eq!(nextjs_route_path("src/app/api/users/route.ts"), "/api/users");
+        assert_eq!(nextjs_route_path("src/app/api/users/[id]/route.ts"), "/api/users/[id]");
+        assert_eq!(nextjs_route_path("app/api/health/route.ts"), "/api/health");
+    }
+
+    #[test]
+    fn is_nextjs_api_route_helper() {
+        assert!(is_nextjs_api_route("src/app/api/users/route.ts"));
+        assert!(is_nextjs_api_route("app/api/health/route.tsx"));
+        assert!(!is_nextjs_api_route("src/routes/route.ts"));
+        assert!(!is_nextjs_api_route("src/app/api/users/page.ts"));
+        assert!(!is_nextjs_api_route("src/app/api/users/route.rs"));
     }
 
     #[test]

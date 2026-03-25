@@ -19,3 +19,9 @@
     (_)
     (identifier) @ws.path_var)
   (#match? @_method2 "^(handshake|async_handshake)$")) @ws.def
+
+; ws_.async_connect(endpoint, callback) — Boost.Beast WebSocket connect
+(call_expression
+  function: (field_expression
+    field: (field_identifier) @_method3)
+  (#match? @_method3 "^(async_connect|connect)$")) @ws.def

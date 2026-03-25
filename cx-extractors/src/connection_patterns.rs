@@ -41,6 +41,11 @@ pub const CPP_GRPC_CLIENT: &str = include_str!("../queries/cpp-grpc-client.scm")
 pub const CPP_WEBSOCKET: &str = include_str!("../queries/cpp-websocket.scm");
 pub const CPP_ENVVAR: &str = include_str!("../queries/cpp-envvar.scm");
 
+// Resource detection queries (Redis, GCS/S3, OpenAI SDK)
+pub const GO_RESOURCE: &str = include_str!("../queries/go-resource.scm");
+pub const TS_RESOURCE: &str = include_str!("../queries/typescript-resource.scm");
+pub const PY_RESOURCE: &str = include_str!("../queries/python-resource.scm");
+
 // String constant collection queries (for local constant propagation)
 pub const GO_STRING_CONSTANTS: &str = include_str!("../queries/go-string-constants.scm");
 pub const TS_STRING_CONSTANTS: &str = include_str!("../queries/typescript-string-constants.scm");
@@ -60,6 +65,7 @@ pub fn connection_queries(lang: Language) -> String {
             GO_ENVVAR,
             GO_GRPC_SERVER,
             GO_GRPC_CLIENT,
+            GO_RESOURCE,
         ]
         .join("\n"),
         Language::TypeScript => [
@@ -69,6 +75,7 @@ pub fn connection_queries(lang: Language) -> String {
             TS_MESSAGEQUEUE,
             TS_ENVVAR,
             TS_GRPC_CLIENT,
+            TS_RESOURCE,
         ]
         .join("\n"),
         Language::Python => [
@@ -79,6 +86,7 @@ pub fn connection_queries(lang: Language) -> String {
             PY_ENVVAR,
             PY_GRPC_CLIENT,
             PY_GRPC_SERVER,
+            PY_RESOURCE,
         ]
         .join("\n"),
         Language::Cpp => [CPP_HTTP_CLIENT, CPP_GRPC_CLIENT, CPP_WEBSOCKET, CPP_ENVVAR].join("\n"),

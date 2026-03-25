@@ -83,44 +83,33 @@ pub fn inspect_symbol(graph: &CsrGraph, symbol: &str) -> String {
         out.push_str(&format_node(graph, node_idx));
         out.push('\n');
 
+        let mut has_edges = false;
+
         // Outgoing edges grouped by kind
         let forward = graph.edges_for(node_idx);
         let mut calls = Vec::new();
         let mut imports = Vec::new();
-        let mut other = Vec::new();
+        let mut other_forward = Vec::new();
 
         for edge in forward {
             match EdgeKind::from_u8(edge.kind) {
                 Some(EdgeKind::Calls) => calls.push(edge.target),
                 Some(EdgeKind::Imports) => imports.push(edge.target),
-                _ => other.push((edge.kind, edge.target)),
+                _ => other_forward.push((edge.kind, edge.target)),
             }
         }
 
         if !calls.is_empty() {
+            has_edges = true;
             out.push_str("\n  Calls:\n");
             for &target in &calls {
                 out.push_str(&format!("    \u{2192} {}\n", format_node(graph, target)));
             }
         }
 
-        // Incoming Calls edges (reverse index)
-        let reverse = graph.rev_edges_for(node_idx);
-        let callers: Vec<u32> = reverse
-            .iter()
-            .filter(|e| e.kind == EdgeKind::Calls as u8)
-            .map(|e| e.target) // in rev_edges, target = source of original edge
-            .collect();
-
-        if !callers.is_empty() {
-            out.push_str("\n  Called by:\n");
-            for &caller in &callers {
-                out.push_str(&format!("    \u{2190} {}\n", format_node(graph, caller)));
-            }
-        }
-
         if !imports.is_empty() {
-            out.push_str("\n  Imports: (module-level)\n");
+            has_edges = true;
+            out.push_str("\n  Imports:\n");
             for &target in &imports {
                 if (target as usize) < graph.nodes.len() {
                     out.push_str(&format!("    \u{2192} {}\n", graph.strings.get(graph.node(target).name)));
@@ -128,18 +117,62 @@ pub fn inspect_symbol(graph: &CsrGraph, symbol: &str) -> String {
             }
         }
 
-        if !other.is_empty() {
-            out.push_str("\n  Other edges:\n");
-            for &(kind, target) in &other {
-                out.push_str(&format!(
-                    "    \u{2192} {} ({})\n",
-                    format_node(graph, target),
-                    edge_kind_name(kind),
-                ));
+        // Show other outgoing edges by kind
+        for &kind_val in &[
+            EdgeKind::Exposes,
+            EdgeKind::DependsOn,
+            EdgeKind::Connects,
+            EdgeKind::Configures,
+            EdgeKind::Consumes,
+            EdgeKind::Publishes,
+            EdgeKind::Subscribes,
+            EdgeKind::Resolves,
+            EdgeKind::Contains,
+        ] {
+            let targets: Vec<u32> = other_forward
+                .iter()
+                .filter(|(k, _)| *k == kind_val as u8)
+                .map(|(_, t)| *t)
+                .collect();
+            if !targets.is_empty() {
+                has_edges = true;
+                out.push_str(&format!("\n  {}:\n", edge_kind_name(kind_val as u8)));
+                for &target in &targets {
+                    out.push_str(&format!("    \u{2192} {}\n", format_node(graph, target)));
+                }
             }
         }
 
-        if calls.is_empty() && callers.is_empty() && imports.is_empty() && other.is_empty() {
+        // Incoming edges (reverse index) — grouped by kind
+        let reverse = graph.rev_edges_for(node_idx);
+
+        for &(kind_val, label) in &[
+            (EdgeKind::Calls, "Called by"),
+            (EdgeKind::Exposes, "Exposed by"),
+            (EdgeKind::DependsOn, "Depended on by"),
+            (EdgeKind::Connects, "Connected from"),
+            (EdgeKind::Configures, "Configured by"),
+            (EdgeKind::Consumes, "Consumed by"),
+            (EdgeKind::Contains, "Contained in"),
+            (EdgeKind::Publishes, "Published by"),
+            (EdgeKind::Subscribes, "Subscribed by"),
+            (EdgeKind::Resolves, "Resolved by"),
+        ] {
+            let sources: Vec<u32> = reverse
+                .iter()
+                .filter(|e| e.kind == kind_val as u8)
+                .map(|e| e.target)
+                .collect();
+            if !sources.is_empty() {
+                has_edges = true;
+                out.push_str(&format!("\n  {}:\n", label));
+                for &src in &sources {
+                    out.push_str(&format!("    \u{2190} {}\n", format_node(graph, src)));
+                }
+            }
+        }
+
+        if !has_edges {
             out.push_str("  (no edges)\n");
         }
 

@@ -34,6 +34,91 @@ pub struct MergedResult {
     pub grpc_servers: Vec<(String, Vec<GrpcServerRegistration>)>,
     /// Proto service definitions found per repo: (repo_name, services)
     pub proto_services: Vec<(String, Vec<ProtoService>)>,
+    /// HTTP server routes extracted from code: (repo_name, routes)
+    pub http_server_routes: Vec<(String, Vec<HttpServerRoute>)>,
+    /// HTTP client calls extracted from code: (repo_name, calls)
+    pub http_client_calls: Vec<(String, Vec<HttpClientCall>)>,
+    /// Env var reads extracted from code: (repo_name, reads)
+    pub env_var_reads: Vec<(String, Vec<EnvVarRead>)>,
+    /// Env var definitions from Helm/k8s manifests: (repo_name, defs)
+    pub helm_env_defs: Vec<(String, Vec<HelmEnvDef>)>,
+    /// Docker images from Dockerfiles: (repo_name, images)
+    pub docker_images: Vec<(String, Vec<DockerImage>)>,
+    /// Container images from k8s manifests: (repo_name, images)
+    pub k8s_container_images: Vec<(String, Vec<K8sContainerImage>)>,
+    /// WebSocket server endpoints: (repo_name, endpoints)
+    pub ws_servers: Vec<(String, Vec<WsServerEndpoint>)>,
+    /// WebSocket client connections: (repo_name, connections)
+    pub ws_clients: Vec<(String, Vec<WsClientConnection>)>,
+}
+
+/// An HTTP server route, for passing to the resolution engine.
+#[derive(Debug, Clone)]
+pub struct HttpServerRoute {
+    pub path: String,
+    pub method: String,
+    pub framework: String,
+    pub file: String,
+    pub line: u32,
+}
+
+/// An HTTP client call, for passing to the resolution engine.
+#[derive(Debug, Clone)]
+pub struct HttpClientCall {
+    pub path: String,
+    pub method: String,
+    pub base_url_env_var: Option<String>,
+    pub file: String,
+    pub line: u32,
+}
+
+/// An env var read from code.
+#[derive(Debug, Clone)]
+pub struct EnvVarRead {
+    pub var_name: String,
+    pub file: String,
+    pub line: u32,
+}
+
+/// An env var definition from Helm/k8s YAML.
+#[derive(Debug, Clone)]
+pub struct HelmEnvDef {
+    pub var_name: String,
+    pub value: String,
+    pub file: String,
+    pub line: u32,
+}
+
+/// A Docker image reference from a Dockerfile.
+#[derive(Debug, Clone)]
+pub struct DockerImage {
+    pub image_ref: String,
+    pub file: String,
+}
+
+/// A container image reference from k8s manifests.
+#[derive(Debug, Clone)]
+pub struct K8sContainerImage {
+    pub image_ref: String,
+    pub file: String,
+    pub line: u32,
+    pub deployment_name: Option<String>,
+}
+
+/// A WebSocket server endpoint.
+#[derive(Debug, Clone)]
+pub struct WsServerEndpoint {
+    pub path: String,
+    pub file: String,
+    pub line: u32,
+}
+
+/// A WebSocket client connection.
+#[derive(Debug, Clone)]
+pub struct WsClientConnection {
+    pub url_or_path: String,
+    pub file: String,
+    pub line: u32,
 }
 
 /// A file to index, tagged with its repo root and repo ID.
@@ -76,16 +161,38 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
     // Step 1: Collect files from all repos (including .proto files)
     let mut all_repo_files: Vec<RepoFile> = Vec::new();
     let mut proto_files: Vec<RepoFile> = Vec::new();
+    let mut infra_files: Vec<RepoFile> = Vec::new();
 
     for (root, repo_id) in repos {
         let files = collect_files(root)?;
         for path in files {
-            if path.extension().is_some_and(|e| e == "proto") {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if ext == "proto" {
                 proto_files.push(RepoFile {
                     path,
                     root: root.clone(),
                     repo_id: *repo_id,
                 });
+            } else if file_name.starts_with("Dockerfile")
+                || ext == "yaml"
+                || ext == "yml"
+                || file_name.ends_with(".yaml.gotmpl")
+                || file_name.ends_with(".yml.gotmpl")
+            {
+                // Keep in both lists — source files also get tree-sitter extraction
+                infra_files.push(RepoFile {
+                    path: path.clone(),
+                    root: root.clone(),
+                    repo_id: *repo_id,
+                });
+                if Language::from_path(&path).is_some() {
+                    all_repo_files.push(RepoFile {
+                        path,
+                        root: root.clone(),
+                        repo_id: *repo_id,
+                    });
+                }
             } else {
                 all_repo_files.push(RepoFile {
                     path,
@@ -96,7 +203,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
         }
     }
 
-    if all_repo_files.is_empty() && proto_files.is_empty() {
+    if all_repo_files.is_empty() && proto_files.is_empty() && infra_files.is_empty() {
         return Ok(MergedResult {
             nodes: vec![],
             edges: vec![],
@@ -106,6 +213,14 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
             grpc_clients: vec![],
             grpc_servers: vec![],
             proto_services: vec![],
+            http_server_routes: vec![],
+            http_client_calls: vec![],
+            env_var_reads: vec![],
+            helm_env_defs: vec![],
+            docker_images: vec![],
+            k8s_container_images: vec![],
+            ws_servers: vec![],
+            ws_clients: vec![],
         });
     }
 
@@ -456,7 +571,15 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
     }
 
     // Step 5d: Cross-repo endpoint resolution (name-based)
-    resolve_cross_repo_endpoints(&all_nodes, &mut all_edges);
+    resolve_cross_repo_endpoints(&all_nodes, &mut all_edges, &merged_strings);
+
+    // Step 6: Scan extracted nodes to build resolution data
+    let (http_servers_by_repo, http_clients_by_repo, ws_servers_by_repo, ws_clients_by_repo, envvar_reads_by_repo) =
+        scan_nodes_for_resolution(&all_nodes, &all_edges, &merged_strings);
+
+    // Step 7: Parse infrastructure files (Dockerfiles, Helm/k8s YAML)
+    let (docker_by_repo, k8s_images_by_repo, helm_env_by_repo) =
+        parse_infra_files(&infra_files);
 
     // Build gRPC/proto output data
     let grpc_clients: Vec<(String, Vec<GrpcClientStub>)> = grpc_clients_by_repo
@@ -483,6 +606,16 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
         })
         .collect();
 
+    // Build HTTP/WS/env resolution output keyed by repo name
+    let http_server_routes = keyed_by_repo_name(&repo_names, http_servers_by_repo);
+    let http_client_calls = keyed_by_repo_name(&repo_names, http_clients_by_repo);
+    let ws_servers = keyed_by_repo_name(&repo_names, ws_servers_by_repo);
+    let ws_clients = keyed_by_repo_name(&repo_names, ws_clients_by_repo);
+    let env_var_reads = keyed_by_repo_name(&repo_names, envvar_reads_by_repo);
+    let helm_env_defs = keyed_by_repo_name(&repo_names, helm_env_by_repo);
+    let docker_images = keyed_by_repo_name(&repo_names, docker_by_repo);
+    let k8s_container_images = keyed_by_repo_name(&repo_names, k8s_images_by_repo);
+
     Ok(MergedResult {
         nodes: all_nodes,
         edges: all_edges,
@@ -492,17 +625,40 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
         grpc_clients,
         grpc_servers,
         proto_services: proto_services_out,
+        http_server_routes,
+        http_client_calls,
+        env_var_reads,
+        helm_env_defs,
+        docker_images,
+        k8s_container_images,
+        ws_servers,
+        ws_clients,
     })
 }
 
 /// Resolve cross-repo connections by matching Endpoint nodes with the same name
 /// across different repos. Creates Connects edges between the nodes.
-fn resolve_cross_repo_endpoints(nodes: &[Node], edges: &mut Vec<EdgeInput>) {
+/// Skips generic endpoint names that would create too many false-positive connections.
+fn resolve_cross_repo_endpoints(
+    nodes: &[Node],
+    edges: &mut Vec<EdgeInput>,
+    strings: &StringInterner,
+) {
     use rustc_hash::FxHashMap;
+
+    // Generic names that match too broadly across repos
+    const SKIP_NAMES: &[&str] = &[
+        "websocket", "/", "/health", "/healthz", "health", "index",
+    ];
 
     let mut endpoints_by_name: FxHashMap<u32, Vec<(u32, u16)>> = FxHashMap::default();
     for node in nodes {
         if node.kind == NodeKind::Endpoint as u8 {
+            let name = strings.get(node.name);
+            // Skip generic names and very short paths
+            if name.len() <= 1 || SKIP_NAMES.contains(&name) {
+                continue;
+            }
             endpoints_by_name
                 .entry(node.name)
                 .or_default()
@@ -520,6 +676,310 @@ fn resolve_cross_repo_endpoints(nodes: &[Node], edges: &mut Vec<EdgeInput>) {
                     edges.push(EdgeInput::new(eps[i].0, eps[j].0, EdgeKind::Connects));
                     edges.push(EdgeInput::new(eps[j].0, eps[i].0, EdgeKind::Connects));
                 }
+            }
+        }
+    }
+}
+
+/// Convert a repo_id-keyed map into a repo_name-keyed Vec.
+fn keyed_by_repo_name<T>(
+    repo_names: &rustc_hash::FxHashMap<u16, String>,
+    by_repo: rustc_hash::FxHashMap<u16, Vec<T>>,
+) -> Vec<(String, Vec<T>)> {
+    by_repo
+        .into_iter()
+        .map(|(id, items)| {
+            let name = repo_names.get(&id).cloned().unwrap_or_default();
+            (name, items)
+        })
+        .collect()
+}
+
+/// Scan extracted nodes and edges to build resolution input data.
+///
+/// Identifies HTTP server routes vs client calls by looking at edge types:
+/// - Endpoint with incoming Exposes edge → server route
+/// - Endpoint with incoming Connects edge → client call
+/// - sub_kind=0 → HTTP, sub_kind=1 → WebSocket
+/// - Resource nodes with names matching env var patterns → env var reads
+#[allow(clippy::type_complexity)]
+fn scan_nodes_for_resolution(
+    nodes: &[Node],
+    edges: &[EdgeInput],
+    strings: &StringInterner,
+) -> (
+    rustc_hash::FxHashMap<u16, Vec<HttpServerRoute>>,
+    rustc_hash::FxHashMap<u16, Vec<HttpClientCall>>,
+    rustc_hash::FxHashMap<u16, Vec<WsServerEndpoint>>,
+    rustc_hash::FxHashMap<u16, Vec<WsClientConnection>>,
+    rustc_hash::FxHashMap<u16, Vec<EnvVarRead>>,
+) {
+    let mut http_servers: rustc_hash::FxHashMap<u16, Vec<HttpServerRoute>> =
+        rustc_hash::FxHashMap::default();
+    let mut http_clients: rustc_hash::FxHashMap<u16, Vec<HttpClientCall>> =
+        rustc_hash::FxHashMap::default();
+    let mut ws_servers: rustc_hash::FxHashMap<u16, Vec<WsServerEndpoint>> =
+        rustc_hash::FxHashMap::default();
+    let mut ws_clients: rustc_hash::FxHashMap<u16, Vec<WsClientConnection>> =
+        rustc_hash::FxHashMap::default();
+    let mut envvar_reads: rustc_hash::FxHashMap<u16, Vec<EnvVarRead>> =
+        rustc_hash::FxHashMap::default();
+
+    // Build a set of node IDs that are targets of Exposes edges
+    let mut exposes_targets: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+    let mut connects_targets: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+    let mut configures_targets: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+
+    for edge in edges {
+        match edge.kind {
+            EdgeKind::Exposes => { exposes_targets.insert(edge.target); }
+            EdgeKind::Connects => { connects_targets.insert(edge.target); }
+            EdgeKind::Configures => { configures_targets.insert(edge.target); }
+            _ => {}
+        }
+    }
+
+    for node in nodes {
+        let name = strings.get(node.name);
+        let file = if node.file != u32::MAX { strings.get(node.file) } else { "" };
+
+        if node.kind == NodeKind::Endpoint as u8 {
+            let is_server = exposes_targets.contains(&node.id);
+            let is_client = connects_targets.contains(&node.id);
+            let is_ws = node.sub_kind == 1;
+
+            if is_ws {
+                if is_server {
+                    ws_servers.entry(node.repo).or_default().push(WsServerEndpoint {
+                        path: name.to_string(),
+                        file: file.to_string(),
+                        line: node.line,
+                    });
+                }
+                if is_client || !is_server {
+                    ws_clients.entry(node.repo).or_default().push(WsClientConnection {
+                        url_or_path: name.to_string(),
+                        file: file.to_string(),
+                        line: node.line,
+                    });
+                }
+            } else {
+                // HTTP (sub_kind=0)
+                if is_server {
+                    http_servers.entry(node.repo).or_default().push(HttpServerRoute {
+                        path: name.to_string(),
+                        method: String::new(),
+                        framework: String::new(),
+                        file: file.to_string(),
+                        line: node.line,
+                    });
+                }
+                if is_client || !is_server {
+                    http_clients.entry(node.repo).or_default().push(HttpClientCall {
+                        path: name.to_string(),
+                        method: String::new(),
+                        base_url_env_var: None,
+                        file: file.to_string(),
+                        line: node.line,
+                    });
+                }
+            }
+        }
+
+        // Env var reads: Resource nodes targeted by Configures edges
+        // whose names look like env var names (uppercase with underscores)
+        if node.kind == NodeKind::Resource as u8
+            && configures_targets.contains(&node.id)
+            && looks_like_env_var(name)
+        {
+            envvar_reads.entry(node.repo).or_default().push(EnvVarRead {
+                var_name: name.to_string(),
+                file: file.to_string(),
+                line: node.line,
+            });
+        }
+    }
+
+    (http_servers, http_clients, ws_servers, ws_clients, envvar_reads)
+}
+
+/// Check if a string looks like an environment variable name.
+fn looks_like_env_var(name: &str) -> bool {
+    if name.len() < 2 {
+        return false;
+    }
+    // Must be mostly uppercase letters and underscores
+    let alpha_count = name.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    if alpha_count == 0 {
+        return false;
+    }
+    let upper_count = name.chars().filter(|c| c.is_ascii_uppercase()).count();
+    // At least 60% uppercase of alphabetic chars
+    upper_count * 100 / alpha_count >= 60
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
+/// Parse infrastructure files (Dockerfiles, Helm/k8s YAML) to extract
+/// Docker image references, env var definitions, and k8s container images.
+#[allow(clippy::type_complexity)]
+fn parse_infra_files(
+    infra_files: &[RepoFile],
+) -> (
+    rustc_hash::FxHashMap<u16, Vec<DockerImage>>,
+    rustc_hash::FxHashMap<u16, Vec<K8sContainerImage>>,
+    rustc_hash::FxHashMap<u16, Vec<HelmEnvDef>>,
+) {
+    let mut docker_images: rustc_hash::FxHashMap<u16, Vec<DockerImage>> =
+        rustc_hash::FxHashMap::default();
+    let mut k8s_images: rustc_hash::FxHashMap<u16, Vec<K8sContainerImage>> =
+        rustc_hash::FxHashMap::default();
+    let mut helm_envs: rustc_hash::FxHashMap<u16, Vec<HelmEnvDef>> =
+        rustc_hash::FxHashMap::default();
+
+    for rf in infra_files {
+        let Ok(content) = std::fs::read_to_string(&rf.path) else { continue };
+        let rel_path = rf
+            .path
+            .strip_prefix(&rf.root)
+            .unwrap_or(&rf.path)
+            .to_string_lossy()
+            .to_string();
+
+        let file_name = rf.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        if file_name.starts_with("Dockerfile") {
+            // Parse Dockerfile: extract FROM image references
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("FROM ") {
+                    // FROM image:tag AS alias
+                    let image_ref = rest.split_whitespace().next().unwrap_or("").to_string();
+                    if !image_ref.is_empty() && image_ref != "scratch" {
+                        docker_images.entry(rf.repo_id).or_default().push(DockerImage {
+                            image_ref,
+                            file: rel_path.clone(),
+                        });
+                    }
+                }
+            }
+        } else {
+            // YAML: parse env var definitions and container image references
+            parse_yaml_for_resolution(&content, &rel_path, rf.repo_id, &mut k8s_images, &mut helm_envs);
+        }
+    }
+
+    (docker_images, k8s_images, helm_envs)
+}
+
+/// Resolve a Go template value to its most useful form.
+/// - `{{ .Values.foo | default "http://bar" }}` → `http://bar`
+/// - `{{ .Values.foo }}` → `.Values.foo` (keep the reference)
+/// - `http://plain-value` → `http://plain-value`
+/// - Mixed: `http://{{ .Values.host }}:8080/path` → `http://{{ .Values.host }}:8080/path` (keep as-is)
+fn resolve_gotmpl_value(raw: &str) -> String {
+    let s = raw.trim();
+
+    // Not a template — return as-is
+    if !s.contains("{{") {
+        return s.to_string();
+    }
+
+    // Extract `default "value"` from template expressions
+    // Pattern: {{ ... | default "value" }}  or  {{ ... | default `value` }}
+    if let Some(default_idx) = s.find("default ") {
+        let after_default = &s[default_idx + 8..];
+        let after_default = after_default.trim();
+        // Find the quoted default value
+        if let Some(start_quote) = after_default.find(|c: char| c == '"' || c == '\'' || c == '`')
+        {
+            let quote_char = after_default.as_bytes()[start_quote] as char;
+            let rest = &after_default[start_quote + 1..];
+            if let Some(end_quote) = rest.find(quote_char) {
+                return rest[..end_quote].to_string();
+            }
+        }
+        // Unquoted default value (up to space, }, or end)
+        let unquoted = after_default
+            .split(|c: char| c == ' ' || c == '}')
+            .next()
+            .unwrap_or("");
+        if !unquoted.is_empty() {
+            return unquoted.to_string();
+        }
+    }
+
+    // Pure template without default: extract the .Values reference
+    if s.starts_with("{{") && s.ends_with("}}") {
+        let inner = s.trim_start_matches('{').trim_end_matches('}').trim();
+        let inner = inner.split('|').next().unwrap_or(inner).trim();
+        if !inner.is_empty() {
+            return inner.to_string();
+        }
+    }
+
+    // Mixed template + literal (e.g., "http://{{ .Values.host }}:8080/path")
+    s.to_string()
+}
+
+/// Simple line-based YAML parser to extract env var definitions and container images.
+/// Not a full YAML parser — handles the common patterns in k8s manifests and Helm charts.
+fn parse_yaml_for_resolution(
+    content: &str,
+    file: &str,
+    repo_id: u16,
+    k8s_images: &mut rustc_hash::FxHashMap<u16, Vec<K8sContainerImage>>,
+    helm_envs: &mut rustc_hash::FxHashMap<u16, Vec<HelmEnvDef>>,
+) {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut pending_env_name: Option<String> = None;
+    let mut pending_env_line: u32 = 0;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let line_num = (i + 1) as u32;
+
+        // Container image references: "image: gcr.io/org/app:tag"
+        if let Some(rest) = trimmed.strip_prefix("image:") {
+            let image_ref = rest.trim().trim_matches('"').trim_matches('\'').to_string();
+            if !image_ref.is_empty() && !image_ref.starts_with("{{") {
+                k8s_images.entry(repo_id).or_default().push(K8sContainerImage {
+                    image_ref,
+                    file: file.to_string(),
+                    line: line_num,
+                    deployment_name: None,
+                });
+            }
+        }
+
+        // Env var definitions: look for "name: VAR_NAME" followed by "value: ..."
+        if let Some(rest) = trimmed.strip_prefix("name:") {
+            let name = rest.trim().trim_matches('"').trim_matches('\'');
+            if looks_like_env_var(name) {
+                pending_env_name = Some(name.to_string());
+                pending_env_line = line_num;
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("value:") {
+            if let Some(var_name) = pending_env_name.take() {
+                let raw = rest.trim().trim_matches('"').trim_matches('\'');
+                // Handle Go template expressions: extract default value or the template itself
+                let value = resolve_gotmpl_value(raw);
+                if !value.is_empty() {
+                    helm_envs.entry(repo_id).or_default().push(HelmEnvDef {
+                        var_name,
+                        value,
+                        file: file.to_string(),
+                        line: pending_env_line,
+                    });
+                }
+            }
+        } else if !trimmed.is_empty()
+            && !trimmed.starts_with('#')
+            && !trimmed.starts_with("value")
+            && !trimmed.starts_with("valueFrom")
+        {
+            // Reset pending env name if we hit a non-value line
+            if pending_env_name.is_some() && !trimmed.starts_with('-') {
+                pending_env_name = None;
             }
         }
     }
