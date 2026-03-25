@@ -32,3 +32,13 @@
   subscript: (string) @envvar.name
   (#eq? @_obj "os")
   (#eq? @_attr "environ")) @envvar.site
+
+; Variant: os.getenv(varName) — variable reference
+(call
+  function: (attribute
+    object: (identifier) @_obj2
+    attribute: (identifier) @_method2)
+  arguments: (argument_list
+    (identifier) @envvar.name_var)
+  (#eq? @_obj2 "os")
+  (#eq? @_method2 "getenv")) @envvar.site

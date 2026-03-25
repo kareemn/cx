@@ -17,3 +17,11 @@
     (string) @endpoint.path)
   (#match? @_fn "^(path|re_path|url)$")
   (#match? @endpoint.path "/")) @endpoint.def
+
+; Variant: app.get(varName, handler) — variable reference
+(call
+  function: (attribute
+    attribute: (identifier) @_method2)
+  arguments: (argument_list
+    (identifier) @endpoint.path_var)
+  (#match? @_method2 "^(route|get|post|put|delete|patch|options|head)$")) @endpoint.def

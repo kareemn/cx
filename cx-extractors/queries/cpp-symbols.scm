@@ -12,6 +12,18 @@
   declarator: (function_declarator
     declarator: (field_identifier) @func.name)) @func.def
 
+; ─── Out-of-class method definitions (Class::method) ─────────────
+(function_definition
+  declarator: (function_declarator
+    declarator: (qualified_identifier
+      name: (identifier) @func.name))) @func.def
+
+; ─── Destructor definitions (Class::~Class) ──────────────────────
+(function_definition
+  declarator: (function_declarator
+    declarator: (qualified_identifier
+      name: (destructor_name) @func.name))) @func.def
+
 ; ─── Class declarations ─────────────────────────────────────────────
 (class_specifier
   name: (type_identifier) @type.name

@@ -63,12 +63,9 @@ pub fn extractor_for_language(lang: Language) -> Option<UniversalExtractor> {
         Language::Cpp => CPP_QUERY,
     };
     let conn_queries = crate::connection_patterns::connection_queries(lang);
-    if conn_queries.is_empty() {
-        UniversalExtractor::new(&ts_lang, symbol_query).ok()
-    } else {
-        let combined = format!("{}\n{}", symbol_query, conn_queries);
-        UniversalExtractor::new(&ts_lang, &combined).ok()
-    }
+    let const_query = crate::connection_patterns::constant_query(lang);
+    let combined = format!("{}\n{}\n{}", symbol_query, conn_queries, const_query);
+    UniversalExtractor::new(&ts_lang, &combined).ok()
 }
 
 #[cfg(test)]

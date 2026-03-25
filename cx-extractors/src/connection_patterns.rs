@@ -3,6 +3,9 @@
 //! Each constant embeds a tree-sitter query file that detects connection patterns
 //! in source code. These queries are concatenated with the language's symbol queries
 //! to create a combined extractor.
+//!
+//! String constant collection queries are also included to support local constant
+//! propagation — resolving variable references to their string literal values.
 
 use crate::grammars::Language;
 
@@ -37,6 +40,13 @@ pub const CPP_HTTP_CLIENT: &str = include_str!("../queries/cpp-http-client.scm")
 pub const CPP_GRPC_CLIENT: &str = include_str!("../queries/cpp-grpc-client.scm");
 pub const CPP_WEBSOCKET: &str = include_str!("../queries/cpp-websocket.scm");
 pub const CPP_ENVVAR: &str = include_str!("../queries/cpp-envvar.scm");
+
+// String constant collection queries (for local constant propagation)
+pub const GO_STRING_CONSTANTS: &str = include_str!("../queries/go-string-constants.scm");
+pub const TS_STRING_CONSTANTS: &str = include_str!("../queries/typescript-string-constants.scm");
+pub const PY_STRING_CONSTANTS: &str = include_str!("../queries/python-string-constants.scm");
+pub const CPP_STRING_CONSTANTS: &str = include_str!("../queries/cpp-string-constants.scm");
+pub const C_STRING_CONSTANTS: &str = include_str!("../queries/c-string-constants.scm");
 
 /// Get all connection pattern queries for a language, concatenated into a single string.
 /// Returns empty string for languages without connection pattern support.
@@ -75,5 +85,17 @@ pub fn connection_queries(lang: Language) -> String {
         Language::C => {
             include_str!("../queries/c-envvar.scm").to_string()
         }
+    }
+}
+
+/// Get the string constant collection query for a language.
+/// Returns empty string for languages without constant propagation support.
+pub fn constant_query(lang: Language) -> &'static str {
+    match lang {
+        Language::Go => GO_STRING_CONSTANTS,
+        Language::TypeScript => TS_STRING_CONSTANTS,
+        Language::Python => PY_STRING_CONSTANTS,
+        Language::Cpp => CPP_STRING_CONSTANTS,
+        Language::C => C_STRING_CONSTANTS,
     }
 }

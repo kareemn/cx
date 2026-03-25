@@ -84,6 +84,76 @@ const CAPTURE_MQ_SUBSCRIBE: &str = "mq.subscribe";
 const CAPTURE_ENVVAR_NAME: &str = "envvar.name";
 const CAPTURE_ENVVAR_SITE: &str = "envvar.site";
 
+// Variable reference capture names (for local constant propagation)
+const CAPTURE_ENDPOINT_PATH_VAR: &str = "endpoint.path_var";
+const CAPTURE_HTTP_CALL_URL_VAR: &str = "http_call.url_var";
+const CAPTURE_WS_PATH_VAR: &str = "ws.path_var";
+const CAPTURE_ENVVAR_NAME_VAR: &str = "envvar.name_var";
+
+// String constant collection capture names
+const CAPTURE_CONST_NAME: &str = "const.name";
+const CAPTURE_CONST_VALUE: &str = "const.value";
+
+/// A local string constant: variable name → string value, with scope info.
+struct LocalConstant {
+    name: String,
+    value: String,
+    byte_offset: usize,
+}
+
+/// Map of locally-defined string constants for resolving variable references.
+struct LocalConstantMap {
+    constants: Vec<LocalConstant>,
+}
+
+impl LocalConstantMap {
+    fn new() -> Self {
+        Self {
+            constants: Vec::new(),
+        }
+    }
+
+    /// Resolve a variable name to its string value, scoped to the same function.
+    /// `defined_symbols` provides function byte ranges for scoping.
+    /// Returns None if the variable is not a known string constant in scope.
+    fn resolve(
+        &self,
+        var_name: &str,
+        at_byte: usize,
+        defined_symbols: &[(StringId, NodeId, usize, usize)],
+    ) -> Option<&str> {
+        // Find the enclosing function for the usage site
+        let usage_scope = defined_symbols
+            .iter()
+            .find(|(_, _, start, end)| *start <= at_byte && at_byte < *end);
+
+        for c in &self.constants {
+            if c.name != var_name {
+                continue;
+            }
+            // Check if the constant is in the same function scope
+            let const_scope = defined_symbols
+                .iter()
+                .find(|(_, _, start, end)| *start <= c.byte_offset && c.byte_offset < *end);
+
+            match (usage_scope, const_scope) {
+                // Both in the same function
+                (Some((_, _, us, ue, ..)), Some((_, _, cs, ce, ..)))
+                    if us == cs && ue == ce =>
+                {
+                    return Some(&c.value);
+                }
+                // Constant is at file scope (not in any function), usage is anywhere
+                (_, None) => {
+                    return Some(&c.value);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
 /// UniversalExtractor processes tree-sitter query matches into ExtractionResult
 /// using standardized capture names.
 pub struct UniversalExtractor {
@@ -114,6 +184,14 @@ pub struct UniversalExtractor {
     mq_subscribe_idx: Option<u32>,
     envvar_name_idx: Option<u32>,
     envvar_site_idx: Option<u32>,
+    // Variable reference capture indices (for constant propagation)
+    endpoint_path_var_idx: Option<u32>,
+    http_call_url_var_idx: Option<u32>,
+    ws_path_var_idx: Option<u32>,
+    envvar_name_var_idx: Option<u32>,
+    // String constant collection indices
+    const_name_idx: Option<u32>,
+    const_value_idx: Option<u32>,
 }
 
 impl UniversalExtractor {
@@ -156,6 +234,14 @@ impl UniversalExtractor {
             mq_subscribe_idx: find_capture(CAPTURE_MQ_SUBSCRIBE),
             envvar_name_idx: find_capture(CAPTURE_ENVVAR_NAME),
             envvar_site_idx: find_capture(CAPTURE_ENVVAR_SITE),
+            // Variable reference captures
+            endpoint_path_var_idx: find_capture(CAPTURE_ENDPOINT_PATH_VAR),
+            http_call_url_var_idx: find_capture(CAPTURE_HTTP_CALL_URL_VAR),
+            ws_path_var_idx: find_capture(CAPTURE_WS_PATH_VAR),
+            envvar_name_var_idx: find_capture(CAPTURE_ENVVAR_NAME_VAR),
+            // String constant captures
+            const_name_idx: find_capture(CAPTURE_CONST_NAME),
+            const_value_idx: find_capture(CAPTURE_CONST_VALUE),
             query,
         })
     }
@@ -187,7 +273,44 @@ impl UniversalExtractor {
         let mut mq_defs: Vec<(NodeId, usize, EdgeKind)> = Vec::new();
         let mut envvar_defs: Vec<(NodeId, usize)> = Vec::new();
 
-        // Single pass: collect definitions and call sites
+        // Pending variable references (resolved after main pass using constant map)
+        // (var_name, byte_offset, kind: "endpoint"|"ws"|"http"|"envvar")
+        let mut pending_var_refs: Vec<(String, usize, &str)> = Vec::new();
+
+        // Pass 0: Collect local string constants
+        let mut const_map = LocalConstantMap::new();
+        {
+            let mut cursor = tree_sitter::QueryCursor::new();
+            let mut matches = cursor.matches(&self.query, file.tree.root_node(), file.source);
+            while let Some(m) = matches.next() {
+                if let (Some(name_text), Some(value_text)) = (
+                    self.capture_text(self.const_name_idx, m, file.source),
+                    self.capture_text(self.const_value_idx, m, file.source),
+                ) {
+                    let value_clean = value_text
+                        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+                        .to_string();
+                    // For #define macros, the value may have leading/trailing whitespace
+                    let value_clean = value_clean.trim().to_string();
+                    // Skip empty values or values that don't look like strings
+                    if !value_clean.is_empty()
+                        && !value_clean.contains(' ')
+                    {
+                        let byte_offset = self
+                            .capture_node(self.const_name_idx, m)
+                            .map(|n| n.start_byte())
+                            .unwrap_or(0);
+                        const_map.constants.push(LocalConstant {
+                            name: name_text.to_string(),
+                            value: value_clean,
+                            byte_offset,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Main pass: collect definitions, call sites, and connection patterns
         let mut cursor = tree_sitter::QueryCursor::new();
         let mut matches = cursor.matches(&self.query, file.tree.root_node(), file.source);
 
@@ -391,6 +514,81 @@ impl UniversalExtractor {
                 }
                 result.nodes.push(node);
             }
+
+            // ─── Variable reference captures (for constant propagation) ──
+            if let Some(var_name) = self.capture_text(self.endpoint_path_var_idx, m, file.source) {
+                let byte_offset = self
+                    .capture_node(self.endpoint_path_var_idx, m)
+                    .map(|n| n.start_byte())
+                    .unwrap_or(0);
+                pending_var_refs.push((var_name.to_string(), byte_offset, "endpoint"));
+            }
+            if let Some(var_name) = self.capture_text(self.ws_path_var_idx, m, file.source) {
+                let byte_offset = self
+                    .capture_node(self.ws_path_var_idx, m)
+                    .map(|n| n.start_byte())
+                    .unwrap_or(0);
+                pending_var_refs.push((var_name.to_string(), byte_offset, "ws"));
+            }
+            if let Some(var_name) = self.capture_text(self.http_call_url_var_idx, m, file.source) {
+                let byte_offset = self
+                    .capture_node(self.http_call_url_var_idx, m)
+                    .map(|n| n.start_byte())
+                    .unwrap_or(0);
+                pending_var_refs.push((var_name.to_string(), byte_offset, "http"));
+            }
+            if let Some(var_name) = self.capture_text(self.envvar_name_var_idx, m, file.source) {
+                let byte_offset = self
+                    .capture_node(self.envvar_name_var_idx, m)
+                    .map(|n| n.start_byte())
+                    .unwrap_or(0);
+                pending_var_refs.push((var_name.to_string(), byte_offset, "envvar"));
+            }
+        }
+
+        // Resolve pending variable references using the constant map
+        for (var_name, byte_offset, kind) in &pending_var_refs {
+            let resolved = const_map.resolve(var_name, *byte_offset, &defined_symbols);
+            if let Some(value) = resolved {
+                let name_id = strings.intern(value);
+                let node_id = *id_counter;
+                *id_counter += 1;
+
+                match *kind {
+                    "endpoint" => {
+                        let mut node = Node::new(node_id, NodeKind::Endpoint, name_id);
+                        node.sub_kind = 0; // HTTP
+                        node.file = file.path;
+                        node.repo = file.repo_id;
+                        endpoint_defs.push((node_id, *byte_offset));
+                        result.nodes.push(node);
+                    }
+                    "ws" => {
+                        let mut node = Node::new(node_id, NodeKind::Endpoint, name_id);
+                        node.sub_kind = 1; // WebSocket
+                        node.file = file.path;
+                        node.repo = file.repo_id;
+                        endpoint_defs.push((node_id, *byte_offset));
+                        result.nodes.push(node);
+                    }
+                    "http" => {
+                        let mut node = Node::new(node_id, NodeKind::Endpoint, name_id);
+                        node.sub_kind = 0; // HTTP
+                        node.file = file.path;
+                        node.repo = file.repo_id;
+                        http_call_defs.push((node_id, *byte_offset));
+                        result.nodes.push(node);
+                    }
+                    "envvar" => {
+                        let mut node = Node::new(node_id, NodeKind::Resource, name_id);
+                        node.file = file.path;
+                        node.repo = file.repo_id;
+                        envvar_defs.push((node_id, *byte_offset));
+                        result.nodes.push(node);
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // Second pass: resolve call edges
@@ -578,13 +776,14 @@ impl UniversalExtractor {
 mod tests {
     use super::*;
 
-    /// Helper: parse Go source at a given path and extract.
+    /// Helper: parse Go source at a given path and extract using full combined query.
     fn extract_go(source: &str, path: &str) -> (ExtractionResult, StringInterner) {
         let lang: tree_sitter::Language = tree_sitter_go::LANGUAGE.into();
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&lang).unwrap();
         let tree = parser.parse(source.as_bytes(), None).unwrap();
-        let extractor = UniversalExtractor::new(&lang, GO_QUERY).unwrap();
+        let extractor =
+            crate::grammars::extractor_for_language(crate::grammars::Language::Go).unwrap();
         let mut strings = StringInterner::new();
         let path_id = strings.intern(path);
         let file = ParsedFile {
@@ -598,8 +797,6 @@ mod tests {
         let result = extractor.extract(&file, &mut strings, &mut id);
         (result, strings)
     }
-
-    const GO_QUERY: &str = include_str!("../queries/go-symbols.scm");
 
     #[test]
     fn extract_go_functions() {
@@ -772,5 +969,129 @@ mod tests {
         let dep2 = result2.nodes.iter().find(|n| n.kind == NodeKind::Deployable as u8).unwrap();
         // Root-level main.go: directory is empty, should be "."
         assert!(!strings2.get(dep2.name).is_empty());
+    }
+
+    // ─── Local constant propagation tests ────────────────────────────
+
+    #[test]
+    fn local_const_go() {
+        let (result, strings) = extract_go(
+            r#"package main
+
+import "net/http"
+
+func handler() {
+    path := "/ws/translate"
+    http.HandleFunc(path, wsHandler)
+}
+"#,
+            "main.go",
+        );
+        let endpoints: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Endpoint as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            endpoints.contains(&"/ws/translate"),
+            "should resolve variable to string literal: got {:?}",
+            endpoints
+        );
+    }
+
+    #[test]
+    fn local_const_unresolved() {
+        let (result, strings) = extract_go(
+            r#"package main
+
+import "net/http"
+
+func handler() {
+    path := getConfigPath()
+    http.HandleFunc(path, wsHandler)
+}
+"#,
+            "main.go",
+        );
+        // Should NOT resolve — function return values are out of scope
+        let endpoints: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Endpoint as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            !endpoints.iter().any(|e| e.starts_with("/")),
+            "should NOT resolve function return value: got {:?}",
+            endpoints
+        );
+    }
+
+    #[test]
+    fn local_const_cpp() {
+        let lang: tree_sitter::Language = tree_sitter_cpp::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).unwrap();
+        // Match a real C++ WebSocket client pattern
+        let source = r#"
+#include <string>
+
+void S2SClient::on_connect(int ec, int ep) {
+    std::string target = "/ws/s2s";
+    ws_->async_handshake(
+        host_ + ":" + port_, target,
+        callback);
+}
+"#;
+        let tree = parser.parse(source.as_bytes(), None).unwrap();
+        let extractor =
+            crate::grammars::extractor_for_language(crate::grammars::Language::Cpp).unwrap();
+        let mut strings = StringInterner::new();
+        let path_id = strings.intern("client.cpp");
+        let file = ParsedFile {
+            tree,
+            source: source.as_bytes(),
+            path: path_id,
+            path_str: "client.cpp",
+            repo_id: 0,
+        };
+        let mut id = 0u32;
+        let result = extractor.extract(&file, &mut strings, &mut id);
+
+        let endpoints: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Endpoint as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            endpoints.contains(&"/ws/s2s"),
+            "should resolve C++ variable to string literal via constant propagation: got {:?}",
+            endpoints
+        );
+    }
+
+    #[test]
+    fn local_const_different_function() {
+        let (result, strings) = extract_go(
+            r#"package main
+
+import "net/http"
+
+func setup() {
+    path := "/ws/translate"
+}
+
+func handler() {
+    http.HandleFunc(path, wsHandler)
+}
+"#,
+            "main.go",
+        );
+        // Should NOT resolve — variable is in a different function scope
+        let endpoints: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Endpoint as u8)
+            .map(|n| strings.get(n.name))
+            .collect();
+        assert!(
+            !endpoints.contains(&"/ws/translate"),
+            "should NOT resolve variable from different function: got {:?}",
+            endpoints
+        );
     }
 }
