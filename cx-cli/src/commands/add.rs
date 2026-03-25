@@ -41,8 +41,7 @@ pub fn run(root: &Path, repo_path: &str) -> Result<()> {
         if repos.len() == 1 { "" } else { "s" }
     );
 
-    let result = cx_extractors::pipeline::index_repos(&repos)
-        .context("failed to index repos")?;
+    let result = crate::indexing::index_repos_with_resolution(&repos)?;
 
     let elapsed = start.elapsed();
 

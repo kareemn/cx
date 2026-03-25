@@ -1,4 +1,6 @@
 use crate::grammars::{self, Language};
+use crate::grpc::{self, GrpcClientStub, GrpcScanResult, GrpcServerRegistration};
+use crate::proto::{self, ProtoService};
 use crate::universal::{ExtractionResult, ParsedFile, UnresolvedCall};
 use cx_core::graph::csr::{CsrGraph, EdgeInput};
 use cx_core::graph::edges::EdgeKind;
@@ -17,6 +19,23 @@ pub struct IndexResult {
     pub errors: Vec<String>,
 }
 
+/// Intermediate result after extraction and merging, before CSR construction.
+/// Exposed so callers can inject additional edges (e.g., from the resolution engine)
+/// before building the final graph.
+pub struct MergedResult {
+    pub nodes: Vec<Node>,
+    pub edges: Vec<EdgeInput>,
+    pub strings: StringInterner,
+    pub file_count: usize,
+    pub errors: Vec<String>,
+    /// gRPC client stubs found per repo: (repo_name, stubs)
+    pub grpc_clients: Vec<(String, Vec<GrpcClientStub>)>,
+    /// gRPC server registrations found per repo: (repo_name, registrations)
+    pub grpc_servers: Vec<(String, Vec<GrpcServerRegistration>)>,
+    /// Proto service definitions found per repo: (repo_name, services)
+    pub proto_services: Vec<(String, Vec<ProtoService>)>,
+}
+
 /// A file to index, tagged with its repo root and repo ID.
 struct RepoFile {
     path: PathBuf,
@@ -30,125 +49,232 @@ pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
 }
 
 /// Run the indexing pipeline across multiple repos, producing a single unified graph.
-///
-/// Each entry is (repo_root, repo_id). All repos are indexed in parallel,
-/// merged into a single node/edge list, cross-repo calls are resolved,
-/// and a unified CsrGraph is built.
 pub fn index_repos(repos: &[(PathBuf, u16)]) -> crate::Result<IndexResult> {
-    // Step 1: Collect files from all repos
+    let merged = extract_and_merge_repos(repos)?;
+    Ok(build_index(merged))
+}
+
+/// Build the final CSR graph from merged extraction data.
+pub fn build_index(merged: MergedResult) -> IndexResult {
+    let node_count = merged.nodes.len() as u32;
+    let edge_count = merged.edges.len() as u32;
+    let graph = CsrGraph::build(merged.nodes, merged.edges, merged.strings);
+    IndexResult {
+        graph,
+        file_count: merged.file_count,
+        node_count,
+        edge_count,
+        errors: merged.errors,
+    }
+}
+
+/// Extract and merge all repos into a single node/edge list with gRPC/proto metadata.
+///
+/// This does everything except building the CSR graph, so callers can inject
+/// additional edges (e.g., from the gRPC resolution engine) before calling `build_index`.
+pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<MergedResult> {
+    // Step 1: Collect files from all repos (including .proto files)
     let mut all_repo_files: Vec<RepoFile> = Vec::new();
+    let mut proto_files: Vec<RepoFile> = Vec::new();
+
     for (root, repo_id) in repos {
         let files = collect_files(root)?;
         for path in files {
-            all_repo_files.push(RepoFile {
-                path,
-                root: root.clone(),
-                repo_id: *repo_id,
-            });
+            if path.extension().is_some_and(|e| e == "proto") {
+                proto_files.push(RepoFile {
+                    path,
+                    root: root.clone(),
+                    repo_id: *repo_id,
+                });
+            } else {
+                all_repo_files.push(RepoFile {
+                    path,
+                    root: root.clone(),
+                    repo_id: *repo_id,
+                });
+            }
         }
     }
 
-    if all_repo_files.is_empty() {
-        let strings = StringInterner::new();
-        let graph = CsrGraph::build(vec![], vec![], strings);
-        return Ok(IndexResult {
-            graph,
+    if all_repo_files.is_empty() && proto_files.is_empty() {
+        return Ok(MergedResult {
+            nodes: vec![],
+            edges: vec![],
+            strings: StringInterner::new(),
             file_count: 0,
-            node_count: 0,
-            edge_count: 0,
             errors: vec![],
+            grpc_clients: vec![],
+            grpc_servers: vec![],
+            proto_services: vec![],
         });
     }
+
+    // Build repo_id → repo_name mapping
+    let repo_names: rustc_hash::FxHashMap<u16, String> = repos
+        .iter()
+        .map(|(root, id)| {
+            let name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("repo-{}", id));
+            (*id, name)
+        })
+        .collect();
 
     // Global ID counter shared across threads
     let id_counter = AtomicU32::new(0);
 
-    // Step 2-4: Parse and extract in parallel
-    let per_file_results: Vec<(ExtractionResult, StringInterner, Vec<String>)> = all_repo_files
-        .par_iter()
-        .filter_map(|rf| {
-            let lang = Language::from_path(&rf.path)?;
-            Some((rf, lang))
-        })
-        .map(|(rf, lang)| {
-            let mut errors = Vec::new();
-            let mut strings = StringInterner::new();
-            let mut result = ExtractionResult::new();
+    // Step 2-4: Parse and extract in parallel, also scanning for gRPC patterns
+    let per_file_results: Vec<(ExtractionResult, StringInterner, Vec<String>, GrpcScanResult)> =
+        all_repo_files
+            .par_iter()
+            .filter_map(|rf| {
+                let lang = Language::from_path(&rf.path)?;
+                Some((rf, lang))
+            })
+            .map(|(rf, lang)| {
+                let mut errors = Vec::new();
+                let mut strings = StringInterner::new();
+                let mut result = ExtractionResult::new();
+                let mut grpc_result = GrpcScanResult {
+                    client_stubs: vec![],
+                    server_registrations: vec![],
+                };
 
-            // Read file
-            let source = match std::fs::read(&rf.path) {
-                Ok(s) => s,
-                Err(e) => {
-                    errors.push(format!("{}: {}", rf.path.display(), e));
-                    return (result, strings, errors);
+                // Read file
+                let source = match std::fs::read(&rf.path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        errors.push(format!("{}: {}", rf.path.display(), e));
+                        return (result, strings, errors, grpc_result);
+                    }
+                };
+
+                // Parse with thread-local parser
+                let ts_lang = lang.ts_language();
+                let mut parser = tree_sitter::Parser::new();
+                if parser.set_language(&ts_lang).is_err() {
+                    errors.push(format!("{}: failed to set language", rf.path.display()));
+                    return (result, strings, errors, grpc_result);
                 }
-            };
 
-            // Parse with thread-local parser
-            let ts_lang = lang.ts_language();
-            let mut parser = tree_sitter::Parser::new();
-            if parser.set_language(&ts_lang).is_err() {
-                errors.push(format!("{}: failed to set language", rf.path.display()));
-                return (result, strings, errors);
-            }
+                let tree = match parser.parse(&source, None) {
+                    Some(t) => t,
+                    None => {
+                        errors.push(format!("{}: parse failed", rf.path.display()));
+                        return (result, strings, errors, grpc_result);
+                    }
+                };
 
-            let tree = match parser.parse(&source, None) {
-                Some(t) => t,
-                None => {
-                    errors.push(format!("{}: parse failed", rf.path.display()));
-                    return (result, strings, errors);
+                // Create extractor
+                let extractor = match grammars::extractor_for_language(lang) {
+                    Some(e) => e,
+                    None => return (result, strings, errors, grpc_result),
+                };
+
+                // Compute repo-relative path
+                let path_str = rf
+                    .path
+                    .strip_prefix(&rf.root)
+                    .unwrap_or(&rf.path)
+                    .to_string_lossy();
+                let path_id = strings.intern(&path_str);
+
+                let file = ParsedFile {
+                    tree,
+                    source: &source,
+                    path: path_id,
+                    path_str: &path_str,
+                    repo_id: rf.repo_id,
+                };
+
+                // Reserve IDs atomically
+                let base_id = id_counter.fetch_add(10000, Ordering::Relaxed);
+                let mut local_id = base_id;
+                result = extractor.extract(&file, &mut strings, &mut local_id);
+
+                // Scan for gRPC patterns on Go files (reuse the parsed tree)
+                if lang == Language::Go {
+                    grpc_result =
+                        grpc::scan_go_grpc(&file.tree, &source, &path_str, &ts_lang);
                 }
-            };
 
-            // Create extractor
-            let extractor = match grammars::extractor_for_language(lang) {
-                Some(e) => e,
-                None => return (result, strings, errors),
-            };
+                (result, strings, errors, grpc_result)
+            })
+            .collect();
 
-            // Compute repo-relative path
-            let path_str = rf.path
-                .strip_prefix(&rf.root)
-                .unwrap_or(&rf.path)
+    // Step 2b: Extract proto files (simple line parser, no tree-sitter needed)
+    let proto_id_base = id_counter.load(Ordering::Relaxed);
+    let mut proto_id = proto_id_base;
+    let mut proto_strings = StringInterner::new();
+    let mut all_proto_nodes: Vec<Node> = Vec::new();
+    let mut all_proto_services: Vec<(u16, Vec<ProtoService>)> = Vec::new();
+
+    for pf in &proto_files {
+        if let Ok(source) = std::fs::read_to_string(&pf.path) {
+            let path_str = pf
+                .path
+                .strip_prefix(&pf.root)
+                .unwrap_or(&pf.path)
                 .to_string_lossy();
-            let path_id = strings.intern(&path_str);
-
-            let file = ParsedFile {
-                tree,
-                source: &source,
-                path: path_id,
-                path_str: &path_str,
-                repo_id: rf.repo_id,
-            };
-
-            // Reserve IDs atomically
-            let base_id = id_counter.fetch_add(10000, Ordering::Relaxed);
-            let mut local_id = base_id;
-            result = extractor.extract(&file, &mut strings, &mut local_id);
-
-            // Update the actual count used
-            let used = local_id - base_id;
-            if used < 10000 {
-                // We over-allocated, but that's fine — IDs just need to be unique
+            let proto_result =
+                proto::extract_proto(&source, &path_str, &mut proto_strings, &mut proto_id);
+            // Tag proto nodes with repo_id
+            for mut node in proto_result.nodes {
+                node.repo = pf.repo_id;
+                all_proto_nodes.push(node);
             }
-
-            (result, strings, errors)
-        })
-        .collect();
+            if !proto_result.services.is_empty() {
+                all_proto_services.push((pf.repo_id, proto_result.services));
+            }
+        }
+    }
 
     // Step 5: Merge all results
-    let file_count = per_file_results.len();
+    let file_count = per_file_results.len() + proto_files.len();
     let mut all_nodes: Vec<Node> = Vec::new();
     let mut all_edges: Vec<EdgeInput> = Vec::new();
     let mut merged_strings = StringInterner::new();
     let mut all_errors: Vec<String> = Vec::new();
     let mut all_unresolved: Vec<UnresolvedCall> = Vec::new();
 
+    // Collect gRPC data per repo
+    let mut grpc_clients_by_repo: rustc_hash::FxHashMap<u16, Vec<GrpcClientStub>> =
+        rustc_hash::FxHashMap::default();
+    let mut grpc_servers_by_repo: rustc_hash::FxHashMap<u16, Vec<GrpcServerRegistration>> =
+        rustc_hash::FxHashMap::default();
+
     // Remap string IDs and node IDs from per-file interners into merged
-    for (result, file_strings, errors) in per_file_results {
+    // We need to track which repo each file result came from for gRPC data grouping
+    let repo_ids: Vec<u16> = all_repo_files
+        .iter()
+        .filter_map(|rf| {
+            Language::from_path(&rf.path)?;
+            Some(rf.repo_id)
+        })
+        .collect();
+
+    for (i, (result, file_strings, errors, grpc_scan)) in per_file_results.into_iter().enumerate()
+    {
         all_errors.extend(errors);
 
-        let mut string_remap: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
+        // Collect gRPC scan data grouped by repo
+        let repo_id = repo_ids[i];
+        if !grpc_scan.client_stubs.is_empty() {
+            grpc_clients_by_repo
+                .entry(repo_id)
+                .or_default()
+                .extend(grpc_scan.client_stubs);
+        }
+        if !grpc_scan.server_registrations.is_empty() {
+            grpc_servers_by_repo
+                .entry(repo_id)
+                .or_default()
+                .extend(grpc_scan.server_registrations);
+        }
+
+        let mut string_remap: rustc_hash::FxHashMap<u32, u32> =
+            rustc_hash::FxHashMap::default();
         let mut id_remap: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
 
         // Remap nodes — assign sequential IDs
@@ -157,9 +283,18 @@ pub fn index_repos(repos: &[(PathBuf, u16)]) -> crate::Result<IndexResult> {
             let new_id = all_nodes.len() as u32;
             id_remap.insert(old_id, new_id);
             node.id = new_id;
-            node.name = remap_string(node.name, &file_strings, &mut merged_strings, &mut string_remap);
-            node.file = remap_string(node.file, &file_strings, &mut merged_strings, &mut string_remap);
-            // Remap parent if present
+            node.name = remap_string(
+                node.name,
+                &file_strings,
+                &mut merged_strings,
+                &mut string_remap,
+            );
+            node.file = remap_string(
+                node.file,
+                &file_strings,
+                &mut merged_strings,
+                &mut string_remap,
+            );
             if node.parent != u32::MAX {
                 if let Some(&new_parent) = id_remap.get(&node.parent) {
                     node.parent = new_parent;
@@ -196,23 +331,39 @@ pub fn index_repos(repos: &[(PathBuf, u16)]) -> crate::Result<IndexResult> {
         }
     }
 
-    // Step 5b: Deduplicate nodes with same (name, kind) that have no file
-    // (e.g., external Module nodes like "context", "fmt" created per-import)
-    // Also dedup Endpoint/Resource nodes with same name and file
+    // Merge proto nodes into the main node list
     {
-        // Map (name, kind) → canonical node ID for fileless nodes
-        // Map (name, kind, file) → canonical node ID for nodes with files
+        let mut proto_string_remap: rustc_hash::FxHashMap<u32, u32> =
+            rustc_hash::FxHashMap::default();
+        for mut node in all_proto_nodes {
+            node.id = all_nodes.len() as u32;
+            node.name = remap_string(
+                node.name,
+                &proto_strings,
+                &mut merged_strings,
+                &mut proto_string_remap,
+            );
+            node.file = remap_string(
+                node.file,
+                &proto_strings,
+                &mut merged_strings,
+                &mut proto_string_remap,
+            );
+            all_nodes.push(node);
+        }
+    }
+
+    // Step 5b: Deduplicate nodes
+    {
         let mut canonical_fileless: rustc_hash::FxHashMap<(u32, u8), u32> =
             rustc_hash::FxHashMap::default();
         let mut canonical_with_file: rustc_hash::FxHashMap<(u32, u8, u32), u32> =
             rustc_hash::FxHashMap::default();
-        // old_id → canonical_id for duplicates
         let mut dedup_remap: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
         let mut keep = vec![true; all_nodes.len()];
 
         for (idx, node) in all_nodes.iter().enumerate() {
             if node.file == u32::MAX {
-                // External (fileless) node — dedup by (name, kind)
                 let key = (node.name, node.kind);
                 match canonical_fileless.entry(key) {
                     std::collections::hash_map::Entry::Occupied(e) => {
@@ -226,7 +377,6 @@ pub fn index_repos(repos: &[(PathBuf, u16)]) -> crate::Result<IndexResult> {
             } else if node.kind == NodeKind::Endpoint as u8
                 || node.kind == NodeKind::Resource as u8
             {
-                // Endpoint/Resource nodes — dedup by (name, kind, file)
                 let key = (node.name, node.kind, node.file);
                 match canonical_with_file.entry(key) {
                     std::collections::hash_map::Entry::Occupied(e) => {
@@ -241,7 +391,6 @@ pub fn index_repos(repos: &[(PathBuf, u16)]) -> crate::Result<IndexResult> {
         }
 
         if !dedup_remap.is_empty() {
-            // Remove duplicate nodes
             let mut idx = 0;
             all_nodes.retain(|_| {
                 let k = keep[idx];
@@ -249,21 +398,18 @@ pub fn index_repos(repos: &[(PathBuf, u16)]) -> crate::Result<IndexResult> {
                 k
             });
 
-            // Reassign sequential IDs and build old→new remap
             let mut id_reassign: rustc_hash::FxHashMap<u32, u32> =
                 rustc_hash::FxHashMap::default();
             for (new_idx, node) in all_nodes.iter_mut().enumerate() {
                 id_reassign.insert(node.id, new_idx as u32);
                 node.id = new_idx as u32;
             }
-            // Also map removed duplicates through: old_dup_id → canonical_id → new_sequential_id
             for (dup_id, canonical_id) in &dedup_remap {
                 if let Some(&new_id) = id_reassign.get(canonical_id) {
                     id_reassign.insert(*dup_id, new_id);
                 }
             }
 
-            // Remap edge targets/sources
             for edge in &mut all_edges {
                 if let Some(&new_id) = id_reassign.get(&edge.source) {
                     edge.source = new_id;
@@ -273,14 +419,12 @@ pub fn index_repos(repos: &[(PathBuf, u16)]) -> crate::Result<IndexResult> {
                 }
             }
 
-            // Remap unresolved call caller IDs
             for call in &mut all_unresolved {
                 if let Some(&new_id) = id_reassign.get(&call.caller_id) {
                     call.caller_id = new_id;
                 }
             }
 
-            // Remap parent references
             for node in &mut all_nodes {
                 if node.parent != u32::MAX {
                     if let Some(&new_id) = id_reassign.get(&node.parent) {
@@ -292,11 +436,9 @@ pub fn index_repos(repos: &[(PathBuf, u16)]) -> crate::Result<IndexResult> {
     }
 
     // Step 5c: Cross-file call resolution
-    // Build a map from symbol name → node ID for all Symbol nodes
     let mut symbol_by_name: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
     for node in &all_nodes {
         if node.kind == NodeKind::Symbol as u8 {
-            // If multiple symbols share a name, keep the first (could be improved with package context)
             symbol_by_name.entry(node.name).or_insert(node.id);
         }
     }
@@ -304,29 +446,52 @@ pub fn index_repos(repos: &[(PathBuf, u16)]) -> crate::Result<IndexResult> {
     for call in &all_unresolved {
         if let Some(&target_id) = symbol_by_name.get(&call.target_name) {
             if target_id != call.caller_id {
-                all_edges.push(EdgeInput::new(call.caller_id, target_id, EdgeKind::Calls));
+                all_edges.push(EdgeInput::new(
+                    call.caller_id,
+                    target_id,
+                    EdgeKind::Calls,
+                ));
             }
         }
     }
 
-    // Step 5d: Cross-repo endpoint resolution
-    // Match Endpoint nodes with the same name across repos (e.g., gRPC client→server,
-    // HTTP client calls to server endpoints). If an Endpoint node in repo A has the
-    // same name as an Endpoint node in repo B, create a DependsOn edge between their
-    // parent nodes.
+    // Step 5d: Cross-repo endpoint resolution (name-based)
     resolve_cross_repo_endpoints(&all_nodes, &mut all_edges);
 
-    // Step 6: Build CsrGraph
-    let node_count = all_nodes.len() as u32;
-    let edge_count = all_edges.len() as u32;
-    let graph = CsrGraph::build(all_nodes, all_edges, merged_strings);
+    // Build gRPC/proto output data
+    let grpc_clients: Vec<(String, Vec<GrpcClientStub>)> = grpc_clients_by_repo
+        .into_iter()
+        .map(|(id, stubs)| {
+            let name = repo_names.get(&id).cloned().unwrap_or_default();
+            (name, stubs)
+        })
+        .collect();
 
-    Ok(IndexResult {
-        graph,
+    let grpc_servers: Vec<(String, Vec<GrpcServerRegistration>)> = grpc_servers_by_repo
+        .into_iter()
+        .map(|(id, regs)| {
+            let name = repo_names.get(&id).cloned().unwrap_or_default();
+            (name, regs)
+        })
+        .collect();
+
+    let proto_services_out: Vec<(String, Vec<ProtoService>)> = all_proto_services
+        .into_iter()
+        .map(|(id, svcs)| {
+            let name = repo_names.get(&id).cloned().unwrap_or_default();
+            (name, svcs)
+        })
+        .collect();
+
+    Ok(MergedResult {
+        nodes: all_nodes,
+        edges: all_edges,
+        strings: merged_strings,
         file_count,
-        node_count,
-        edge_count,
         errors: all_errors,
+        grpc_clients,
+        grpc_servers,
+        proto_services: proto_services_out,
     })
 }
 
@@ -335,8 +500,7 @@ pub fn index_repos(repos: &[(PathBuf, u16)]) -> crate::Result<IndexResult> {
 fn resolve_cross_repo_endpoints(nodes: &[Node], edges: &mut Vec<EdgeInput>) {
     use rustc_hash::FxHashMap;
 
-    // Group Endpoint nodes by name, tracking which repo they're from
-    let mut endpoints_by_name: FxHashMap<u32, Vec<(u32, u16)>> = FxHashMap::default(); // name → [(node_id, repo_id)]
+    let mut endpoints_by_name: FxHashMap<u32, Vec<(u32, u16)>> = FxHashMap::default();
     for node in nodes {
         if node.kind == NodeKind::Endpoint as u8 {
             endpoints_by_name
@@ -346,16 +510,13 @@ fn resolve_cross_repo_endpoints(nodes: &[Node], edges: &mut Vec<EdgeInput>) {
         }
     }
 
-    // For each name with endpoints in multiple repos, create Connects edges
     for eps in endpoints_by_name.values() {
         if eps.len() < 2 {
             continue;
         }
-        // Connect endpoints across different repos
         for i in 0..eps.len() {
             for j in (i + 1)..eps.len() {
                 if eps[i].1 != eps[j].1 {
-                    // Different repos — create bidirectional Connects edges
                     edges.push(EdgeInput::new(eps[i].0, eps[j].0, EdgeKind::Connects));
                     edges.push(EdgeInput::new(eps[j].0, eps[i].0, EdgeKind::Connects));
                 }
@@ -399,7 +560,6 @@ fn collect_files(root: &Path) -> crate::Result<Vec<PathBuf>> {
                 files.push(e.into_path());
             }
             Err(e) => {
-                // Non-fatal: log and continue
                 eprintln!("walk error: {}", e);
             }
             _ => {}
@@ -474,9 +634,12 @@ func newServer() *Server {
 
         assert_eq!(result.file_count, 2, "should process 2 Go files");
         assert!(result.node_count > 0, "should find symbols");
-        assert!(result.errors.is_empty(), "should have no errors: {:?}", result.errors);
+        assert!(
+            result.errors.is_empty(),
+            "should have no errors: {:?}",
+            result.errors
+        );
 
-        // Check specific symbols exist
         let names: Vec<&str> = result
             .graph
             .nodes
@@ -514,8 +677,6 @@ func newServer() *Server {
 
         let result = index_directory(dir.path()).unwrap();
 
-        // Should only process main.go, not README.md or data.json
-        // file_count includes only files that had a matching language
         assert!(result.node_count > 0, "should find Go symbols");
 
         let names: Vec<&str> = result
@@ -533,24 +694,18 @@ func newServer() *Server {
     fn index_respects_gitignore() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Init git repo so .gitignore is respected
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(dir.path())
             .output()
             .unwrap();
 
-        // Create .gitignore
         fs::write(dir.path().join(".gitignore"), "vendor/\n").unwrap();
-
-        // Create a file that should be indexed
         fs::write(
             dir.path().join("main.go"),
             "package main\nfunc included() {}\n",
         )
         .unwrap();
-
-        // Create a file in vendor/ that should be ignored
         fs::create_dir(dir.path().join("vendor")).unwrap();
         fs::write(
             dir.path().join("vendor/dep.go"),
@@ -569,51 +724,45 @@ func newServer() *Server {
             .collect();
 
         assert!(names.contains(&"included"), "should find included");
-        assert!(!names.contains(&"excluded"), "should not find excluded (gitignored)");
+        assert!(
+            !names.contains(&"excluded"),
+            "should not find excluded (gitignored)"
+        );
     }
 
     #[test]
     fn index_respects_gitignore_venv_and_nested() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Init git repo so .gitignore is respected
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(dir.path())
             .output()
             .unwrap();
 
-        // Create .gitignore with multiple patterns
         fs::write(
             dir.path().join(".gitignore"),
             "venv/\nnode_modules/\n*.generated.go\n",
         )
         .unwrap();
 
-        // Indexed: normal Go file
         fs::write(
             dir.path().join("main.go"),
             "package main\nfunc keepMe() {}\n",
         )
         .unwrap();
-
-        // Ignored: venv/ directory (Python virtualenv)
         fs::create_dir_all(dir.path().join("venv/lib")).unwrap();
         fs::write(
             dir.path().join("venv/lib/setup.go"),
             "package lib\nfunc venvFunc() {}\n",
         )
         .unwrap();
-
-        // Ignored: node_modules/
         fs::create_dir(dir.path().join("node_modules")).unwrap();
         fs::write(
             dir.path().join("node_modules/pkg.go"),
             "package pkg\nfunc nodeFunc() {}\n",
         )
         .unwrap();
-
-        // Ignored: wildcard pattern *.generated.go
         fs::write(
             dir.path().join("api.generated.go"),
             "package main\nfunc generatedFunc() {}\n",
@@ -633,7 +782,10 @@ func newServer() *Server {
         assert!(names.contains(&"keepMe"), "should index normal file");
         assert!(!names.contains(&"venvFunc"), "should ignore venv/");
         assert!(!names.contains(&"nodeFunc"), "should ignore node_modules/");
-        assert!(!names.contains(&"generatedFunc"), "should ignore *.generated.go");
+        assert!(
+            !names.contains(&"generatedFunc"),
+            "should ignore *.generated.go"
+        );
     }
 
     #[test]
@@ -646,7 +798,6 @@ func newServer() *Server {
             .output()
             .unwrap();
 
-        // Package "transport" with StartWSServer
         fs::create_dir(dir.path().join("transport")).unwrap();
         fs::write(
             dir.path().join("transport/ws.go"),
@@ -661,7 +812,6 @@ func loggingMiddleware() {}
         )
         .unwrap();
 
-        // Package "main" calls transport.StartWSServer()
         fs::write(
             dir.path().join("main.go"),
             r#"package main
@@ -677,14 +827,12 @@ func main() {
 
         let result = index_directory(dir.path()).unwrap();
 
-        // Find node IDs
         let main_id = result
             .graph
             .nodes
             .iter()
             .find(|n| {
-                result.graph.strings.get(n.name) == "main"
-                    && n.kind == NodeKind::Symbol as u8
+                result.graph.strings.get(n.name) == "main" && n.kind == NodeKind::Symbol as u8
             })
             .map(|n| n.id)
             .expect("main function should exist");
@@ -700,26 +848,44 @@ func main() {
             .map(|n| n.id)
             .expect("StartWSServer should exist");
 
-        // There should be a Calls edge from main → StartWSServer (cross-package)
-        let has_cross_call = result.graph.edges_for(
-            result.graph.nodes.iter().position(|n| n.id == main_id).unwrap() as u32
-        ).iter().any(|e| {
-            let target_node = result.graph.node(e.target);
-            result.graph.strings.get(target_node.name) == "StartWSServer"
-                && e.kind == EdgeKind::Calls as u8
-        });
+        let has_cross_call = result
+            .graph
+            .edges_for(
+                result
+                    .graph
+                    .nodes
+                    .iter()
+                    .position(|n| n.id == main_id)
+                    .unwrap() as u32,
+            )
+            .iter()
+            .any(|e| {
+                let target_node = result.graph.node(e.target);
+                result.graph.strings.get(target_node.name) == "StartWSServer"
+                    && e.kind == EdgeKind::Calls as u8
+            });
 
-        assert!(has_cross_call, "main should have a Calls edge to StartWSServer (cross-package)");
+        assert!(
+            has_cross_call,
+            "main should have a Calls edge to StartWSServer (cross-package)"
+        );
 
-        // Intra-file call should still work: StartWSServer → loggingMiddleware
-        let start_ws_idx = result.graph.nodes.iter().position(|n| n.id == start_ws_id).unwrap() as u32;
+        let start_ws_idx = result
+            .graph
+            .nodes
+            .iter()
+            .position(|n| n.id == start_ws_id)
+            .unwrap() as u32;
         let has_intra_call = result.graph.edges_for(start_ws_idx).iter().any(|e| {
             let target_node = result.graph.node(e.target);
             result.graph.strings.get(target_node.name) == "loggingMiddleware"
                 && e.kind == EdgeKind::Calls as u8
         });
 
-        assert!(has_intra_call, "StartWSServer should call loggingMiddleware (intra-file)");
+        assert!(
+            has_intra_call,
+            "StartWSServer should call loggingMiddleware (intra-file)"
+        );
     }
 
     #[test]
@@ -729,7 +895,6 @@ func main() {
 
         let result = index_directory(dir.path()).unwrap();
 
-        // Graph should be queryable
         let graph = &result.graph;
         assert!(graph.node_count() > 0);
         assert_eq!(graph.offsets.len() as u32, graph.node_count() + 1);
@@ -741,86 +906,93 @@ func main() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // cmd/server/main.go
         fs::create_dir_all(root.join("cmd/server")).unwrap();
-        fs::write(root.join("cmd/server/main.go"), r#"package main
+        fs::write(
+            root.join("cmd/server/main.go"),
+            "package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"server starting\") }\n",
+        )
+        .unwrap();
 
-import "fmt"
-
-func main() {
-    fmt.Println("server starting")
-}
-"#).unwrap();
-
-        // cmd/migrate/main.go
         fs::create_dir_all(root.join("cmd/migrate")).unwrap();
-        fs::write(root.join("cmd/migrate/main.go"), r#"package main
+        fs::write(
+            root.join("cmd/migrate/main.go"),
+            "package main\nfunc main() {}\n",
+        )
+        .unwrap();
 
-func main() {}
-"#).unwrap();
-
-        // pkg/auth/login.go
         fs::create_dir_all(root.join("pkg/auth")).unwrap();
-        fs::write(root.join("pkg/auth/login.go"), r#"package auth
+        fs::write(
+            root.join("pkg/auth/login.go"),
+            "package auth\nfunc Login() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("pkg/auth/token.go"),
+            "package auth\nfunc ValidateToken() {}\n",
+        )
+        .unwrap();
 
-func Login() {}
-"#).unwrap();
-
-        // pkg/auth/token.go
-        fs::write(root.join("pkg/auth/token.go"), r#"package auth
-
-func ValidateToken() {}
-"#).unwrap();
-
-        // internal/db/query.go
         fs::create_dir_all(root.join("internal/db")).unwrap();
-        fs::write(root.join("internal/db/query.go"), r#"package db
-
-func Query() {}
-"#).unwrap();
+        fs::write(
+            root.join("internal/db/query.go"),
+            "package db\nfunc Query() {}\n",
+        )
+        .unwrap();
 
         let result = index_directory(root).unwrap();
         let graph = &result.graph;
 
-        // 2 Deployable nodes (from the two package main files)
-        let deployables: Vec<&str> = graph.nodes.iter()
+        let deployables: Vec<&str> = graph
+            .nodes
+            .iter()
             .filter(|n| n.kind == NodeKind::Deployable as u8)
             .map(|n| graph.strings.get(n.name))
             .collect();
-        assert_eq!(deployables.len(), 2, "should have 2 deployables, got: {:?}", deployables);
+        assert_eq!(
+            deployables.len(),
+            2,
+            "should have 2 deployables, got: {:?}",
+            deployables
+        );
 
-        // 3 distinct Module nodes (auth x2 deduplicated to auth, db, but auth appears in two files)
-        // Actually each file produces its own Module node, so auth appears twice, db once = 3 Module nodes
-        let modules: Vec<&str> = graph.nodes.iter()
+        let modules: Vec<&str> = graph
+            .nodes
+            .iter()
             .filter(|n| n.kind == NodeKind::Module as u8)
             .map(|n| graph.strings.get(n.name))
             .collect();
         assert!(modules.contains(&"auth"), "should have auth module");
         assert!(modules.contains(&"db"), "should have db module");
-        assert!(!modules.contains(&"main"), "main should be Deployable, not Module");
+        assert!(
+            !modules.contains(&"main"),
+            "main should be Deployable, not Module"
+        );
 
-        // Symbol count: main(2) + Login + ValidateToken + Query = 5 functions
-        let symbols: Vec<&str> = graph.nodes.iter()
+        let symbols: Vec<&str> = graph
+            .nodes
+            .iter()
             .filter(|n| n.kind == NodeKind::Symbol as u8 && n.sub_kind == 0)
             .map(|n| graph.strings.get(n.name))
             .collect();
         assert!(symbols.contains(&"Login"), "should find Login");
-        assert!(symbols.contains(&"ValidateToken"), "should find ValidateToken");
+        assert!(
+            symbols.contains(&"ValidateToken"),
+            "should find ValidateToken"
+        );
         assert!(symbols.contains(&"Query"), "should find Query");
-        assert_eq!(symbols.iter().filter(|&&s| s == "main").count(), 2, "should have 2 main functions");
+        assert_eq!(
+            symbols.iter().filter(|&&s| s == "main").count(),
+            2,
+            "should have 2 main functions"
+        );
     }
 
     #[test]
     fn extractor_parse_failure_nonfatal() {
-        // TEST extractor_parse_failure_nonfatal from ARCHITECTURE.md:
-        // Repo with 10 Go files. File 5 has syntax errors (invalid Go).
-        // Other 9 files indexed successfully. Graph contains symbols from good files.
         let dir = tempfile::tempdir().unwrap();
 
         for i in 0..10 {
             let content = if i == 5 {
-                // Invalid Go — tree-sitter will still produce a tree (it's error-tolerant)
-                // but extraction should produce fewer/no useful symbols
                 "package main\n\nfunc {{{ invalid syntax @@@ }}}\n".to_string()
             } else {
                 format!("package main\n\nfunc func_{}() {{}}\n", i)
@@ -830,7 +1002,6 @@ func Query() {}
 
         let result = index_directory(dir.path()).unwrap();
 
-        // Should have symbols from the 9 good files
         let func_names: Vec<&str> = result
             .graph
             .nodes
@@ -839,7 +1010,6 @@ func Query() {}
             .map(|n| result.graph.strings.get(n.name))
             .collect();
 
-        // Should find at least 9 functions (func_0 through func_9, excluding func_5)
         for i in 0..10 {
             if i == 5 {
                 continue;
@@ -852,9 +1022,6 @@ func Query() {}
                 func_names.len()
             );
         }
-
-        // Pipeline should not have fatal errors
-        // (parse failures are non-fatal per ARCHITECTURE.md)
     }
 
     #[test]
@@ -862,14 +1029,12 @@ func Query() {}
         let repo_a = tempfile::tempdir().unwrap();
         let repo_b = tempfile::tempdir().unwrap();
 
-        // Repo A: a server
         fs::write(
             repo_a.path().join("server.go"),
             "package main\nfunc ServeHTTP() {}\nfunc handleAuth() {}\n",
         )
         .unwrap();
 
-        // Repo B: a client
         fs::write(
             repo_b.path().join("client.go"),
             "package main\nfunc CallServer() {}\nfunc retry() {}\n",
@@ -882,7 +1047,6 @@ func Query() {}
         ];
         let result = index_repos(&repos).unwrap();
 
-        // Should have nodes from both repos
         let names: Vec<&str> = result
             .graph
             .nodes
@@ -896,10 +1060,117 @@ func Query() {}
         assert!(names.contains(&"CallServer"), "should have repo B symbols");
         assert!(names.contains(&"retry"), "should have repo B symbols");
 
-        // Nodes should have correct repo IDs
         let repo_a_nodes: Vec<_> = result.graph.nodes.iter().filter(|n| n.repo == 0).collect();
         let repo_b_nodes: Vec<_> = result.graph.nodes.iter().filter(|n| n.repo == 1).collect();
         assert!(!repo_a_nodes.is_empty(), "should have repo 0 nodes");
         assert!(!repo_b_nodes.is_empty(), "should have repo 1 nodes");
+    }
+
+    #[test]
+    fn extract_collects_grpc_data() {
+        let repo = tempfile::tempdir().unwrap();
+
+        fs::write(
+            repo.path().join("server.go"),
+            r#"package main
+
+import pb "example.com/proto/order"
+
+func main() {
+    s := grpc.NewServer()
+    pb.RegisterOrderProcessingServer(s, &handler{})
+    s.Serve(lis)
+}
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            repo.path().join("client.go"),
+            r#"package main
+
+import pb "example.com/proto/order"
+
+func callService() {
+    conn, _ := grpc.Dial("localhost:50051")
+    client := pb.NewOrderProcessingClient(conn)
+    _ = client
+}
+"#,
+        )
+        .unwrap();
+
+        let merged = extract_and_merge_repos(&[(repo.path().to_path_buf(), 0)]).unwrap();
+
+        let all_servers: Vec<&str> = merged
+            .grpc_servers
+            .iter()
+            .flat_map(|(_, regs)| regs.iter().map(|r| r.service_name.as_str()))
+            .collect();
+        let all_clients: Vec<&str> = merged
+            .grpc_clients
+            .iter()
+            .flat_map(|(_, stubs)| stubs.iter().map(|s| s.service_name.as_str()))
+            .collect();
+
+        assert!(
+            all_servers.contains(&"OrderProcessing"),
+            "should detect RegisterOrderProcessingServer, got: {:?}",
+            all_servers
+        );
+        assert!(
+            all_clients.contains(&"OrderProcessing"),
+            "should detect NewOrderProcessingClient, got: {:?}",
+            all_clients
+        );
+    }
+
+    #[test]
+    fn extract_collects_proto_services() {
+        let repo = tempfile::tempdir().unwrap();
+
+        fs::write(
+            repo.path().join("main.go"),
+            "package main\nfunc main() {}\n",
+        )
+        .unwrap();
+
+        fs::create_dir(repo.path().join("proto")).unwrap();
+        fs::write(
+            repo.path().join("proto/service.proto"),
+            r#"syntax = "proto3";
+package myapp;
+service Auth {
+  rpc Login (LoginRequest) returns (LoginResponse);
+}
+"#,
+        )
+        .unwrap();
+
+        let merged = extract_and_merge_repos(&[(repo.path().to_path_buf(), 0)]).unwrap();
+
+        let all_services: Vec<&str> = merged
+            .proto_services
+            .iter()
+            .flat_map(|(_, svcs)| svcs.iter().map(|s| s.name.as_str()))
+            .collect();
+        assert!(
+            all_services.contains(&"Auth"),
+            "should extract proto service, got: {:?}",
+            all_services
+        );
+
+        // Proto nodes should also appear in the node list
+        let node_names: Vec<&str> = merged
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Surface as u8 || n.kind == NodeKind::Endpoint as u8)
+            .map(|n| merged.strings.get(n.name))
+            .collect();
+        assert!(
+            node_names.iter().any(|n| n.contains("Auth")),
+            "proto Surface/Endpoint nodes should be in the graph, got: {:?}",
+            node_names
+        );
     }
 }

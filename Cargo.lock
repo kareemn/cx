@@ -400,6 +400,7 @@ dependencies = [
  "clap",
  "cx-core",
  "cx-extractors",
+ "cx-resolution",
  "libc",
  "rustc-hash",
  "serde",

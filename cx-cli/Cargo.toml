@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 cx-core = { path = "../cx-core" }
 cx-extractors = { path = "../cx-extractors" }
+cx-resolution = { path = "../cx-resolution" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

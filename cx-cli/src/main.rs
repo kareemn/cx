@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod indexing;
 mod mcp;
 
 use clap::{Parser, Subcommand};

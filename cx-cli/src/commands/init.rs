@@ -24,8 +24,7 @@ pub fn run(root: &Path) -> Result<()> {
         .map(|(i, r)| (r.path.clone(), i as u16))
         .collect();
 
-    let result = cx_extractors::pipeline::index_repos(&repos)
-        .context("failed to index repos")?;
+    let result = crate::indexing::index_repos_with_resolution(&repos)?;
 
     let elapsed = start.elapsed();
 
