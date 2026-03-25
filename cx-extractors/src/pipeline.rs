@@ -1,7 +1,8 @@
 use crate::grammars::{self, Language};
-use crate::universal::{ExtractionResult, ParsedFile};
+use crate::universal::{ExtractionResult, ParsedFile, UnresolvedCall};
 use cx_core::graph::csr::{CsrGraph, EdgeInput};
-use cx_core::graph::nodes::Node;
+use cx_core::graph::edges::EdgeKind;
+use cx_core::graph::nodes::{Node, NodeKind};
 use cx_core::graph::string_interner::StringInterner;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -123,6 +124,7 @@ pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
     let mut all_edges: Vec<EdgeInput> = Vec::new();
     let mut merged_strings = StringInterner::new();
     let mut all_errors: Vec<String> = Vec::new();
+    let mut all_unresolved: Vec<UnresolvedCall> = Vec::new();
 
     // Remap string IDs and node IDs from per-file interners into merged
     for (result, file_strings, errors) in per_file_results {
@@ -156,6 +158,135 @@ pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
                 edge.source = new_src;
                 edge.target = new_tgt;
                 all_edges.push(edge);
+            }
+        }
+
+        // Remap unresolved calls
+        for call in result.unresolved_calls {
+            if let Some(&new_caller) = id_remap.get(&call.caller_id) {
+                let new_target_name = remap_string(
+                    call.target_name,
+                    &file_strings,
+                    &mut merged_strings,
+                    &mut string_remap,
+                );
+                all_unresolved.push(UnresolvedCall {
+                    caller_id: new_caller,
+                    target_name: new_target_name,
+                });
+            }
+        }
+    }
+
+    // Step 5b: Deduplicate nodes with same (name, kind) that have no file
+    // (e.g., external Module nodes like "context", "fmt" created per-import)
+    // Also dedup Endpoint/Resource nodes with same name and file
+    {
+        // Map (name, kind) → canonical node ID for fileless nodes
+        // Map (name, kind, file) → canonical node ID for nodes with files
+        let mut canonical_fileless: rustc_hash::FxHashMap<(u32, u8), u32> =
+            rustc_hash::FxHashMap::default();
+        let mut canonical_with_file: rustc_hash::FxHashMap<(u32, u8, u32), u32> =
+            rustc_hash::FxHashMap::default();
+        // old_id → canonical_id for duplicates
+        let mut dedup_remap: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
+        let mut keep = vec![true; all_nodes.len()];
+
+        for (idx, node) in all_nodes.iter().enumerate() {
+            if node.file == u32::MAX {
+                // External (fileless) node — dedup by (name, kind)
+                let key = (node.name, node.kind);
+                match canonical_fileless.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        dedup_remap.insert(node.id, *e.get());
+                        keep[idx] = false;
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(node.id);
+                    }
+                }
+            } else if node.kind == NodeKind::Endpoint as u8
+                || node.kind == NodeKind::Resource as u8
+            {
+                // Endpoint/Resource nodes — dedup by (name, kind, file)
+                let key = (node.name, node.kind, node.file);
+                match canonical_with_file.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        dedup_remap.insert(node.id, *e.get());
+                        keep[idx] = false;
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(node.id);
+                    }
+                }
+            }
+        }
+
+        if !dedup_remap.is_empty() {
+            // Remove duplicate nodes
+            let mut idx = 0;
+            all_nodes.retain(|_| {
+                let k = keep[idx];
+                idx += 1;
+                k
+            });
+
+            // Reassign sequential IDs and build old→new remap
+            let mut id_reassign: rustc_hash::FxHashMap<u32, u32> =
+                rustc_hash::FxHashMap::default();
+            for (new_idx, node) in all_nodes.iter_mut().enumerate() {
+                id_reassign.insert(node.id, new_idx as u32);
+                node.id = new_idx as u32;
+            }
+            // Also map removed duplicates through: old_dup_id → canonical_id → new_sequential_id
+            for (dup_id, canonical_id) in &dedup_remap {
+                if let Some(&new_id) = id_reassign.get(canonical_id) {
+                    id_reassign.insert(*dup_id, new_id);
+                }
+            }
+
+            // Remap edge targets/sources
+            for edge in &mut all_edges {
+                if let Some(&new_id) = id_reassign.get(&edge.source) {
+                    edge.source = new_id;
+                }
+                if let Some(&new_id) = id_reassign.get(&edge.target) {
+                    edge.target = new_id;
+                }
+            }
+
+            // Remap unresolved call caller IDs
+            for call in &mut all_unresolved {
+                if let Some(&new_id) = id_reassign.get(&call.caller_id) {
+                    call.caller_id = new_id;
+                }
+            }
+
+            // Remap parent references
+            for node in &mut all_nodes {
+                if node.parent != u32::MAX {
+                    if let Some(&new_id) = id_reassign.get(&node.parent) {
+                        node.parent = new_id;
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 5c: Cross-file call resolution
+    // Build a map from symbol name → node ID for all Symbol nodes
+    let mut symbol_by_name: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
+    for node in &all_nodes {
+        if node.kind == NodeKind::Symbol as u8 {
+            // If multiple symbols share a name, keep the first (could be improved with package context)
+            symbol_by_name.entry(node.name).or_insert(node.id);
+        }
+    }
+
+    for call in &all_unresolved {
+        if let Some(&target_id) = symbol_by_name.get(&call.target_name) {
+            if target_id != call.caller_id {
+                all_edges.push(EdgeInput::new(call.caller_id, target_id, EdgeKind::Calls));
             }
         }
     }
@@ -444,6 +575,92 @@ func newServer() *Server {
         assert!(!names.contains(&"venvFunc"), "should ignore venv/");
         assert!(!names.contains(&"nodeFunc"), "should ignore node_modules/");
         assert!(!names.contains(&"generatedFunc"), "should ignore *.generated.go");
+    }
+
+    #[test]
+    fn cross_package_call_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Package "transport" with StartWSServer
+        fs::create_dir(dir.path().join("transport")).unwrap();
+        fs::write(
+            dir.path().join("transport/ws.go"),
+            r#"package transport
+
+func StartWSServer() {
+    loggingMiddleware()
+}
+
+func loggingMiddleware() {}
+"#,
+        )
+        .unwrap();
+
+        // Package "main" calls transport.StartWSServer()
+        fs::write(
+            dir.path().join("main.go"),
+            r#"package main
+
+import "myapp/transport"
+
+func main() {
+    transport.StartWSServer()
+}
+"#,
+        )
+        .unwrap();
+
+        let result = index_directory(dir.path()).unwrap();
+
+        // Find node IDs
+        let main_id = result
+            .graph
+            .nodes
+            .iter()
+            .find(|n| {
+                result.graph.strings.get(n.name) == "main"
+                    && n.kind == NodeKind::Symbol as u8
+            })
+            .map(|n| n.id)
+            .expect("main function should exist");
+
+        let start_ws_id = result
+            .graph
+            .nodes
+            .iter()
+            .find(|n| {
+                result.graph.strings.get(n.name) == "StartWSServer"
+                    && n.kind == NodeKind::Symbol as u8
+            })
+            .map(|n| n.id)
+            .expect("StartWSServer should exist");
+
+        // There should be a Calls edge from main → StartWSServer (cross-package)
+        let has_cross_call = result.graph.edges_for(
+            result.graph.nodes.iter().position(|n| n.id == main_id).unwrap() as u32
+        ).iter().any(|e| {
+            let target_node = result.graph.node(e.target);
+            result.graph.strings.get(target_node.name) == "StartWSServer"
+                && e.kind == EdgeKind::Calls as u8
+        });
+
+        assert!(has_cross_call, "main should have a Calls edge to StartWSServer (cross-package)");
+
+        // Intra-file call should still work: StartWSServer → loggingMiddleware
+        let start_ws_idx = result.graph.nodes.iter().position(|n| n.id == start_ws_id).unwrap() as u32;
+        let has_intra_call = result.graph.edges_for(start_ws_idx).iter().any(|e| {
+            let target_node = result.graph.node(e.target);
+            result.graph.strings.get(target_node.name) == "loggingMiddleware"
+                && e.kind == EdgeKind::Calls as u8
+        });
+
+        assert!(has_intra_call, "StartWSServer should call loggingMiddleware (intra-file)");
     }
 
     #[test]

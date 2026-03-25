@@ -93,21 +93,36 @@ impl TrigramIndex {
             return Vec::new();
         }
 
-        // Filter: candidates must match at least some trigrams, then rank
+        // Filter: candidates must match at least a quarter of query trigrams
+        let min_trigrams = std::cmp::max(1, query_trigrams.len() as u32 / 4);
         let mut candidates: Vec<(StringId, u32)> = candidate_scores
             .into_iter()
-            .filter(|&(_, count)| count > 0)
+            .filter(|&(_, count)| count >= min_trigrams)
             .collect();
 
-        // Sort by: trigram match count desc, then by substring match quality
+        // Score each candidate: exact match > prefix > substring > trigram-only
+        let score = |id: StringId, trigram_count: u32| -> (u32, u32, u32) {
+            let s = strings.get(id).to_ascii_lowercase();
+            let exact = if s == lower_query { 3 } else { 0 };
+            let prefix = if exact == 0 && s.starts_with(&lower_query) {
+                2
+            } else {
+                0
+            };
+            let substring = if exact == 0 && prefix == 0 && s.contains(&lower_query) {
+                1
+            } else {
+                0
+            };
+            let quality = exact + prefix + substring;
+            // Sort key: (quality desc, trigram_count desc, length asc for tiebreak)
+            (quality, trigram_count, u32::MAX - s.len() as u32)
+        };
+
         candidates.sort_unstable_by(|a, b| {
-            b.1.cmp(&a.1).then_with(|| {
-                let a_str = strings.get(a.0).to_ascii_lowercase();
-                let b_str = strings.get(b.0).to_ascii_lowercase();
-                let a_exact = a_str.contains(&lower_query);
-                let b_exact = b_str.contains(&lower_query);
-                b_exact.cmp(&a_exact).then_with(|| a_str.len().cmp(&b_str.len()))
-            })
+            let sa = score(a.0, a.1);
+            let sb = score(b.0, b.1);
+            sb.cmp(&sa)
         });
 
         candidates.into_iter().map(|(id, _)| id).collect()

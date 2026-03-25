@@ -88,7 +88,8 @@ impl CsrGraph {
                 (source, edge)
             })
             .collect();
-        forward.sort_unstable_by_key(|(src, e)| (*src, e.kind));
+        forward.sort_unstable_by_key(|(src, e)| (*src, e.kind, e.target));
+        forward.dedup_by(|a, b| a.0 == b.0 && a.1.kind == b.1.kind && a.1.target == b.1.target);
 
         // Build forward offsets and edges arrays
         let mut offsets = Vec::with_capacity(n + 1);
@@ -115,7 +116,8 @@ impl CsrGraph {
                 (target, edge)
             })
             .collect();
-        reverse.sort_unstable_by_key(|(tgt, e)| (*tgt, e.kind));
+        reverse.sort_unstable_by_key(|(tgt, e)| (*tgt, e.kind, e.target));
+        reverse.dedup_by(|a, b| a.0 == b.0 && a.1.kind == b.1.kind && a.1.target == b.1.target);
 
         let mut rev_offsets = Vec::with_capacity(n + 1);
         let mut rev_edges = Vec::with_capacity(reverse.len());

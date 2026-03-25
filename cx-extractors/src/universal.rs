@@ -4,10 +4,18 @@ use cx_core::graph::nodes::{Node, NodeId, NodeKind, StringId};
 use cx_core::graph::string_interner::StringInterner;
 use streaming_iterator::StreamingIterator;
 
+/// An unresolved call: the caller node ID and the call target name.
+pub struct UnresolvedCall {
+    pub caller_id: NodeId,
+    pub target_name: StringId,
+}
+
 /// Result of extraction from a single file.
 pub struct ExtractionResult {
     pub nodes: Vec<Node>,
     pub edges: Vec<EdgeInput>,
+    /// Calls that couldn't be resolved within this file (cross-package).
+    pub unresolved_calls: Vec<UnresolvedCall>,
 }
 
 impl ExtractionResult {
@@ -15,6 +23,7 @@ impl ExtractionResult {
         Self {
             nodes: Vec::new(),
             edges: Vec::new(),
+            unresolved_calls: Vec::new(),
         }
     }
 
@@ -22,6 +31,7 @@ impl ExtractionResult {
         Self {
             nodes: Vec::with_capacity(nodes),
             edges: Vec::with_capacity(edges),
+            unresolved_calls: Vec::new(),
         }
     }
 }
@@ -387,24 +397,31 @@ impl UniversalExtractor {
         for (call_name, byte_offset) in &call_sites {
             let call_name_id = strings.intern(call_name);
 
-            // Find the target: a defined symbol with this name
+            // Find the enclosing function first
+            let caller = defined_symbols
+                .iter()
+                .find(|(_, _, start, end)| *start <= *byte_offset && *byte_offset < *end);
+
+            let caller_id = match caller {
+                Some(&(_, id, _, _)) => id,
+                None => continue,
+            };
+
+            // Find the target: a defined symbol with this name in this file
             let target = defined_symbols
                 .iter()
-                .find(|(name, _, _, _)| *name == call_name_id);
+                .find(|(name, id, _, _)| *name == call_name_id && *id != caller_id);
 
             if let Some(&(_, target_id, _, _)) = target {
-                // Find the enclosing function: the defined symbol whose byte range contains this call
-                let caller = defined_symbols
-                    .iter()
-                    .find(|(_, id, start, end)| {
-                        *id != target_id && *start <= *byte_offset && *byte_offset < *end
-                    });
-
-                if let Some(&(_, caller_id, _, _)) = caller {
-                    result
-                        .edges
-                        .push(EdgeInput::new(caller_id, target_id, EdgeKind::Calls));
-                }
+                result
+                    .edges
+                    .push(EdgeInput::new(caller_id, target_id, EdgeKind::Calls));
+            } else {
+                // Unresolved — likely a cross-package call
+                result.unresolved_calls.push(UnresolvedCall {
+                    caller_id,
+                    target_name: call_name_id,
+                });
             }
         }
 
