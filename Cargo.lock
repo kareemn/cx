@@ -407,6 +407,7 @@ dependencies = [
 name = "cx-core"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "criterion",
  "crossbeam-channel",
  "dashmap",
@@ -421,6 +422,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "tempfile",
  "thiserror",
  "toml",
 ]

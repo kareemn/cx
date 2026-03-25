@@ -3,4 +3,5 @@ pub mod csr;
 pub mod edges;
 pub mod kind_index;
 pub mod nodes;
+pub mod string_interner;
 pub mod summary;
