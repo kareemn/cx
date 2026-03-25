@@ -2,6 +2,7 @@ pub mod database;
 pub mod dockerfile;
 pub mod envvar;
 pub mod grammars;
+pub mod grpc;
 pub mod grpc_client;
 pub mod grpc_server;
 pub mod helm;

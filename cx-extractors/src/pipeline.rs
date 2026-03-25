@@ -469,4 +469,51 @@ func Query() {}
         assert!(symbols.contains(&"Query"), "should find Query");
         assert_eq!(symbols.iter().filter(|&&s| s == "main").count(), 2, "should have 2 main functions");
     }
+
+    #[test]
+    fn extractor_parse_failure_nonfatal() {
+        // TEST extractor_parse_failure_nonfatal from ARCHITECTURE.md:
+        // Repo with 10 Go files. File 5 has syntax errors (invalid Go).
+        // Other 9 files indexed successfully. Graph contains symbols from good files.
+        let dir = tempfile::tempdir().unwrap();
+
+        for i in 0..10 {
+            let content = if i == 5 {
+                // Invalid Go — tree-sitter will still produce a tree (it's error-tolerant)
+                // but extraction should produce fewer/no useful symbols
+                "package main\n\nfunc {{{ invalid syntax @@@ }}}\n".to_string()
+            } else {
+                format!("package main\n\nfunc func_{}() {{}}\n", i)
+            };
+            fs::write(dir.path().join(format!("file_{}.go", i)), content).unwrap();
+        }
+
+        let result = index_directory(dir.path()).unwrap();
+
+        // Should have symbols from the 9 good files
+        let func_names: Vec<&str> = result
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Symbol as u8 && n.sub_kind == 0)
+            .map(|n| result.graph.strings.get(n.name))
+            .collect();
+
+        // Should find at least 9 functions (func_0 through func_9, excluding func_5)
+        for i in 0..10 {
+            if i == 5 {
+                continue;
+            }
+            let name = format!("func_{}", i);
+            assert!(
+                func_names.contains(&name.as_str()),
+                "should find {} from good files, got: {:?}",
+                name,
+                func_names.len()
+            );
+        }
+
+        // Pipeline should not have fatal errors
+        // (parse failures are non-fatal per ARCHITECTURE.md)
+    }
 }

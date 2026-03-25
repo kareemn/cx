@@ -465,9 +465,12 @@ name = "cx-resolution"
 version = "0.1.0"
 dependencies = [
  "cx-core",
+ "cx-extractors",
  "reqwest",
+ "rustc-hash",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
