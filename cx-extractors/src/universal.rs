@@ -244,6 +244,26 @@ impl UniversalExtractor {
             }
         }
 
+        // If no package declaration but we have symbols or imports,
+        // create a file-level Module node (e.g. for C/C++ files without namespaces).
+        if pkg_node_id.is_none() && (!defined_symbols.is_empty() || !import_paths.is_empty()) {
+            let file_name = std::str::from_utf8(file.source)
+                .ok()
+                .map(|_| file.path_str);
+            let mod_name = file_name
+                .and_then(|p| std::path::Path::new(p).file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".to_string());
+            let name_id = strings.intern(&mod_name);
+            let node_id = *id_counter;
+            *id_counter += 1;
+            let mut node = Node::new(node_id, NodeKind::Module, name_id);
+            node.file = file.path;
+            node.repo = file.repo_id;
+            result.nodes.push(node);
+            pkg_node_id = Some(node_id);
+        }
+
         // Create Contains edges: package/deployable → each symbol in this file
         if let Some(pkg_id) = pkg_node_id {
             for &(_, symbol_id, _, _) in &defined_symbols {

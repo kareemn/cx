@@ -8,6 +8,8 @@ tree-sitter = "0.24"
 tree-sitter-go = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
 
 # CLI & serialization
 clap = { version = "4", features = ["derive"] }

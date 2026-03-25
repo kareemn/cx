@@ -6,6 +6,8 @@ pub enum Language {
     Go,
     TypeScript,
     Python,
+    C,
+    Cpp,
 }
 
 impl Language {
@@ -13,8 +15,10 @@ impl Language {
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
             "go" => Some(Self::Go),
-            "ts" | "tsx" => Some(Self::TypeScript),
+            "ts" | "tsx" | "js" | "jsx" => Some(Self::TypeScript),
             "py" => Some(Self::Python),
+            "c" | "h" => Some(Self::C),
+            "cpp" | "cc" | "cxx" | "hpp" => Some(Self::Cpp),
             _ => None,
         }
     }
@@ -31,12 +35,18 @@ impl Language {
             Self::Go => tree_sitter_go::LANGUAGE.into(),
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
+            Self::C => tree_sitter_c::LANGUAGE.into(),
+            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         }
     }
 }
 
 /// Embedded query files for each language.
 pub const GO_QUERY: &str = include_str!("../queries/go-symbols.scm");
+pub const PYTHON_QUERY: &str = include_str!("../queries/python-symbols.scm");
+pub const TYPESCRIPT_QUERY: &str = include_str!("../queries/typescript-symbols.scm");
+pub const C_QUERY: &str = include_str!("../queries/c-symbols.scm");
+pub const CPP_QUERY: &str = include_str!("../queries/cpp-symbols.scm");
 
 /// Create a UniversalExtractor for a given language.
 /// Returns None if no query is available for this language yet.
@@ -44,8 +54,10 @@ pub fn extractor_for_language(lang: Language) -> Option<UniversalExtractor> {
     let ts_lang = lang.ts_language();
     let query_src = match lang {
         Language::Go => GO_QUERY,
-        // TypeScript and Python queries not yet implemented
-        _ => return None,
+        Language::Python => PYTHON_QUERY,
+        Language::TypeScript => TYPESCRIPT_QUERY,
+        Language::C => C_QUERY,
+        Language::Cpp => CPP_QUERY,
     };
     UniversalExtractor::new(&ts_lang, query_src).ok()
 }
@@ -59,7 +71,15 @@ mod tests {
         assert_eq!(Language::from_extension("go"), Some(Language::Go));
         assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
         assert_eq!(Language::from_extension("tsx"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("js"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("jsx"), Some(Language::TypeScript));
         assert_eq!(Language::from_extension("py"), Some(Language::Python));
+        assert_eq!(Language::from_extension("c"), Some(Language::C));
+        assert_eq!(Language::from_extension("h"), Some(Language::C));
+        assert_eq!(Language::from_extension("cpp"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("cc"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("cxx"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("hpp"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("rs"), None);
         assert_eq!(Language::from_extension(""), None);
     }
@@ -69,13 +89,38 @@ mod tests {
         use std::path::Path;
         assert_eq!(Language::from_path(Path::new("main.go")), Some(Language::Go));
         assert_eq!(Language::from_path(Path::new("src/app.ts")), Some(Language::TypeScript));
+        assert_eq!(Language::from_path(Path::new("src/index.js")), Some(Language::TypeScript));
+        assert_eq!(Language::from_path(Path::new("main.py")), Some(Language::Python));
+        assert_eq!(Language::from_path(Path::new("main.c")), Some(Language::C));
+        assert_eq!(Language::from_path(Path::new("util.h")), Some(Language::C));
+        assert_eq!(Language::from_path(Path::new("server.cpp")), Some(Language::Cpp));
+        assert_eq!(Language::from_path(Path::new("server.cc")), Some(Language::Cpp));
         assert_eq!(Language::from_path(Path::new("README.md")), None);
     }
 
     #[test]
     fn go_extractor_loads() {
-        let ext = extractor_for_language(Language::Go);
-        assert!(ext.is_some(), "Go extractor should load");
+        assert!(extractor_for_language(Language::Go).is_some(), "Go extractor should load");
+    }
+
+    #[test]
+    fn python_extractor_loads() {
+        assert!(extractor_for_language(Language::Python).is_some(), "Python extractor should load");
+    }
+
+    #[test]
+    fn typescript_extractor_loads() {
+        assert!(extractor_for_language(Language::TypeScript).is_some(), "TypeScript extractor should load");
+    }
+
+    #[test]
+    fn c_extractor_loads() {
+        assert!(extractor_for_language(Language::C).is_some(), "C extractor should load");
+    }
+
+    #[test]
+    fn cpp_extractor_loads() {
+        assert!(extractor_for_language(Language::Cpp).is_some(), "C++ extractor should load");
     }
 
     #[test]
