@@ -24,6 +24,14 @@ enum Commands {
 }
 
 fn main() {
+    // Reset SIGPIPE to default behavior so piping to `head` etc. exits cleanly
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
+
     let cli = Cli::parse();
     let root = std::env::current_dir().expect("failed to get current directory");
 
