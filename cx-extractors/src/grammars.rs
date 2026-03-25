@@ -95,6 +95,7 @@ mod tests {
             tree,
             source,
             path: path_id,
+            path_str: "test.go",
             repo_id: 0,
         };
 

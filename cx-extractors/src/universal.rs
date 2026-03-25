@@ -43,6 +43,8 @@ pub struct ParsedFile<'src> {
     pub tree: tree_sitter::Tree,
     pub source: &'src [u8],
     pub path: StringId,
+    /// Raw path string for pattern checks (e.g., _test.go detection).
+    pub path_str: &'src str,
     pub repo_id: u16,
 }
 
@@ -169,15 +171,24 @@ impl UniversalExtractor {
 
             // Package declarations → Module node (or Deployable if "main")
             if let Some(pkg_name) = self.capture_text(self.pkg_name_idx, m, file.source) {
-                let name_id = strings.intern(pkg_name);
+                let is_test_file = file.path_str.ends_with("_test.go");
+                let is_main = pkg_name == "main" && !is_test_file;
+
+                let (kind, display_name) = if is_main {
+                    // Deployable: use the directory path as the name
+                    let dir = std::path::Path::new(file.path_str)
+                        .parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| ".".to_string());
+                    let dir = if dir.is_empty() { ".".to_string() } else { dir };
+                    (NodeKind::Deployable, dir)
+                } else {
+                    (NodeKind::Module, pkg_name.to_string())
+                };
+
+                let name_id = strings.intern(&display_name);
                 let node_id = *id_counter;
                 *id_counter += 1;
-
-                let kind = if pkg_name == "main" {
-                    NodeKind::Deployable
-                } else {
-                    NodeKind::Module
-                };
 
                 let mut node = Node::new(node_id, kind, name_id);
                 node.file = file.path;
@@ -303,320 +314,98 @@ impl UniversalExtractor {
 mod tests {
     use super::*;
 
-    fn go_language() -> tree_sitter::Language {
-        tree_sitter_go::LANGUAGE.into()
-    }
-
-    fn parse_go(source: &str) -> tree_sitter::Tree {
+    /// Helper: parse Go source at a given path and extract.
+    fn extract_go(source: &str, path: &str) -> (ExtractionResult, StringInterner) {
+        let lang: tree_sitter::Language = tree_sitter_go::LANGUAGE.into();
         let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&go_language()).unwrap();
-        parser.parse(source.as_bytes(), None).unwrap()
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(source.as_bytes(), None).unwrap();
+        let extractor = UniversalExtractor::new(&lang, GO_QUERY).unwrap();
+        let mut strings = StringInterner::new();
+        let path_id = strings.intern(path);
+        let file = ParsedFile {
+            tree,
+            source: source.as_bytes(),
+            path: path_id,
+            path_str: path,
+            repo_id: 0,
+        };
+        let mut id = 0u32;
+        let result = extractor.extract(&file, &mut strings, &mut id);
+        (result, strings)
     }
 
     const GO_QUERY: &str = include_str!("../queries/go-symbols.scm");
 
     #[test]
     fn extract_go_functions() {
-        let source = r#"
-package main
-
-func hello() {
-    println("hello")
-}
-
-func world() {
-    hello()
-}
-"#;
-        let tree = parse_go(source);
-        let lang = go_language();
-        let extractor = UniversalExtractor::new(&lang, GO_QUERY).unwrap();
-
-        let mut strings = StringInterner::new();
-        let path_id = strings.intern("main.go");
-        let file = ParsedFile {
-            tree,
-            source: source.as_bytes(),
-            path: path_id,
-            repo_id: 0,
-        };
-
-        let mut id_counter = 0u32;
-        let result = extractor.extract(&file, &mut strings, &mut id_counter);
-
-        let func_names: Vec<&str> = result
-            .nodes
-            .iter()
+        let (result, strings) = extract_go(
+            "package main\n\nfunc hello() {\n    println(\"hello\")\n}\n\nfunc world() {\n    hello()\n}\n",
+            "main.go",
+        );
+        let func_names: Vec<&str> = result.nodes.iter()
             .filter(|n| n.kind == NodeKind::Symbol as u8 && n.sub_kind == 0)
             .map(|n| strings.get(n.name))
             .collect();
-
-        assert!(func_names.contains(&"hello"), "should find hello, got: {:?}", func_names);
-        assert!(func_names.contains(&"world"), "should find world, got: {:?}", func_names);
+        assert!(func_names.contains(&"hello"));
+        assert!(func_names.contains(&"world"));
     }
 
     #[test]
     fn extract_go_call_edges() {
-        let source = r#"
-package main
-
-func helper() {}
-
-func main() {
-    helper()
-}
-"#;
-        let tree = parse_go(source);
-        let lang = go_language();
-        let extractor = UniversalExtractor::new(&lang, GO_QUERY).unwrap();
-
-        let mut strings = StringInterner::new();
-        let path_id = strings.intern("main.go");
-        let file = ParsedFile {
-            tree,
-            source: source.as_bytes(),
-            path: path_id,
-            repo_id: 0,
-        };
-
-        let mut id_counter = 0u32;
-        let result = extractor.extract(&file, &mut strings, &mut id_counter);
-
-        // Should have an edge from main → helper
-        assert!(
-            !result.edges.is_empty(),
-            "should have at least one call edge"
+        let (result, strings) = extract_go(
+            "package main\n\nfunc helper() {}\n\nfunc main() {\n    helper()\n}\n",
+            "main.go",
         );
-
-        // Find the main function (Symbol) and helper node IDs
-        let helper_id = result
-            .nodes
-            .iter()
+        let helper_id = result.nodes.iter()
             .find(|n| strings.get(n.name) == "helper" && n.kind == NodeKind::Symbol as u8)
-            .map(|n| n.id);
-        let main_func_id = result
-            .nodes
-            .iter()
+            .map(|n| n.id).unwrap();
+        let main_id = result.nodes.iter()
             .find(|n| strings.get(n.name) == "main" && n.kind == NodeKind::Symbol as u8)
-            .map(|n| n.id);
-
-        assert!(helper_id.is_some(), "should find helper node");
-        assert!(main_func_id.is_some(), "should find main func node");
-
-        let has_call_edge = result.edges.iter().any(|e| {
-            e.source == main_func_id.unwrap()
-                && e.target == helper_id.unwrap()
-                && e.kind == EdgeKind::Calls
-        });
-        assert!(has_call_edge, "should have main→helper call edge");
+            .map(|n| n.id).unwrap();
+        assert!(result.edges.iter().any(|e| e.source == main_id && e.target == helper_id && e.kind == EdgeKind::Calls));
     }
 
     #[test]
     fn extract_go_types() {
-        let source = r#"
-package main
-
-type Server struct {
-    port int
-}
-
-type Handler interface {
-    Handle()
-}
-"#;
-        let tree = parse_go(source);
-        let lang = go_language();
-        let extractor = UniversalExtractor::new(&lang, GO_QUERY).unwrap();
-
-        let mut strings = StringInterner::new();
-        let path_id = strings.intern("types.go");
-        let file = ParsedFile {
-            tree,
-            source: source.as_bytes(),
-            path: path_id,
-            repo_id: 0,
-        };
-
-        let mut id_counter = 0u32;
-        let result = extractor.extract(&file, &mut strings, &mut id_counter);
-
-        let type_names: Vec<&str> = result
-            .nodes
-            .iter()
+        let (result, strings) = extract_go(
+            "package main\n\ntype Server struct {\n    port int\n}\n\ntype Handler interface {\n    Handle()\n}\n",
+            "types.go",
+        );
+        let type_names: Vec<&str> = result.nodes.iter()
             .filter(|n| n.kind == NodeKind::Symbol as u8 && n.sub_kind == 1)
             .map(|n| strings.get(n.name))
             .collect();
-
-        assert!(type_names.contains(&"Server"), "should find Server type");
-        assert!(type_names.contains(&"Handler"), "should find Handler type");
-    }
-
-    #[test]
-    fn extract_go_package_as_module() {
-        let source = r#"
-package server
-
-import "fmt"
-
-func Start() {
-    fmt.Println("starting")
-}
-"#;
-        let tree = parse_go(source);
-        let lang = go_language();
-        let extractor = UniversalExtractor::new(&lang, GO_QUERY).unwrap();
-
-        let mut strings = StringInterner::new();
-        let path_id = strings.intern("server.go");
-        let file = ParsedFile {
-            tree,
-            source: source.as_bytes(),
-            path: path_id,
-            repo_id: 0,
-        };
-
-        let mut id_counter = 0u32;
-        let result = extractor.extract(&file, &mut strings, &mut id_counter);
-
-        // Module node should come from `package server`, not from imports
-        let modules: Vec<&str> = result
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Module as u8)
-            .map(|n| strings.get(n.name))
-            .collect();
-
-        assert!(modules.contains(&"server"), "should find 'server' module from package decl, got: {:?}", modules);
-        assert!(!modules.iter().any(|m| m.contains("fmt")), "imports should NOT create Module nodes, got: {:?}", modules);
-    }
-
-    #[test]
-    fn extract_go_deployable_from_package_main() {
-        let source = r#"
-package main
-
-func main() {}
-"#;
-        let tree = parse_go(source);
-        let lang = go_language();
-        let extractor = UniversalExtractor::new(&lang, GO_QUERY).unwrap();
-
-        let mut strings = StringInterner::new();
-        let path_id = strings.intern("cmd/myapp/main.go");
-        let file = ParsedFile {
-            tree,
-            source: source.as_bytes(),
-            path: path_id,
-            repo_id: 0,
-        };
-
-        let mut id_counter = 0u32;
-        let result = extractor.extract(&file, &mut strings, &mut id_counter);
-
-        // `package main` should create a Deployable node
-        let deployables: Vec<&str> = result
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Deployable as u8)
-            .map(|n| strings.get(n.name))
-            .collect();
-
-        assert!(deployables.contains(&"main"), "should create Deployable for package main, got: {:?}", deployables);
-
-        // Should NOT create a Module node for "main"
-        let modules: Vec<&str> = result
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Module as u8)
-            .map(|n| strings.get(n.name))
-            .collect();
-
-        assert!(!modules.contains(&"main"), "package main should be Deployable, not Module");
+        assert!(type_names.contains(&"Server"));
+        assert!(type_names.contains(&"Handler"));
     }
 
     #[test]
     fn extract_go_methods() {
-        let source = r#"
-package main
-
-type Server struct{}
-
-func (s *Server) Start() {}
-func (s *Server) Stop() {}
-"#;
-        let tree = parse_go(source);
-        let lang = go_language();
-        let extractor = UniversalExtractor::new(&lang, GO_QUERY).unwrap();
-
-        let mut strings = StringInterner::new();
-        let path_id = strings.intern("server.go");
-        let file = ParsedFile {
-            tree,
-            source: source.as_bytes(),
-            path: path_id,
-            repo_id: 0,
-        };
-
-        let mut id_counter = 0u32;
-        let result = extractor.extract(&file, &mut strings, &mut id_counter);
-
-        let method_names: Vec<&str> = result
-            .nodes
-            .iter()
+        let (result, strings) = extract_go(
+            "package main\n\ntype Server struct{}\n\nfunc (s *Server) Start() {}\nfunc (s *Server) Stop() {}\n",
+            "server.go",
+        );
+        let names: Vec<&str> = result.nodes.iter()
             .filter(|n| n.kind == NodeKind::Symbol as u8 && n.sub_kind == 0)
             .map(|n| strings.get(n.name))
             .collect();
-
-        assert!(method_names.contains(&"Start"), "should find Start method");
-        assert!(method_names.contains(&"Stop"), "should find Stop method");
+        assert!(names.contains(&"Start"));
+        assert!(names.contains(&"Stop"));
     }
 
     #[test]
     fn extract_line_numbers() {
-        let source = "package main\n\nfunc foo() {}\n\nfunc bar() {}\n";
-        let tree = parse_go(source);
-        let lang = go_language();
-        let extractor = UniversalExtractor::new(&lang, GO_QUERY).unwrap();
-
-        let mut strings = StringInterner::new();
-        let path_id = strings.intern("test.go");
-        let file = ParsedFile {
-            tree,
-            source: source.as_bytes(),
-            path: path_id,
-            repo_id: 0,
-        };
-
-        let mut id_counter = 0u32;
-        let result = extractor.extract(&file, &mut strings, &mut id_counter);
-
-        let foo = result.nodes.iter().find(|n| strings.get(n.name) == "foo").expect("should find foo");
-        let bar = result.nodes.iter().find(|n| strings.get(n.name) == "bar").expect("should find bar");
-
-        assert_eq!(foo.line, 3, "foo should be on line 3");
-        assert_eq!(bar.line, 5, "bar should be on line 5");
+        let (result, strings) = extract_go("package main\n\nfunc foo() {}\n\nfunc bar() {}\n", "test.go");
+        let foo = result.nodes.iter().find(|n| strings.get(n.name) == "foo").unwrap();
+        let bar = result.nodes.iter().find(|n| strings.get(n.name) == "bar").unwrap();
+        assert_eq!(foo.line, 3);
+        assert_eq!(bar.line, 5);
     }
 
     #[test]
     fn extract_file_with_only_package_decl() {
-        let source = "package main\n";
-        let tree = parse_go(source);
-        let lang = go_language();
-        let extractor = UniversalExtractor::new(&lang, GO_QUERY).unwrap();
-
-        let mut strings = StringInterner::new();
-        let path_id = strings.intern("empty.go");
-        let file = ParsedFile {
-            tree,
-            source: source.as_bytes(),
-            path: path_id,
-            repo_id: 0,
-        };
-
-        let mut id_counter = 0u32;
-        let result = extractor.extract(&file, &mut strings, &mut id_counter);
-
-        // Should have exactly 1 node: the Deployable from `package main`
+        let (result, _strings) = extract_go("package main\n", "empty.go");
         assert_eq!(result.nodes.len(), 1);
         assert_eq!(result.nodes[0].kind, NodeKind::Deployable as u8);
         assert!(result.edges.is_empty());
@@ -624,147 +413,91 @@ func (s *Server) Stop() {}
 
     #[test]
     fn invalid_query_returns_error() {
-        let lang = go_language();
-        let result = UniversalExtractor::new(&lang, "(invalid_node_type @cap)");
-        assert!(result.is_err());
+        let lang: tree_sitter::Language = tree_sitter_go::LANGUAGE.into();
+        assert!(UniversalExtractor::new(&lang, "(invalid_node_type @cap)").is_err());
     }
 
     // ─── Realistic Go pattern tests ─────────────────────────────────
 
     #[test]
     fn real_go_package_declaration() {
-        let source = r#"package auth
-
-import "fmt"
-
-func Login() { fmt.Println("login") }
-"#;
-        let tree = parse_go(source);
-        let lang = go_language();
-        let extractor = UniversalExtractor::new(&lang, GO_QUERY).unwrap();
-
-        let mut strings = StringInterner::new();
-        let path_id = strings.intern("pkg/auth/login.go");
-        let file = ParsedFile { tree, source: source.as_bytes(), path: path_id, repo_id: 0 };
-
-        let mut id = 0u32;
-        let result = extractor.extract(&file, &mut strings, &mut id);
-
-        // 1 Module node with name="auth" (from package declaration)
+        let (result, strings) = extract_go(
+            "package auth\n\nimport \"fmt\"\n\nfunc Login() { fmt.Println(\"login\") }\n",
+            "pkg/auth/login.go",
+        );
         let modules: Vec<&str> = result.nodes.iter()
             .filter(|n| n.kind == NodeKind::Module as u8)
-            .map(|n| strings.get(n.name))
-            .collect();
-        assert_eq!(modules, vec!["auth"], "should have 1 Module from package decl");
-
-        // 0 Module nodes with name="fmt" — imports don't create Module nodes
-        assert!(!modules.contains(&"fmt"), "imports must not create Module nodes");
-
-        // 1 Import edge from auth module to "fmt"
-        let import_edges: Vec<_> = result.edges.iter()
-            .filter(|e| e.kind == EdgeKind::Imports)
-            .collect();
-        assert_eq!(import_edges.len(), 1, "should have 1 Imports edge");
-
-        // 1 Symbol node: Login
+            .map(|n| strings.get(n.name)).collect();
+        assert_eq!(modules, vec!["auth"]);
+        assert!(!modules.contains(&"fmt"));
+        assert_eq!(result.edges.iter().filter(|e| e.kind == EdgeKind::Imports).count(), 1);
         let symbols: Vec<&str> = result.nodes.iter()
             .filter(|n| n.kind == NodeKind::Symbol as u8 && n.sub_kind == 0)
-            .map(|n| strings.get(n.name))
-            .collect();
+            .map(|n| strings.get(n.name)).collect();
         assert_eq!(symbols, vec!["Login"]);
     }
 
     #[test]
     fn real_go_main_package() {
-        let source = r#"package main
-
-import "fmt"
-
-func main() { fmt.Println("hello") }
-"#;
-        let tree = parse_go(source);
-        let lang = go_language();
-        let extractor = UniversalExtractor::new(&lang, GO_QUERY).unwrap();
-
-        let mut strings = StringInterner::new();
-        let path_id = strings.intern("cmd/server/main.go");
-        let file = ParsedFile { tree, source: source.as_bytes(), path: path_id, repo_id: 0 };
-
-        let mut id = 0u32;
-        let result = extractor.extract(&file, &mut strings, &mut id);
-
-        // 1 Deployable node
-        let deployables: Vec<_> = result.nodes.iter()
+        let (result, strings) = extract_go(
+            "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(\"hello\") }\n",
+            "cmd/server/main.go",
+        );
+        let deployables: Vec<&str> = result.nodes.iter()
             .filter(|n| n.kind == NodeKind::Deployable as u8)
-            .collect();
-        assert_eq!(deployables.len(), 1, "should have 1 Deployable");
-
-        // 1 Symbol node: main (Function)
-        let symbols: Vec<&str> = result.nodes.iter()
-            .filter(|n| n.kind == NodeKind::Symbol as u8 && n.sub_kind == 0)
-            .map(|n| strings.get(n.name))
-            .collect();
-        assert!(symbols.contains(&"main"), "should have main function symbol");
-
-        // 1 Import edge to "fmt"
-        let import_edges: Vec<_> = result.edges.iter()
-            .filter(|e| e.kind == EdgeKind::Imports)
-            .collect();
-        assert_eq!(import_edges.len(), 1, "should have 1 Imports edge");
-
-        // 0 Module nodes named "fmt"
-        let fmt_modules: Vec<_> = result.nodes.iter()
-            .filter(|n| n.kind == NodeKind::Module as u8 && strings.get(n.name) == "fmt")
-            .collect();
-        assert!(fmt_modules.is_empty(), "fmt should not be a Module node");
+            .map(|n| strings.get(n.name)).collect();
+        assert_eq!(deployables.len(), 1);
+        assert_eq!(deployables[0], "cmd/server", "deployable name should be the directory");
+        assert!(result.nodes.iter().any(|n| strings.get(n.name) == "main" && n.kind == NodeKind::Symbol as u8));
+        assert_eq!(result.edges.iter().filter(|e| e.kind == EdgeKind::Imports).count(), 1);
+        assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Module as u8 && strings.get(n.name) == "fmt"));
     }
 
     #[test]
     fn real_go_multiple_imports() {
-        let source = r#"package router
-
-import (
-    "fmt"
-    "net/http"
-    "github.com/gorilla/mux"
-)
-
-func HandleRoute() {}
-"#;
-        let tree = parse_go(source);
-        let lang = go_language();
-        let extractor = UniversalExtractor::new(&lang, GO_QUERY).unwrap();
-
-        let mut strings = StringInterner::new();
-        let path_id = strings.intern("pkg/router/router.go");
-        let file = ParsedFile { tree, source: source.as_bytes(), path: path_id, repo_id: 0 };
-
-        let mut id = 0u32;
-        let result = extractor.extract(&file, &mut strings, &mut id);
-
-        // 1 Module node with name="router"
+        let (result, strings) = extract_go(
+            "package router\n\nimport (\n    \"fmt\"\n    \"net/http\"\n    \"github.com/gorilla/mux\"\n)\n\nfunc HandleRoute() {}\n",
+            "pkg/router/router.go",
+        );
         let modules: Vec<&str> = result.nodes.iter()
             .filter(|n| n.kind == NodeKind::Module as u8)
-            .map(|n| strings.get(n.name))
-            .collect();
+            .map(|n| strings.get(n.name)).collect();
         assert_eq!(modules, vec!["router"]);
-
-        // 3 Import edges
-        let import_edges: Vec<_> = result.edges.iter()
-            .filter(|e| e.kind == EdgeKind::Imports)
-            .collect();
-        assert_eq!(import_edges.len(), 3, "should have 3 Imports edges");
-
-        // 0 Module nodes for import paths
-        assert!(!modules.contains(&"fmt"));
-        assert!(!modules.iter().any(|m| m.contains("net/http")));
-        assert!(!modules.iter().any(|m| m.contains("gorilla")));
-
-        // 1 Symbol node: HandleRoute
+        assert_eq!(result.edges.iter().filter(|e| e.kind == EdgeKind::Imports).count(), 3);
         let symbols: Vec<&str> = result.nodes.iter()
             .filter(|n| n.kind == NodeKind::Symbol as u8)
-            .map(|n| strings.get(n.name))
-            .collect();
+            .map(|n| strings.get(n.name)).collect();
         assert_eq!(symbols, vec!["HandleRoute"]);
+    }
+
+    #[test]
+    fn test_file_not_deployable() {
+        // _test.go files with package main should NOT create Deployable nodes
+        let (result, strings) = extract_go(
+            "package main\n\nimport \"testing\"\n\nfunc TestSomething(t *testing.T) {}\n",
+            "cmd/server/main_test.go",
+        );
+        let deployables: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Deployable as u8)
+            .map(|n| strings.get(n.name)).collect();
+        assert!(deployables.is_empty(), "test files should not create deployables, got: {:?}", deployables);
+        // Should create a Module node instead
+        let modules: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Module as u8)
+            .map(|n| strings.get(n.name)).collect();
+        assert!(modules.contains(&"main"), "test file with package main should be Module");
+    }
+
+    #[test]
+    fn deployable_named_by_directory() {
+        // Deployable name should be the directory, not "main"
+        let (result, strings) = extract_go("package main\n\nfunc main() {}\n", "cmd/gh/main.go");
+        let dep = result.nodes.iter().find(|n| n.kind == NodeKind::Deployable as u8).unwrap();
+        assert_eq!(strings.get(dep.name), "cmd/gh");
+
+        let (result2, strings2) = extract_go("package main\n\nfunc main() {}\n", "main.go");
+        let dep2 = result2.nodes.iter().find(|n| n.kind == NodeKind::Deployable as u8).unwrap();
+        // Root-level main.go: directory is empty, should be "."
+        assert!(!strings2.get(dep2.name).is_empty());
     }
 }

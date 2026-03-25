@@ -134,6 +134,7 @@ fn extractor_throughput(c: &mut Criterion) {
                 tree: tree.clone(),
                 source: source.as_bytes(),
                 path: path_id,
+                path_str: "bench.go",
                 repo_id: 0,
             };
             let mut id = 0u32;

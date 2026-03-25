@@ -87,9 +87,9 @@ pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
                 None => return (result, strings, errors),
             };
 
-            // Allocate a block of IDs for this file
+            // Compute repo-relative path
             let path_str = path
-                .strip_prefix(path.ancestors().last().unwrap_or(path))
+                .strip_prefix(root)
                 .unwrap_or(path)
                 .to_string_lossy();
             let path_id = strings.intern(&path_str);
@@ -98,6 +98,7 @@ pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
                 tree,
                 source: &source,
                 path: path_id,
+                path_str: &path_str,
                 repo_id: 0,
             };
 
