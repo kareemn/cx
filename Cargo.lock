@@ -402,9 +402,11 @@ dependencies = [
  "cx-extractors",
  "libc",
  "rustc-hash",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]

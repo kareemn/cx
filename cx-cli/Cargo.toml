@@ -12,7 +12,9 @@ cx-core = { path = "../cx-core" }
 cx-extractors = { path = "../cx-extractors" }
 clap = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true }
 rustc-hash = { workspace = true }
 libc = { workspace = true }

@@ -155,7 +155,7 @@ fn cx_context_latency(c: &mut Criterion) {
     // Write graph
     let cx_dir = dir.path().join(".cx").join("graph");
     std::fs::create_dir_all(&cx_dir).unwrap();
-    let graph_path = cx_dir.join("index.cxgraph");
+    let graph_path = cx_dir.join("base.cxgraph");
     cx_core::store::mmap::write_graph(&result.graph, &graph_path).unwrap();
 
     // Load graph once (this is what cx context does)

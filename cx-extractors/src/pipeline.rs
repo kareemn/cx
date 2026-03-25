@@ -17,20 +17,38 @@ pub struct IndexResult {
     pub errors: Vec<String>,
 }
 
-/// Run the indexing pipeline on a directory.
-///
-/// Pipeline:
-/// 1. Walk directory with `ignore` crate (parallel, .gitignore aware)
-/// 2. Filter to supported file extensions
-/// 3. Parse files in parallel with rayon (per-thread tree-sitter parsers)
-/// 4. Run UniversalExtractor on each parsed file
-/// 5. Merge all ExtractionResults
-/// 6. Build CsrGraph
-pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
-    // Step 1: Collect file paths using ignore crate
-    let files = collect_files(root)?;
+/// A file to index, tagged with its repo root and repo ID.
+struct RepoFile {
+    path: PathBuf,
+    root: PathBuf,
+    repo_id: u16,
+}
 
-    if files.is_empty() {
+/// Run the indexing pipeline on a single directory (convenience wrapper).
+pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
+    index_repos(&[(root.to_path_buf(), 0)])
+}
+
+/// Run the indexing pipeline across multiple repos, producing a single unified graph.
+///
+/// Each entry is (repo_root, repo_id). All repos are indexed in parallel,
+/// merged into a single node/edge list, cross-repo calls are resolved,
+/// and a unified CsrGraph is built.
+pub fn index_repos(repos: &[(PathBuf, u16)]) -> crate::Result<IndexResult> {
+    // Step 1: Collect files from all repos
+    let mut all_repo_files: Vec<RepoFile> = Vec::new();
+    for (root, repo_id) in repos {
+        let files = collect_files(root)?;
+        for path in files {
+            all_repo_files.push(RepoFile {
+                path,
+                root: root.clone(),
+                repo_id: *repo_id,
+            });
+        }
+    }
+
+    if all_repo_files.is_empty() {
         let strings = StringInterner::new();
         let graph = CsrGraph::build(vec![], vec![], strings);
         return Ok(IndexResult {
@@ -46,22 +64,22 @@ pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
     let id_counter = AtomicU32::new(0);
 
     // Step 2-4: Parse and extract in parallel
-    let per_file_results: Vec<(ExtractionResult, StringInterner, Vec<String>)> = files
+    let per_file_results: Vec<(ExtractionResult, StringInterner, Vec<String>)> = all_repo_files
         .par_iter()
-        .filter_map(|path| {
-            let lang = Language::from_path(path)?;
-            Some((path, lang))
+        .filter_map(|rf| {
+            let lang = Language::from_path(&rf.path)?;
+            Some((rf, lang))
         })
-        .map(|(path, lang)| {
+        .map(|(rf, lang)| {
             let mut errors = Vec::new();
             let mut strings = StringInterner::new();
             let mut result = ExtractionResult::new();
 
             // Read file
-            let source = match std::fs::read(path) {
+            let source = match std::fs::read(&rf.path) {
                 Ok(s) => s,
                 Err(e) => {
-                    errors.push(format!("{}: {}", path.display(), e));
+                    errors.push(format!("{}: {}", rf.path.display(), e));
                     return (result, strings, errors);
                 }
             };
@@ -70,14 +88,14 @@ pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
             let ts_lang = lang.ts_language();
             let mut parser = tree_sitter::Parser::new();
             if parser.set_language(&ts_lang).is_err() {
-                errors.push(format!("{}: failed to set language", path.display()));
+                errors.push(format!("{}: failed to set language", rf.path.display()));
                 return (result, strings, errors);
             }
 
             let tree = match parser.parse(&source, None) {
                 Some(t) => t,
                 None => {
-                    errors.push(format!("{}: parse failed", path.display()));
+                    errors.push(format!("{}: parse failed", rf.path.display()));
                     return (result, strings, errors);
                 }
             };
@@ -89,9 +107,9 @@ pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
             };
 
             // Compute repo-relative path
-            let path_str = path
-                .strip_prefix(root)
-                .unwrap_or(path)
+            let path_str = rf.path
+                .strip_prefix(&rf.root)
+                .unwrap_or(&rf.path)
                 .to_string_lossy();
             let path_id = strings.intern(&path_str);
 
@@ -100,10 +118,10 @@ pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
                 source: &source,
                 path: path_id,
                 path_str: &path_str,
-                repo_id: 0,
+                repo_id: rf.repo_id,
             };
 
-            // Reserve IDs atomically (estimate: we'll adjust after extraction)
+            // Reserve IDs atomically
             let base_id = id_counter.fetch_add(10000, Ordering::Relaxed);
             let mut local_id = base_id;
             result = extractor.extract(&file, &mut strings, &mut local_id);
@@ -291,6 +309,13 @@ pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
         }
     }
 
+    // Step 5d: Cross-repo endpoint resolution
+    // Match Endpoint nodes with the same name across repos (e.g., gRPC client→server,
+    // HTTP client calls to server endpoints). If an Endpoint node in repo A has the
+    // same name as an Endpoint node in repo B, create a DependsOn edge between their
+    // parent nodes.
+    resolve_cross_repo_endpoints(&all_nodes, &mut all_edges);
+
     // Step 6: Build CsrGraph
     let node_count = all_nodes.len() as u32;
     let edge_count = all_edges.len() as u32;
@@ -303,6 +328,40 @@ pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
         edge_count,
         errors: all_errors,
     })
+}
+
+/// Resolve cross-repo connections by matching Endpoint nodes with the same name
+/// across different repos. Creates Connects edges between the nodes.
+fn resolve_cross_repo_endpoints(nodes: &[Node], edges: &mut Vec<EdgeInput>) {
+    use rustc_hash::FxHashMap;
+
+    // Group Endpoint nodes by name, tracking which repo they're from
+    let mut endpoints_by_name: FxHashMap<u32, Vec<(u32, u16)>> = FxHashMap::default(); // name → [(node_id, repo_id)]
+    for node in nodes {
+        if node.kind == NodeKind::Endpoint as u8 {
+            endpoints_by_name
+                .entry(node.name)
+                .or_default()
+                .push((node.id, node.repo));
+        }
+    }
+
+    // For each name with endpoints in multiple repos, create Connects edges
+    for eps in endpoints_by_name.values() {
+        if eps.len() < 2 {
+            continue;
+        }
+        // Connect endpoints across different repos
+        for i in 0..eps.len() {
+            for j in (i + 1)..eps.len() {
+                if eps[i].1 != eps[j].1 {
+                    // Different repos — create bidirectional Connects edges
+                    edges.push(EdgeInput::new(eps[i].0, eps[j].0, EdgeKind::Connects));
+                    edges.push(EdgeInput::new(eps[j].0, eps[i].0, EdgeKind::Connects));
+                }
+            }
+        }
+    }
 }
 
 /// Remap a StringId from a per-file interner to the merged interner.
@@ -796,5 +855,51 @@ func Query() {}
 
         // Pipeline should not have fatal errors
         // (parse failures are non-fatal per ARCHITECTURE.md)
+    }
+
+    #[test]
+    fn index_repos_multi_repo_unified_graph() {
+        let repo_a = tempfile::tempdir().unwrap();
+        let repo_b = tempfile::tempdir().unwrap();
+
+        // Repo A: a server
+        fs::write(
+            repo_a.path().join("server.go"),
+            "package main\nfunc ServeHTTP() {}\nfunc handleAuth() {}\n",
+        )
+        .unwrap();
+
+        // Repo B: a client
+        fs::write(
+            repo_b.path().join("client.go"),
+            "package main\nfunc CallServer() {}\nfunc retry() {}\n",
+        )
+        .unwrap();
+
+        let repos = vec![
+            (repo_a.path().to_path_buf(), 0u16),
+            (repo_b.path().to_path_buf(), 1u16),
+        ];
+        let result = index_repos(&repos).unwrap();
+
+        // Should have nodes from both repos
+        let names: Vec<&str> = result
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Symbol as u8)
+            .map(|n| result.graph.strings.get(n.name))
+            .collect();
+
+        assert!(names.contains(&"ServeHTTP"), "should have repo A symbols");
+        assert!(names.contains(&"handleAuth"), "should have repo A symbols");
+        assert!(names.contains(&"CallServer"), "should have repo B symbols");
+        assert!(names.contains(&"retry"), "should have repo B symbols");
+
+        // Nodes should have correct repo IDs
+        let repo_a_nodes: Vec<_> = result.graph.nodes.iter().filter(|n| n.repo == 0).collect();
+        let repo_b_nodes: Vec<_> = result.graph.nodes.iter().filter(|n| n.repo == 1).collect();
+        assert!(!repo_a_nodes.is_empty(), "should have repo 0 nodes");
+        assert!(!repo_b_nodes.is_empty(), "should have repo 1 nodes");
     }
 }

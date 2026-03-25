@@ -122,7 +122,7 @@ fn mcp_roundtrip(c: &mut Criterion) {
     // Write and reload via mmap (as MCP server would)
     let cx_dir = dir.path().join(".cx").join("graph");
     std::fs::create_dir_all(&cx_dir).unwrap();
-    let graph_path = cx_dir.join("index.cxgraph");
+    let graph_path = cx_dir.join("base.cxgraph");
     cx_core::store::mmap::write_graph(&result.graph, &graph_path).unwrap();
     let graph = cx_core::store::mmap::load_graph(&graph_path).unwrap();
 
