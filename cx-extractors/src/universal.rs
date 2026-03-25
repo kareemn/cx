@@ -244,12 +244,27 @@ impl UniversalExtractor {
             }
         }
 
+        // Create Contains edges: package/deployable → each symbol in this file
+        if let Some(pkg_id) = pkg_node_id {
+            for &(_, symbol_id, _, _) in &defined_symbols {
+                result
+                    .edges
+                    .push(EdgeInput::new(pkg_id, symbol_id, EdgeKind::Contains));
+            }
+        }
+
         // Create Imports edges: package node → import target (as a Module node)
         if let Some(pkg_id) = pkg_node_id {
             for import_path in &import_paths {
-                let _import_name_id = strings.intern(import_path);
+                let import_name_id = strings.intern(import_path);
                 let import_node_id = *id_counter;
                 *id_counter += 1;
+
+                // Create a Module node for the import target so the edge
+                // survives ID remapping in the merge step.
+                let mut import_node = Node::new(import_node_id, NodeKind::Module, import_name_id);
+                import_node.repo = file.repo_id;
+                result.nodes.push(import_node);
 
                 result
                     .edges
@@ -425,12 +440,15 @@ mod tests {
             "package auth\n\nimport \"fmt\"\n\nfunc Login() { fmt.Println(\"login\") }\n",
             "pkg/auth/login.go",
         );
-        let modules: Vec<&str> = result.nodes.iter()
-            .filter(|n| n.kind == NodeKind::Module as u8)
+        // The package's own Module node
+        let pkg_modules: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Module as u8 && n.line > 0)
             .map(|n| strings.get(n.name)).collect();
-        assert_eq!(modules, vec!["auth"]);
-        assert!(!modules.contains(&"fmt"));
+        assert_eq!(pkg_modules, vec!["auth"]);
+        // Import target Module node for "fmt"
+        assert!(result.nodes.iter().any(|n| n.kind == NodeKind::Module as u8 && strings.get(n.name) == "fmt"));
         assert_eq!(result.edges.iter().filter(|e| e.kind == EdgeKind::Imports).count(), 1);
+        assert_eq!(result.edges.iter().filter(|e| e.kind == EdgeKind::Contains).count(), 1);
         let symbols: Vec<&str> = result.nodes.iter()
             .filter(|n| n.kind == NodeKind::Symbol as u8 && n.sub_kind == 0)
             .map(|n| strings.get(n.name)).collect();
@@ -450,7 +468,9 @@ mod tests {
         assert_eq!(deployables[0], "cmd/server", "deployable name should be the directory");
         assert!(result.nodes.iter().any(|n| strings.get(n.name) == "main" && n.kind == NodeKind::Symbol as u8));
         assert_eq!(result.edges.iter().filter(|e| e.kind == EdgeKind::Imports).count(), 1);
-        assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Module as u8 && strings.get(n.name) == "fmt"));
+        assert_eq!(result.edges.iter().filter(|e| e.kind == EdgeKind::Contains).count(), 1);
+        // Import target Module node for "fmt" is now created
+        assert!(result.nodes.iter().any(|n| n.kind == NodeKind::Module as u8 && strings.get(n.name) == "fmt"));
     }
 
     #[test]
@@ -459,11 +479,15 @@ mod tests {
             "package router\n\nimport (\n    \"fmt\"\n    \"net/http\"\n    \"github.com/gorilla/mux\"\n)\n\nfunc HandleRoute() {}\n",
             "pkg/router/router.go",
         );
-        let modules: Vec<&str> = result.nodes.iter()
-            .filter(|n| n.kind == NodeKind::Module as u8)
+        // The package's own Module node
+        let pkg_modules: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Module as u8 && n.line > 0)
             .map(|n| strings.get(n.name)).collect();
-        assert_eq!(modules, vec!["router"]);
+        assert_eq!(pkg_modules, vec!["router"]);
+        // 3 import target Module nodes
+        assert_eq!(result.nodes.iter().filter(|n| n.kind == NodeKind::Module as u8 && n.line == 0).count(), 3);
         assert_eq!(result.edges.iter().filter(|e| e.kind == EdgeKind::Imports).count(), 3);
+        assert_eq!(result.edges.iter().filter(|e| e.kind == EdgeKind::Contains).count(), 1);
         let symbols: Vec<&str> = result.nodes.iter()
             .filter(|n| n.kind == NodeKind::Symbol as u8)
             .map(|n| strings.get(n.name)).collect();
