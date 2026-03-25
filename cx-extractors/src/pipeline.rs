@@ -394,4 +394,78 @@ func newServer() *Server {
         assert_eq!(graph.offsets.len() as u32, graph.node_count() + 1);
         assert_eq!(graph.rev_offsets.len() as u32, graph.node_count() + 1);
     }
+
+    #[test]
+    fn real_go_repo_structure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // cmd/server/main.go
+        fs::create_dir_all(root.join("cmd/server")).unwrap();
+        fs::write(root.join("cmd/server/main.go"), r#"package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("server starting")
+}
+"#).unwrap();
+
+        // cmd/migrate/main.go
+        fs::create_dir_all(root.join("cmd/migrate")).unwrap();
+        fs::write(root.join("cmd/migrate/main.go"), r#"package main
+
+func main() {}
+"#).unwrap();
+
+        // pkg/auth/login.go
+        fs::create_dir_all(root.join("pkg/auth")).unwrap();
+        fs::write(root.join("pkg/auth/login.go"), r#"package auth
+
+func Login() {}
+"#).unwrap();
+
+        // pkg/auth/token.go
+        fs::write(root.join("pkg/auth/token.go"), r#"package auth
+
+func ValidateToken() {}
+"#).unwrap();
+
+        // internal/db/query.go
+        fs::create_dir_all(root.join("internal/db")).unwrap();
+        fs::write(root.join("internal/db/query.go"), r#"package db
+
+func Query() {}
+"#).unwrap();
+
+        let result = index_directory(root).unwrap();
+        let graph = &result.graph;
+
+        // 2 Deployable nodes (from the two package main files)
+        let deployables: Vec<&str> = graph.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Deployable as u8)
+            .map(|n| graph.strings.get(n.name))
+            .collect();
+        assert_eq!(deployables.len(), 2, "should have 2 deployables, got: {:?}", deployables);
+
+        // 3 distinct Module nodes (auth x2 deduplicated to auth, db, but auth appears in two files)
+        // Actually each file produces its own Module node, so auth appears twice, db once = 3 Module nodes
+        let modules: Vec<&str> = graph.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Module as u8)
+            .map(|n| graph.strings.get(n.name))
+            .collect();
+        assert!(modules.contains(&"auth"), "should have auth module");
+        assert!(modules.contains(&"db"), "should have db module");
+        assert!(!modules.contains(&"main"), "main should be Deployable, not Module");
+
+        // Symbol count: main(2) + Login + ValidateToken + Query = 5 functions
+        let symbols: Vec<&str> = graph.nodes.iter()
+            .filter(|n| n.kind == NodeKind::Symbol as u8 && n.sub_kind == 0)
+            .map(|n| graph.strings.get(n.name))
+            .collect();
+        assert!(symbols.contains(&"Login"), "should find Login");
+        assert!(symbols.contains(&"ValidateToken"), "should find ValidateToken");
+        assert!(symbols.contains(&"Query"), "should find Query");
+        assert_eq!(symbols.iter().filter(|&&s| s == "main").count(), 2, "should have 2 main functions");
+    }
 }

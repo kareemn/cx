@@ -1,6 +1,10 @@
 ; Go symbol extraction queries for CX UniversalExtractor
 ; Uses standardized capture names: @func.name, @func.def, @call.name, @call.site,
-; @import.path, @import.def, @type.name, @type.def
+; @import.path, @import.def, @type.name, @type.def, @pkg.name, @pkg.def
+
+; ─── Package declarations ────────────────────────────────────────────
+(package_clause
+  (package_identifier) @pkg.name) @pkg.def
 
 ; ─── Function declarations ───────────────────────────────────────────
 (function_declaration

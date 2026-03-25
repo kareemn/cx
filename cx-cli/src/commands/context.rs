@@ -110,20 +110,20 @@ func helper() {}
     }
 
     #[test]
-    fn context_shows_modules() {
+    fn context_shows_modules_and_deployables() {
         let dir = tempfile::tempdir().unwrap();
 
+        // package main → Deployable
         fs::write(
             dir.path().join("main.go"),
-            r#"package main
+            "package main\n\nfunc main() {}\n",
+        )
+        .unwrap();
 
-import (
-    "fmt"
-    "net/http"
-)
-
-func main() {}
-"#,
+        // package server → Module
+        fs::write(
+            dir.path().join("server.go"),
+            "package server\n\nfunc Start() {}\n",
         )
         .unwrap();
 
@@ -132,6 +132,10 @@ func main() {}
         let ctx = build_context(&graph);
 
         let modules = ctx["modules"].as_array().unwrap();
-        assert!(!modules.is_empty(), "should have modules from imports");
+        let module_names: Vec<&str> = modules.iter().map(|m| m["name"].as_str().unwrap()).collect();
+        assert!(module_names.contains(&"server"), "should have server module");
+
+        let deployables = ctx["deployables"].as_array().unwrap();
+        assert!(!deployables.is_empty(), "should have deployables from package main");
     }
 }
