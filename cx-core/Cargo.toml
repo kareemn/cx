@@ -44,3 +44,7 @@ harness = false
 [[bench]]
 name = "string_intern"
 harness = false
+
+[[bench]]
+name = "query_depends"
+harness = false
