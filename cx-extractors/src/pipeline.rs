@@ -383,6 +383,70 @@ func newServer() *Server {
     }
 
     #[test]
+    fn index_respects_gitignore_venv_and_nested() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Init git repo so .gitignore is respected
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Create .gitignore with multiple patterns
+        fs::write(
+            dir.path().join(".gitignore"),
+            "venv/\nnode_modules/\n*.generated.go\n",
+        )
+        .unwrap();
+
+        // Indexed: normal Go file
+        fs::write(
+            dir.path().join("main.go"),
+            "package main\nfunc keepMe() {}\n",
+        )
+        .unwrap();
+
+        // Ignored: venv/ directory (Python virtualenv)
+        fs::create_dir_all(dir.path().join("venv/lib")).unwrap();
+        fs::write(
+            dir.path().join("venv/lib/setup.go"),
+            "package lib\nfunc venvFunc() {}\n",
+        )
+        .unwrap();
+
+        // Ignored: node_modules/
+        fs::create_dir(dir.path().join("node_modules")).unwrap();
+        fs::write(
+            dir.path().join("node_modules/pkg.go"),
+            "package pkg\nfunc nodeFunc() {}\n",
+        )
+        .unwrap();
+
+        // Ignored: wildcard pattern *.generated.go
+        fs::write(
+            dir.path().join("api.generated.go"),
+            "package main\nfunc generatedFunc() {}\n",
+        )
+        .unwrap();
+
+        let result = index_directory(dir.path()).unwrap();
+
+        let names: Vec<&str> = result
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Symbol as u8)
+            .map(|n| result.graph.strings.get(n.name))
+            .collect();
+
+        assert!(names.contains(&"keepMe"), "should index normal file");
+        assert!(!names.contains(&"venvFunc"), "should ignore venv/");
+        assert!(!names.contains(&"nodeFunc"), "should ignore node_modules/");
+        assert!(!names.contains(&"generatedFunc"), "should ignore *.generated.go");
+    }
+
+    #[test]
     fn index_produces_valid_graph() {
         let dir = tempfile::tempdir().unwrap();
         create_go_project(dir.path());
