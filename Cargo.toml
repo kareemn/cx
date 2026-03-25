@@ -1,0 +1,54 @@
+[workspace]
+members = ["cx-cli", "cx-core", "cx-extractors", "cx-resolution", "cx-languages"]
+resolver = "2"
+
+[workspace.dependencies]
+# Parsing
+tree-sitter = "0.24"
+tree-sitter-go = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.23"
+
+# CLI & serialization
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+anyhow = "1"
+crossbeam-channel = "0.5"
+
+# Memory-mapped I/O
+memmap2 = "0.9"
+
+# madvise hints (unix only)
+libc = "0.2"
+
+# Fast hash map for string interning
+rustc-hash = "2"
+
+# Parallel file indexing
+rayon = "1.10"
+
+# Small-vec optimization
+smallvec = "1.13"
+
+# Concurrent hash map for parallel string interning
+dashmap = "6"
+
+# Filesystem & git
+notify = "7"
+gix = "0.68"
+ignore = "0.4"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+glob = "0.3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

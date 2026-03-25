@@ -1,0 +1,44 @@
+[package]
+name = "cx-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memmap2 = { workspace = true }
+libc = { workspace = true }
+rustc-hash = { workspace = true }
+rayon = { workspace = true }
+smallvec = { workspace = true }
+dashmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+crossbeam-channel = { workspace = true }
+gix = { workspace = true }
+ignore = { workspace = true }
+notify = { workspace = true }
+glob = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "graph_traversal"
+harness = false
+
+[[bench]]
+name = "graph_loading"
+harness = false
+
+[[bench]]
+name = "query_path"
+harness = false
+
+[[bench]]
+name = "query_impact"
+harness = false
+
+[[bench]]
+name = "string_intern"
+harness = false

@@ -1,0 +1,11 @@
+[package]
+name = "cx-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cx-core = { path = "../cx-core" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

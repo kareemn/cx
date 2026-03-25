@@ -1,0 +1,15 @@
+[package]
+name = "cx-extractors"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cx-core = { path = "../cx-core" }
+tree-sitter = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-python = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+rayon = { workspace = true }
+dashmap = { workspace = true }
