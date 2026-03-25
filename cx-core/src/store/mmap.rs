@@ -5,7 +5,7 @@ use crate::graph::nodes::Node;
 use crate::graph::string_interner::StringInterner;
 
 /// Current graph file format version.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Magic bytes identifying a .cxgraph file.
 pub const MAGIC: [u8; 4] = *b"CX01";
@@ -29,6 +29,7 @@ pub struct GraphFileHeader {
     pub summary_node_count: u32,
     pub summary_edge_count: u32,
     pub string_table_size: u32,
+    pub _pad0: [u8; 4],
     pub nodes_offset: u64,
     pub edges_offset: u64,
     pub strings_offset: u64,
@@ -47,10 +48,9 @@ impl GraphFileHeader {
                 std::mem::size_of::<Self>(),
             )
         };
-        // Hash everything except the checksum field (offset 52, 4 bytes) and reserved (offset 56, 4 bytes)
+        // Hash everything before the checksum field (offset 56) and skip checksum + reserved
         let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&bytes[..52]);
-        // Skip checksum (4 bytes) and reserved (4 bytes)
+        hasher.update(&bytes[..56]);
         hasher.finalize()
     }
 }
@@ -91,6 +91,7 @@ pub fn write_graph(graph: &CsrGraph, path: &std::path::Path) -> crate::Result<()
         summary_node_count: 0,
         summary_edge_count: 0,
         string_table_size: string_data.len() as u32,
+        _pad0: [0; 4],
         nodes_offset,
         edges_offset,
         strings_offset,
@@ -486,7 +487,7 @@ mod tests {
         data[..64].copy_from_slice(header_bytes);
         std::fs::write(&bad_version_path, &data).unwrap();
         match load_graph(&bad_version_path) {
-            Err(CxError::VersionMismatch { found: 999, expected: 1 }) => {}
+            Err(CxError::VersionMismatch { found: 999, expected: 2 }) => {}
             other => panic!("expected VersionMismatch, got {:?}", other),
         }
 

@@ -69,7 +69,7 @@ pub struct Node {
     pub line: u32,
     pub parent: NodeId,
     pub repo: RepoId,
-    pub _pad: [u8; 2],
+    pub _pad: [u8; 6],
 }
 
 impl Node {
@@ -85,7 +85,7 @@ impl Node {
             line: 0,
             parent: NODE_NONE,
             repo: 0,
-            _pad: [0; 2],
+            _pad: [0; 6],
         }
     }
 
