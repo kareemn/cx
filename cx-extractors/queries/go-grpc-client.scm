@@ -1,17 +1,14 @@
-; Detect gRPC client patterns in Go
-; Matches: pb.NewXxxClient(conn) and grpc.Dial(addr, opts...)
+; Go gRPC client detection for CX
+; Captures: @http_call.url, @http_call.site
 
-; pb.New{Service}Client(conn) — gRPC client stub creation
+; grpc.Dial("addr"), grpc.DialContext(ctx, "addr"), grpc.NewClient("addr")
 (call_expression
   function: (selector_expression
-    operand: (_) @grpc.client.pkg
-    field: (field_identifier) @grpc.client.constructor)
-  (#match? @grpc.client.constructor "^New.*Client$")) @grpc.client.call
-
-; grpc.Dial(addr, opts...) — gRPC connection
-(call_expression
-  function: (selector_expression
-    operand: (identifier) @grpc.dial.pkg
-    field: (field_identifier) @grpc.dial.method)
-  (#eq? @grpc.dial.pkg "grpc")
-  (#match? @grpc.dial.method "^(Dial|DialContext|NewClient)$")) @grpc.dial.call
+    operand: (identifier) @_pkg
+    field: (field_identifier) @_method)
+  arguments: (argument_list
+    .
+    (_)* @_skip
+    (interpreted_string_literal) @http_call.url)
+  (#eq? @_pkg "grpc")
+  (#match? @_method "^(Dial|DialContext|NewClient)$")) @http_call.site

@@ -41,33 +41,40 @@ pub fn scan_go_grpc(
     let mut client_stubs = Vec::new();
     let mut server_registrations = Vec::new();
 
-    // Scan for client patterns
-    if let Ok(query) = tree_sitter::Query::new(language, GO_GRPC_CLIENT_QUERY) {
-        let constructor_idx = query
-            .capture_names()
-            .iter()
-            .position(|n| *n == "grpc.client.constructor")
-            .map(|i| i as u32);
+    // Scan for client patterns using call.name capture (method calls like NewXxxClient)
+    {
+        let client_query_src = r#"
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @call.name)
+  (#match? @call.name "^New.*Client$")) @call.site
+"#;
+        if let Ok(query) = tree_sitter::Query::new(language, client_query_src) {
+            let name_idx = query
+                .capture_names()
+                .iter()
+                .position(|n| *n == "call.name")
+                .map(|i| i as u32);
 
-        if let Some(idx) = constructor_idx {
-            let mut cursor = tree_sitter::QueryCursor::new();
-            let mut matches = cursor.matches(&query, tree.root_node(), source);
+            if let Some(idx) = name_idx {
+                let mut cursor = tree_sitter::QueryCursor::new();
+                let mut matches = cursor.matches(&query, tree.root_node(), source);
 
-            while let Some(m) = matches.next() {
-                for cap in m.captures {
-                    if cap.index == idx {
-                        if let Ok(text) = std::str::from_utf8(&source[cap.node.byte_range()]) {
-                            // Extract service name from "New{Service}Client"
-                            if let Some(svc) = text
-                                .strip_prefix("New")
-                                .and_then(|s| s.strip_suffix("Client"))
-                            {
-                                if !svc.is_empty() {
-                                    client_stubs.push(GrpcClientStub {
-                                        service_name: svc.to_string(),
-                                        file: file_path.to_string(),
-                                        line: cap.node.start_position().row as u32 + 1,
-                                    });
+                while let Some(m) = matches.next() {
+                    for cap in m.captures {
+                        if cap.index == idx {
+                            if let Ok(text) = std::str::from_utf8(&source[cap.node.byte_range()]) {
+                                if let Some(svc) = text
+                                    .strip_prefix("New")
+                                    .and_then(|s| s.strip_suffix("Client"))
+                                {
+                                    if !svc.is_empty() {
+                                        client_stubs.push(GrpcClientStub {
+                                            service_name: svc.to_string(),
+                                            file: file_path.to_string(),
+                                            line: cap.node.start_position().row as u32 + 1,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -77,12 +84,12 @@ pub fn scan_go_grpc(
         }
     }
 
-    // Scan for server patterns
+    // Scan for server patterns using endpoint.path capture
     if let Ok(query) = tree_sitter::Query::new(language, GO_GRPC_SERVER_QUERY) {
         let register_idx = query
             .capture_names()
             .iter()
-            .position(|n| *n == "grpc.server.register")
+            .position(|n| *n == "endpoint.path")
             .map(|i| i as u32);
 
         if let Some(idx) = register_idx {
