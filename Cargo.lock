@@ -399,7 +399,10 @@ dependencies = [
  "anyhow",
  "clap",
  "cx-core",
+ "cx-extractors",
+ "rustc-hash",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -431,10 +434,15 @@ dependencies = [
 name = "cx-extractors"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "cx-core",
  "dashmap",
+ "ignore",
  "rayon",
+ "rustc-hash",
  "serde",
+ "streaming-iterator",
+ "tempfile",
  "thiserror",
  "tree-sitter",
  "tree-sitter-go",

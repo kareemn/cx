@@ -1859,6 +1859,11 @@ BENCH trigram_index_build:
 BENCH trigram_search:
   Trigram index over 100K names. Search for a 10-character query.
   TARGET: < 2ms to return top 20 results.
+
+BENCH index_scaling:
+  Same 50K LOC Go repo. Run with RAYON_NUM_THREADS=1, 2, 4, 8, 16.
+  Report throughput (LOC/sec) at each thread count.
+  This tells you the actual parallelism efficiency and where it plateaus.
 ```
 
 ### Milestone 3: Cross-Repo Resolution and Path Tracing
