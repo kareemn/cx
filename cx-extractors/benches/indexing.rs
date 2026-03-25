@@ -192,6 +192,43 @@ fn cx_search_latency(c: &mut Criterion) {
     });
 }
 
+/// BENCH index_scaling:
+///   Same 50K LOC Go repo. Run with RAYON_NUM_THREADS=1, 2, 4, 8, 16.
+///   Report throughput (LOC/sec) at each thread count.
+fn index_scaling(c: &mut Criterion) {
+    use criterion::BenchmarkId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let funcs_per_file = 8;
+    let num_files = 500;
+    gen_go_repo(dir.path(), num_files, funcs_per_file);
+    let total_loc = num_files * loc_per_file(funcs_per_file);
+
+    let mut group = c.benchmark_group("index_scaling");
+    group.sample_size(10);
+
+    for threads in [1, 2, 4, 8, 16] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{}_threads", threads)),
+            &threads,
+            |b, &t| {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(t)
+                    .build()
+                    .unwrap();
+                b.iter(|| {
+                    pool.install(|| {
+                        cx_extractors::pipeline::index_directory(dir.path()).unwrap()
+                    })
+                });
+            },
+        );
+    }
+
+    group.finish();
+    eprintln!("Total LOC for scaling bench: {}", total_loc);
+}
+
 criterion_group! {
     name = small_benches;
     config = Criterion::default();
@@ -201,7 +238,7 @@ criterion_group! {
 criterion_group! {
     name = large_benches;
     config = Criterion::default().sample_size(10);
-    targets = index_medium_repo, index_large_repo
+    targets = index_medium_repo, index_large_repo, index_scaling
 }
 
 criterion_main!(small_benches, large_benches);
