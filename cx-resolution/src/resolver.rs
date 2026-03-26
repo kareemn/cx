@@ -1,5 +1,6 @@
 use crate::helm_env_resolution::{self, EnvVarRead, HelmEnvDef, HelmEnvMatch};
 use crate::image_resolution::{self, DockerImage, ImageMatch, K8sContainerImage};
+use crate::k8s_resolution::{self, K8sEnvBinding, K8sServiceMatch};
 use crate::proto_matching::{self, ProtoMatch};
 use crate::rest_resolution::{self, HttpClientCall, HttpServerRoute, RestMatch};
 use crate::websocket_resolution::{self, WsClientConnection, WsMatch, WsServerEndpoint};
@@ -39,6 +40,10 @@ pub struct ResolutionInput {
     pub ws_clients: Vec<(String, Vec<WsClientConnection>)>,
     /// (repo_name, ws_server_endpoints)
     pub ws_servers: Vec<(String, Vec<WsServerEndpoint>)>,
+
+    // -- K8s env → service resolution --
+    /// K8s env var bindings from deployment manifests.
+    pub k8s_env_bindings: Vec<K8sEnvBinding>,
 }
 
 /// Result of a resolution pass.
@@ -48,6 +53,7 @@ pub struct ResolutionResult {
     pub helm_env_matches: Vec<HelmEnvMatch>,
     pub image_matches: Vec<ImageMatch>,
     pub ws_matches: Vec<WsMatch>,
+    pub k8s_matches: Vec<K8sServiceMatch>,
 
     /// Total resolved edges across all types.
     pub resolved_count: usize,
@@ -57,6 +63,7 @@ pub struct ResolutionResult {
     pub helm_env_count: usize,
     pub image_count: usize,
     pub ws_count: usize,
+    pub k8s_count: usize,
 
     /// Unresolved gRPC client stubs.
     pub unresolved_client_stubs: Vec<(String, GrpcClientStub)>,
@@ -102,12 +109,23 @@ pub fn resolve(input: &ResolutionInput) -> ResolutionResult {
     let ws_matches =
         websocket_resolution::match_websockets(&input.ws_clients, &input.ws_servers);
 
+    // 6. K8s env var → service DNS resolution
+    let all_code_env_reads: Vec<EnvVarRead> = input
+        .env_var_reads
+        .iter()
+        .flat_map(|(_, reads)| reads.clone())
+        .collect();
+    let k8s_matches =
+        k8s_resolution::match_env_to_services(&input.k8s_env_bindings, &all_code_env_reads);
+
     let proto_count = proto_matches.len();
     let rest_count = rest_matches.len();
     let helm_env_count = helm_env_matches.len();
     let image_count = image_matches.len();
     let ws_count = ws_matches.len();
-    let resolved_count = proto_count + rest_count + helm_env_count + image_count + ws_count;
+    let k8s_count = k8s_matches.len();
+    let resolved_count =
+        proto_count + rest_count + helm_env_count + image_count + ws_count + k8s_count;
 
     ResolutionResult {
         proto_matches,
@@ -115,11 +133,13 @@ pub fn resolve(input: &ResolutionInput) -> ResolutionResult {
         helm_env_matches,
         image_matches,
         ws_matches,
+        k8s_matches,
         resolved_count,
         proto_count,
         rest_count,
         helm_env_count,
         image_count,
+        k8s_count,
         ws_count,
         unresolved_client_stubs: unresolved,
     }
@@ -142,6 +162,7 @@ mod tests {
             k8s_container_images: vec![],
             ws_clients: vec![],
             ws_servers: vec![],
+            k8s_env_bindings: vec![],
         }
     }
 

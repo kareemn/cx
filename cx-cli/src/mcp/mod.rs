@@ -270,6 +270,16 @@ fn dispatch_tool(
                 .collect();
             serde_json::to_string(&output).map_err(|e| e.to_string())
         }
+        "cx_network" => {
+            let kind = args.get("kind").and_then(|v| v.as_str());
+            let direction = args.get("direction").and_then(|v| v.as_str());
+            let service = args.get("service").and_then(|v| v.as_str());
+
+            let report = crate::commands::network::build_network_report(
+                graph, kind, direction, service,
+            );
+            serde_json::to_string(&report).map_err(|e| e.to_string())
+        }
         _ => Err(format!("unknown tool: {}", name)),
     }
 }
@@ -335,6 +345,18 @@ fn tool_definitions() -> Vec<serde_json::Value> {
                 "required": ["query"]
             }
         }),
+        serde_json::json!({
+            "name": "cx_network",
+            "description": "List all detected network calls and exposed APIs with provenance chains. Shows outbound connections (HTTP, gRPC, database, Redis, Kafka, etc.) and inbound exposed endpoints.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "description": "Filter by kind: http, grpc, database, redis, kafka, websocket, sqs, s3, tcp" },
+                    "direction": { "type": "string", "enum": ["inbound", "outbound"], "description": "Filter by direction" },
+                    "service": { "type": "string", "description": "Filter by service/deployable name" }
+                }
+            }
+        }),
     ]
 }
 
@@ -386,7 +408,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
 
         let tools = v["result"]["tools"].as_array().unwrap();
-        assert!(tools.len() >= 5, "should have at least 5 tools");
+        assert!(tools.len() >= 6, "should have at least 6 tools");
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"cx_path"));

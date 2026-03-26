@@ -72,6 +72,7 @@ fn resolve_cross_repo(merged: &mut MergedResult) -> usize {
                 path: e.path.clone(), file: e.file.clone(), line: e.line,
             }).collect())
         }).collect(),
+        k8s_env_bindings: vec![],
     };
 
     let result = resolver::resolve(&input);
@@ -119,9 +120,9 @@ fn resolve_cross_repo(merged: &mut MergedResult) -> usize {
     }
 
     eprintln!(
-        "  Resolution summary: {} gRPC, {} REST, {} env→Helm, {} image, {} WebSocket",
+        "  Resolution summary: {} gRPC, {} REST, {} env→Helm, {} image, {} WebSocket, {} K8s env",
         result.proto_count, result.rest_count, result.helm_env_count,
-        result.image_count, result.ws_count
+        result.image_count, result.ws_count, result.k8s_count
     );
 
     edges_added

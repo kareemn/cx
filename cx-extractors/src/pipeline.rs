@@ -94,6 +94,14 @@ pub struct HelmEnvDef {
 pub struct DockerImage {
     pub image_ref: String,
     pub file: String,
+    /// Ports declared via EXPOSE.
+    pub exposed_ports: Vec<u16>,
+    /// Default env vars declared via ENV.
+    pub env_defaults: Vec<(String, String)>,
+    /// ENTRYPOINT command, if declared.
+    pub entrypoint: Option<String>,
+    /// CMD command, if declared.
+    pub cmd: Option<String>,
 }
 
 /// A container image reference from k8s manifests.
@@ -971,19 +979,64 @@ fn parse_infra_files(
         let file_name = rf.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         if file_name.starts_with("Dockerfile") {
-            // Parse Dockerfile: extract FROM image references
+            // Parse Dockerfile: extract FROM, EXPOSE, ENV, ENTRYPOINT, CMD
+            let mut from_images = Vec::new();
+            let mut exposed_ports = Vec::new();
+            let mut env_defaults = Vec::new();
+            let mut entrypoint: Option<String> = None;
+            let mut cmd: Option<String> = None;
+
             for line in content.lines() {
                 let trimmed = line.trim();
                 if let Some(rest) = trimmed.strip_prefix("FROM ") {
-                    // FROM image:tag AS alias
                     let image_ref = rest.split_whitespace().next().unwrap_or("").to_string();
                     if !image_ref.is_empty() && image_ref != "scratch" {
-                        docker_images.entry(rf.repo_id).or_default().push(DockerImage {
-                            image_ref,
-                            file: rel_path.clone(),
-                        });
+                        from_images.push(image_ref);
                     }
+                } else if let Some(rest) = trimmed.strip_prefix("EXPOSE ") {
+                    // EXPOSE 8080 or EXPOSE 8080/tcp
+                    for token in rest.split_whitespace() {
+                        let port_str = token.split('/').next().unwrap_or(token);
+                        if let Ok(port) = port_str.parse::<u16>() {
+                            if !exposed_ports.contains(&port) {
+                                exposed_ports.push(port);
+                            }
+                        }
+                    }
+                } else if let Some(rest) = trimmed.strip_prefix("ENV ") {
+                    // ENV KEY=value or ENV KEY value
+                    let rest = rest.trim();
+                    if let Some(eq_idx) = rest.find('=') {
+                        let key = rest[..eq_idx].trim();
+                        let val = rest[eq_idx + 1..].trim().trim_matches('"');
+                        if !key.is_empty() {
+                            env_defaults.push((key.to_string(), val.to_string()));
+                        }
+                    } else {
+                        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                        if parts.len() == 2 {
+                            env_defaults.push((
+                                parts[0].to_string(),
+                                parts[1].trim_matches('"').to_string(),
+                            ));
+                        }
+                    }
+                } else if let Some(rest) = trimmed.strip_prefix("ENTRYPOINT ") {
+                    entrypoint = Some(rest.trim().to_string());
+                } else if let Some(rest) = trimmed.strip_prefix("CMD ") {
+                    cmd = Some(rest.trim().to_string());
                 }
+            }
+
+            for image_ref in from_images {
+                docker_images.entry(rf.repo_id).or_default().push(DockerImage {
+                    image_ref,
+                    file: rel_path.clone(),
+                    exposed_ports: exposed_ports.clone(),
+                    env_defaults: env_defaults.clone(),
+                    entrypoint: entrypoint.clone(),
+                    cmd: cmd.clone(),
+                });
             }
         } else {
             // YAML: parse env var definitions and container image references

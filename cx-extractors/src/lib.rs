@@ -8,11 +8,16 @@ pub mod grpc_client;
 pub mod grpc_server;
 pub mod helm;
 pub mod k8s;
+pub mod lsp;
+pub mod manifest;
 pub mod messagequeue;
 pub mod openapi;
 pub mod pipeline;
 pub mod proto;
+pub mod raw_extract;
 pub mod rest;
+pub mod sink_registry;
+pub mod taint;
 pub mod treesitter;
 pub mod universal;
 

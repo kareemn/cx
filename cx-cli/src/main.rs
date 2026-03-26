@@ -65,6 +65,21 @@ enum Commands {
         #[arg(long, default_value = "10")]
         max_depth: u32,
     },
+    /// List all detected network calls and exposed APIs
+    Network {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Filter by kind (http, grpc, database, redis, kafka, websocket, sqs, s3, tcp)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Filter by direction (inbound, outbound)
+        #[arg(long)]
+        direction: Option<String>,
+        /// Filter by service/deployable name
+        #[arg(long)]
+        service: Option<String>,
+    },
     /// Start MCP server (JSON-RPC over stdio)
     Mcp,
 }
@@ -95,6 +110,12 @@ fn main() {
             upstream,
             max_depth,
         } => commands::depends::run(&root, symbol, upstream, max_depth),
+        Commands::Network {
+            json,
+            ref kind,
+            ref direction,
+            ref service,
+        } => commands::network::run(&root, json, kind.as_deref(), direction.as_deref(), service.as_deref()),
         Commands::Mcp => mcp::run(&root),
     };
 

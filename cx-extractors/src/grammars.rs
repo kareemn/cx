@@ -8,6 +8,7 @@ pub enum Language {
     Python,
     C,
     Cpp,
+    Java,
 }
 
 impl Language {
@@ -19,6 +20,7 @@ impl Language {
             "py" => Some(Self::Python),
             "c" | "h" => Some(Self::C),
             "cpp" | "cc" | "cxx" | "hpp" => Some(Self::Cpp),
+            "java" => Some(Self::Java),
             _ => None,
         }
     }
@@ -37,6 +39,7 @@ impl Language {
             Self::Python => tree_sitter_python::LANGUAGE.into(),
             Self::C => tree_sitter_c::LANGUAGE.into(),
             Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Self::Java => tree_sitter_java::LANGUAGE.into(),
         }
     }
 }
@@ -61,6 +64,7 @@ pub fn extractor_for_language(lang: Language) -> Option<UniversalExtractor> {
         Language::TypeScript => TYPESCRIPT_QUERY,
         Language::C => C_QUERY,
         Language::Cpp => CPP_QUERY,
+        Language::Java => return None,
     };
     let conn_queries = crate::connection_patterns::connection_queries(lang);
     let const_query = crate::connection_patterns::constant_query(lang);
@@ -86,6 +90,7 @@ mod tests {
         assert_eq!(Language::from_extension("cc"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("cxx"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("hpp"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("java"), Some(Language::Java));
         assert_eq!(Language::from_extension("rs"), None);
         assert_eq!(Language::from_extension(""), None);
     }
@@ -101,6 +106,7 @@ mod tests {
         assert_eq!(Language::from_path(Path::new("util.h")), Some(Language::C));
         assert_eq!(Language::from_path(Path::new("server.cpp")), Some(Language::Cpp));
         assert_eq!(Language::from_path(Path::new("server.cc")), Some(Language::Cpp));
+        assert_eq!(Language::from_path(Path::new("Main.java")), Some(Language::Java));
         assert_eq!(Language::from_path(Path::new("README.md")), None);
     }
 

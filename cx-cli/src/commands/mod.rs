@@ -4,5 +4,6 @@ pub mod depends;
 pub mod edges;
 pub mod init;
 pub mod inspect;
+pub mod network;
 pub mod path;
 pub mod search;

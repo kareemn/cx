@@ -93,6 +93,7 @@ pub fn connection_queries(lang: Language) -> String {
         Language::C => {
             include_str!("../queries/c-envvar.scm").to_string()
         }
+        Language::Java => String::new(),
     }
 }
 
@@ -105,5 +106,6 @@ pub fn constant_query(lang: Language) -> &'static str {
         Language::Python => PY_STRING_CONSTANTS,
         Language::Cpp => CPP_STRING_CONSTANTS,
         Language::C => C_STRING_CONSTANTS,
+        Language::Java => "",
     }
 }
