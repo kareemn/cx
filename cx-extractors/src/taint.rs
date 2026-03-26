@@ -691,7 +691,7 @@ pub fn propagate(
     const_map: &FxHashMap<StringId, StringId>,
     max_depth: u32,
 ) -> Vec<ResolvedNetworkCall> {
-    let mut results: Vec<ResolvedNetworkCall> = Vec::new();
+    let results: Vec<ResolvedNetworkCall> = Vec::new();
 
     // Index: func_name → summary
     let _summary_map: FxHashMap<StringId, &FunctionFlowSummary> = summaries
@@ -705,32 +705,28 @@ pub fn propagate(
         callers.entry(*callee).or_default().push(*caller);
     }
 
-    // Collect all direct sinks as initial resolved calls
+    // Index direct sinks for worklist seeding, but do NOT emit them as results.
+    // The caller (pipeline.rs) already collects direct sinks with correct file paths.
+    // Re-emitting them here would create duplicates with empty file fields when
+    // file_id was passed as STRING_NONE.
+    struct SinkRef {
+        address_source: AddressSource,
+    }
+    let mut direct_sink_refs: Vec<SinkRef> = Vec::new();
     for summary in summaries {
         for sink in &summary.direct_sinks {
-            let file_str = if sink.file != STRING_NONE {
-                strings.get(sink.file).to_string()
-            } else {
-                String::new()
-            };
-
-            results.push(ResolvedNetworkCall {
-                net_kind: sink.net_kind,
-                callee_fqn: sink.callee_name.clone(),
+            direct_sink_refs.push(SinkRef {
                 address_source: sink.address_source.clone(),
-                file: file_str,
-                line: sink.line,
-                confidence: Confidence::Heuristic,
             });
         }
     }
 
     // Worklist: propagate Parameter sources through callers
-    let mut worklist: Vec<(StringId, u8, usize)> = Vec::new(); // (func_name, param_idx, result_idx)
+    let mut worklist: Vec<(StringId, u8, usize)> = Vec::new(); // (func_name, param_idx, sink_idx)
 
-    // Find all Parameter sources in results and enqueue
-    for (idx, result) in results.iter().enumerate() {
-        if let AddressSource::Parameter { func, param_idx, .. } = &result.address_source {
+    // Find all Parameter sources in direct sinks and enqueue
+    for (idx, sink_ref) in direct_sink_refs.iter().enumerate() {
+        if let AddressSource::Parameter { func, param_idx, .. } = &sink_ref.address_source {
             let func_id = strings.intern_lookup(func);
             if let Some(fid) = func_id {
                 worklist.push((fid, *param_idx, idx));
@@ -745,7 +741,7 @@ pub fn propagate(
         let next_worklist = Vec::new();
         depth += 1;
 
-        for (func_name, param_idx, result_idx) in worklist.drain(..) {
+        for (func_name, param_idx, sink_idx) in worklist.drain(..) {
             if !visited.insert((func_name, param_idx)) {
                 continue;
             }
@@ -763,10 +759,10 @@ pub fn propagate(
                             max_depth - depth,
                         );
 
-                        // Update the result's address source
-                        if result_idx < results.len() {
+                        // Update the sink ref's address source
+                        if sink_idx < direct_sink_refs.len() {
                             if let AddressSource::Parameter { caller_sources, .. } =
-                                &mut results[result_idx].address_source
+                                &mut direct_sink_refs[sink_idx].address_source
                             {
                                 caller_sources.push(caller_source);
                             }
