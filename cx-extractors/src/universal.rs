@@ -1121,11 +1121,12 @@ func handler() {
     }
 
     #[test]
-    fn local_const_cpp() {
+    fn local_const_cpp_handshake_is_client_not_server() {
         let lang: tree_sitter::Language = tree_sitter_cpp::LANGUAGE.into();
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&lang).unwrap();
-        // Match a real C++ WebSocket client pattern
+        // async_handshake is a CLIENT-side WebSocket upgrade in Boost.Beast,
+        // not a server endpoint. It should NOT create an Endpoint node.
         let source = r#"
 #include <string>
 
@@ -1156,8 +1157,8 @@ void S2SClient::on_connect(int ec, int ep) {
             .map(|n| strings.get(n.name))
             .collect();
         assert!(
-            endpoints.contains(&"/ws/s2s"),
-            "should resolve C++ variable to string literal via constant propagation: got {:?}",
+            endpoints.is_empty(),
+            "async_handshake is client-side, should NOT create Endpoint nodes: got {:?}",
             endpoints
         );
     }

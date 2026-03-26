@@ -579,6 +579,11 @@ pub static NETWORK_SINKS: &[SinkEntry] = &[
     SinkEntry { fqn: "websocketpp::server::listen", category: WebsocketServer, addr_arg_index: 0, direction: Inbound },
     SinkEntry { fqn: "ix::WebSocket::setUrl", category: WebsocketClient, addr_arg_index: 0, direction: Outbound },
     SinkEntry { fqn: "ix::WebSocketServer", category: WebsocketServer, addr_arg_index: 0, direction: Inbound },
+    // Boost.Beast WebSocket
+    SinkEntry { fqn: "beast::websocket::stream::handshake", category: WebsocketClient, addr_arg_index: 1, direction: Outbound },
+    SinkEntry { fqn: "beast::websocket::stream::async_handshake", category: WebsocketClient, addr_arg_index: 1, direction: Outbound },
+    SinkEntry { fqn: "beast::websocket::stream::accept", category: WebsocketServer, addr_arg_index: 0, direction: Inbound },
+    SinkEntry { fqn: "beast::websocket::stream::async_accept", category: WebsocketServer, addr_arg_index: 0, direction: Inbound },
 
     // -- C++: TCP (Boost.Asio) --
     SinkEntry { fqn: "boost::asio::ip::tcp::socket::connect", category: TcpDial, addr_arg_index: 0, direction: Outbound },
@@ -791,10 +796,12 @@ pub fn heuristic_classify_call(
 
     // WebSocket patterns
     if recv.contains("websocket") || recv.contains("ws") || recv == "websocket" {
-        if meth == "connect" || meth == "dial" || meth == "dialcontext" || meth == "seturl" {
+        if meth == "connect" || meth == "dial" || meth == "dialcontext" || meth == "seturl"
+            || meth == "handshake" || meth == "async_handshake"
+        {
             return Some(WebsocketClient);
         }
-        if meth == "upgrade" || meth == "accept" || meth == "serve" || meth == "listen" {
+        if meth == "upgrade" || meth == "accept" || meth == "async_accept" || meth == "serve" || meth == "listen" {
             return Some(WebsocketServer);
         }
     }
