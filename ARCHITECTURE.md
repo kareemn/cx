@@ -2,9 +2,19 @@
 
 ## What CX Is
 
-CX is a local-first, git-native code intelligence engine that builds a queryable structural graph of distributed codebases. It indexes across multiple repositories, languages, and infrastructure configs to answer questions like "what happens when this endpoint receives a request," "what breaks if I change this function," and "how has the service topology changed since last month."
+CX is a distributed code intelligence engine that builds a complete, type-resolved map of how services communicate — across repositories, languages, and infrastructure. It answers one question with 100% accuracy:
 
-CX is not a code search tool. It is a structural intelligence engine that gives both developers and AI coding agents an instant, deterministic, exhaustive map of how a distributed system is wired together.
+> **What are every single incoming API and outgoing network call in this codebase, where does each connection target come from, and how do all these services connect to each other?**
+
+Given one or more source code repositories and their deployment configs, CX produces:
+
+1. **Every exposed API**: HTTP endpoints, gRPC services, WebSocket endpoints, message queue topics — with exact file:line locations.
+2. **Every outgoing network call**: HTTP clients, gRPC dials, database connections, Redis, Kafka, SQS, raw TCP — with a full provenance chain showing where the connection target comes from (string literal, env var, config file, function parameter).
+3. **The complete service wiring**: How services connect to each other via env vars, K8s DNS, Helm values, and Docker networking — traced from source code through infrastructure config to the target service's exposed API.
+
+CX works like git: local-first, distributed, collaborative. Each team builds their repo's graph independently. Teams add remotes to pull other repos' graphs and build the complete cross-service topology. The graph is never a static document — it's a living, compiler-derived artifact that improves with each index run and can be tuned by teams to reach 100% coverage of their codebase.
+
+CX is designed to scale to **1000+ repositories** across an organization.
 
 The primary interfaces are a CLI (`cx`) and an MCP server that plugs directly into Claude Code, Cursor, Gemini CLI, and any MCP-compatible AI agent. There is no web UI. There is no SaaS dashboard. CX lives in the terminal.
 
@@ -18,19 +28,41 @@ Current tools don't solve this:
 - **LSPs** break at repository boundaries and can't trace cross-service calls
 - **Sourcegraph/GitHub code search** finds text matches but can't follow gRPC boundaries, resolve environment variables through Helm charts, or show the full request path across services
 - **AI agents with large context windows** can read code and infer structure, but they're expensive per query, non-deterministic, potentially incomplete (they miss edges in files they skim), and can't do temporal queries across git history
+- **Architecture documentation** goes stale the moment it's written
 
 ### The Insight
 
-The structural connections between services are well-specified. gRPC has proto files. REST has OpenAPI specs. Kubernetes has manifests. Helm has values files. These are all parseable, deterministic sources of truth about how services connect. The reason nobody has built a great cross-repo structural intelligence tool is that the implementation volume — parsing every protocol, every language, every infrastructure format — was too large for a small team. AI coding agents change that equation.
+Every network call in every language takes an address argument — a URL, host:port, connection string. That address comes from somewhere: a string literal, an environment variable, a config file, a function parameter. By tracing that data flow from network call back to its source, and matching it against infrastructure configs (K8s manifests, Helm values), we can deterministically reconstruct the entire service topology without running anything.
+
+The reason nobody has built this is that it requires: fast multi-language parsing, cross-file taint analysis, infrastructure config resolution, and type-resolved call graphs — across every major language and framework. AI coding agents change that equation.
 
 ### CX's Position
 
 CX is the structural map. The AI agent is the reasoning engine. They're complementary:
-- CX provides instant, deterministic, exhaustive structural queries (what connects to what)
+- CX provides instant, deterministic, exhaustive structural queries (what connects to what, with provenance)
 - The AI agent provides reasoning (why does it connect that way, how should I change it)
 - The MCP interface makes them work together: the agent queries CX to understand structure, then loads only the relevant files into its context window for deep reasoning
 
 This makes the AI agent dramatically more effective — instead of burning 50k+ tokens grepping and reading files to understand a call chain, the agent makes one `cx_path` call and gets the complete answer in milliseconds.
+
+### CX as Lossless Context
+
+Inspired by [Lossless Context Management](https://papers.voltropy.com/LCM) (Voltropy, 2026), CX's graph is a precomputed, hierarchical exploration summary of a codebase's network structure. LCM demonstrates that context management is the primary bottleneck for long-horizon agentic tasks — tools like CX that pre-compute compact graph representations eliminate this bottleneck.
+
+The graph provides multiple resolution levels:
+- `cx context` → top-level service topology (condensed summary)
+- `cx path --from A --to B` → specific call chain between symbols (expanded detail)
+- `cx network` → all network boundaries with provenance (full resolution)
+
+Every edge is traceable to source code. No information is lost — the graph is lossless, deterministic, and reproducible. An agent can drill from summary to detail without re-analyzing code.
+
+## How CX Achieves This
+
+1. **tree-sitter** for fast structural parsing — always available, <2s per repo, extracts all symbols, calls, imports, and string literals with 100% recall.
+2. **LSP servers** (ty, gopls, tsserver, jdtls, clangd) for type-resolved call graphs — optional, graceful degradation. When available, every call target is resolved to its fully qualified name. Without LSP, falls back to import-based heuristics.
+3. **Backward taint analysis** tracing address arguments through variable assignments, function parameters, env var reads, and config file loads — cross-file, inter-procedural, depth-bounded.
+4. **Infrastructure resolution** linking code-side env var reads to K8s manifest values to service DNS names to target services' exposed APIs.
+5. **Distributed graph protocol** enabling teams to share graphs via remotes, with collaborative parser config refinement via `.cx/config/`.
 
 ## Core Design Principles
 
@@ -38,11 +70,17 @@ This makes the AI agent dramatically more effective — instead of burning 50k+ 
 
 2. **Git-native.** The fundamental unit of indexing is a commit, not a directory. Branches are graph states. Diffs between branches are graph diffs. Temporal queries ("when did this dependency appear") walk git history.
 
-3. **Progressive resolution.** CX is honest about what it doesn't know. Every query response carries a completeness score and explicit gap information. Dangling edges (references to unindexed services) are first-class objects, not silent omissions.
+3. **Progressive resolution.** CX is honest about what it doesn't know. Every query response carries a completeness score and explicit gap information. Dangling edges (references to unindexed services) are first-class objects, not silent omissions. Results are marked as "type-confirmed" (via LSP) or "heuristic" (tree-sitter only).
 
-4. **Incremental.** File changes trigger incremental re-parsing via tree-sitter. Cross-repo updates happen in the background. Local edits are real-time; remote repo updates are eventually consistent.
+4. **Incremental.** File changes trigger incremental re-parsing via tree-sitter. Cross-repo updates happen in the background. Per-repo graphs are independent — adding repo 1000 is as fast as adding repo 2.
 
-5. **Single binary.** CX compiles to one static Rust binary. No runtime dependencies. `cargo install cx` or download from releases. The binary serves as both the CLI and the MCP server.
+5. **Single binary, optional LSP.** CX compiles to one static Rust binary. It always works standalone with tree-sitter. When language-specific LSP servers (ty, gopls, tsserver, jdtls, clangd) are installed, CX uses them for type-resolved accuracy. The LSP integration is always optional — never a hard dependency.
+
+6. **Distributed like git.** Each repo has a `.cx/` directory. Teams build their own graph. `cx remote add/pull/push` shares graphs. Custom parser config (`.cx/config/sinks.toml`, `.cx/config/taxonomy.toml`) is version-controlled and shareable — enabling teams to reach 100% coverage without modifying CX source code.
+
+7. **Network boundaries are the primary concern.** Every incoming API and outgoing network call is detected, classified, and traced to its address source. The graph is structured around network I/O boundaries, not arbitrary code structure.
+
+8. **1000-repo scale.** Per-repo graphs with a global index. Cross-repo resolution is O(new_repo) not O(N^2). Queries load only the repos they touch via mmap.
 
 ## Performance Rules (MANDATORY)
 

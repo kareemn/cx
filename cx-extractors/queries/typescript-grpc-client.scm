@@ -1,18 +1,5 @@
 ; TypeScript/JavaScript gRPC client detection for CX
-; Captures: @http_call.url, @http_call.site
-
-; new grpc.Client("addr", creds), grpc.credentials.createInsecure()
-; new XxxClient("addr", ...)
-(new_expression
-  constructor: (identifier) @_cls
-  arguments: (arguments
-    (string) @http_call.url)
-  (#match? @_cls "Client$")) @http_call.site
-
-; @grpc/grpc-js: new Client("addr")
-(new_expression
-  constructor: (member_expression
-    property: (property_identifier) @_cls)
-  arguments: (arguments
-    (string) @http_call.url)
-  (#match? @_cls "Client$")) @http_call.site
+; gRPC client stubs are now detected by scan_js_grpc() in grpc.rs
+; (line-based scanner that produces GrpcClientStub directly)
+; This file is intentionally empty — the old tree-sitter query used
+; @http_call.url captures which created false HTTP Endpoint nodes.

@@ -1,11 +1,17 @@
-# CX - Code Intelligence Engine
+# CX - Distributed Code Intelligence for Network Boundary Analysis
 
 ## Project Overview
 Read ARCHITECTURE.md for full design. This file contains working instructions.
 
+cx's primary goal: find every incoming API and outgoing network call in a codebase,
+trace where each connection target comes from, and map how services connect across
+repos, languages, and infrastructure. Designed for 1000+ repo scale.
+
 ## Tech Stack
 - Rust workspace (cargo)
 - Key crates: tree-sitter, memmap2, rayon, rustc-hash, dashmap, smallvec, clap, serde, serde_json, thiserror, anyhow, libc, ignore, gix, criterion
+- LSP integration: ty (Python), gopls (Go), tsserver (TS/JS), jdtls (Java), clangd (C/C++)
+- tree-sitter grammars: Go, Python, TypeScript, C, C++, Java (tree-sitter-java)
 - Release profile: opt-level=3, lto="fat", codegen-units=1, panic="abort"
 
 ## Build Commands
@@ -28,16 +34,17 @@ Read it before implementing any module. Follow it exactly.
 7. Every public function returns Result<T, CxError>. No unwrap() in library code.
 8. Tests go in the same file as the code (#[cfg(test)] mod tests).
 9. Benchmarks use criterion in cx-core/benches/.
-
-## Implementation Order
-Build bottom-up. Each step must compile and pass tests before moving on:
-1. cx-core/src/graph/nodes.rs + edges.rs — Node, Edge, StringId, NodeId types
-2. cx-core/src/graph/bitvec.rs — BitVec
-3. cx-core/src/graph/csr.rs — CsrGraph struct, builder, traversal
-4. cx-core/src/store/mmap.rs — GraphFileHeader, write to disk, mmap load
-5. cx-core/src/query/bfs.rs — BfsState double-buffer traversal
-6. cx-core/src/graph/summary.rs — SummaryGraph construction
-7. cx-core/src/graph/kind_index.rs — KindIndex
-8. Benchmarks for all of the above
-9. Then move to Milestone 2 (extractors)
+10. Network boundary analysis is the primary use case. Every change must preserve
+    or improve coverage of: exposed APIs, outgoing network calls, address provenance
+    tracing, and cross-service resolution.
+11. LSP integration is optional — cx must always work without LSP servers installed.
+    Use tree-sitter + import heuristics as fallback. Mark results as
+    "type-confirmed" vs "heuristic" in output.
+12. The sink registry (known network functions) must be exhaustive. When adding a
+    new language or framework, add ALL its network functions to the registry.
+13. cx is designed for 1000+ repos. Never re-index all repos when adding one.
+    Per-repo graphs are independent. Cross-repo resolution uses a global index.
+14. Custom sink/taxonomy configs in .cx/config/ are the mechanism for teams to
+    reach 100% coverage. cx should never require source code changes to handle
+    repo-specific patterns.
 

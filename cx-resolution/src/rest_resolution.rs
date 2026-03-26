@@ -49,6 +49,15 @@ pub struct RestMatch {
     pub confidence: f32,
 }
 
+/// Paths that are too generic to match meaningfully across repos.
+const TRIVIAL_PATHS: &[&str] = &[
+    "/", "/health", "/healthz", "/ready", "/readyz", "/livez",
+    "/metrics", "/status", "/ping", "/version", "/favicon.ico",
+];
+
+/// Minimum path segment count for prefix matching (avoid "/" matching everything).
+const MIN_PREFIX_SEGMENTS: usize = 2;
+
 /// Normalize a URL path for matching: lowercase, strip trailing slash, collapse double slashes.
 fn normalize_path(path: &str) -> String {
     let p = path.trim().to_lowercase();
@@ -58,6 +67,11 @@ fn normalize_path(path: &str) -> String {
     } else {
         p.replace("//", "/")
     }
+}
+
+/// Count meaningful path segments (split by '/', skip empty).
+fn path_segment_count(path: &str) -> usize {
+    path.split('/').filter(|s| !s.is_empty()).count()
 }
 
 /// Check if a client path matches a server route path.
@@ -70,9 +84,13 @@ fn paths_match(client_path: &str, server_path: &str) -> (bool, bool) {
         return (true, true);
     }
 
-    // Prefix match: client "/inference" matches server "/inference/{id}"
-    // or server "/inference" matches client "/inference/stream"
-    if c.starts_with(&s) || s.starts_with(&c) {
+    // Prefix match requires both paths to have meaningful depth
+    // to avoid "/" or "/api" matching everything
+    let c_segs = path_segment_count(&c);
+    let s_segs = path_segment_count(&s);
+    let shorter = c_segs.min(s_segs);
+
+    if shorter >= MIN_PREFIX_SEGMENTS && (c.starts_with(&s) || s.starts_with(&c)) {
         return (true, false);
     }
 
@@ -87,11 +105,15 @@ pub fn match_rest(
     let mut matches = Vec::new();
 
     // Build server index: normalized_path → Vec<(repo, route)>
+    // Skip trivial paths that would create false matches
     let mut server_index: FxHashMap<String, Vec<(&str, &HttpServerRoute)>> =
         FxHashMap::default();
     for (repo, routes) in server_routes {
         for route in routes {
             let key = normalize_path(&route.path);
+            if TRIVIAL_PATHS.contains(&key.as_str()) {
+                continue;
+            }
             server_index
                 .entry(key)
                 .or_default()
@@ -102,6 +124,10 @@ pub fn match_rest(
     for (client_repo, calls) in client_calls {
         for call in calls {
             let client_norm = normalize_path(&call.path);
+            // Skip trivial client paths
+            if TRIVIAL_PATHS.contains(&client_norm.as_str()) {
+                continue;
+            }
 
             // Try exact path match first
             if let Some(servers) = server_index.get(&client_norm) {
@@ -208,7 +234,7 @@ mod tests {
         let clients = vec![(
             "repo-a".into(),
             vec![HttpClientCall {
-                path: "/health".into(),
+                path: "/api/users".into(),
                 method: "GET".into(),
                 base_url_env_var: None,
                 file: "client.go".into(),
@@ -218,7 +244,7 @@ mod tests {
         let servers = vec![(
             "repo-b".into(),
             vec![HttpServerRoute {
-                path: "/health".into(),
+                path: "/api/users".into(),
                 method: "POST".into(),
                 framework: "express".into(),
                 file: "server.ts".into(),
@@ -247,7 +273,7 @@ mod tests {
         let servers = vec![(
             "repo-b".into(),
             vec![HttpServerRoute {
-                path: "/v1".into(),
+                path: "/v1/chat".into(),
                 method: "POST".into(),
                 framework: "fastapi".into(),
                 file: "api.py".into(),
@@ -259,6 +285,60 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(result[0].confidence >= 0.5);
         assert!(result[0].confidence < 0.85);
+    }
+
+    #[test]
+    fn trivial_paths_not_matched() {
+        let clients = vec![(
+            "repo-a".into(),
+            vec![HttpClientCall {
+                path: "/".into(),
+                method: "GET".into(),
+                base_url_env_var: None,
+                file: "client.go".into(),
+                line: 10,
+            }],
+        )];
+        let servers = vec![(
+            "repo-b".into(),
+            vec![HttpServerRoute {
+                path: "/".into(),
+                method: "GET".into(),
+                framework: "express".into(),
+                file: "server.ts".into(),
+                line: 5,
+            }],
+        )];
+        let result = match_rest(&clients, &servers);
+        assert!(result.is_empty(), "trivial path '/' should not match");
+    }
+
+    #[test]
+    fn short_prefix_not_matched() {
+        // "/v1" (1 segment) should not prefix-match "/v1/chat/completions"
+        let clients = vec![(
+            "repo-a".into(),
+            vec![HttpClientCall {
+                path: "/v1/chat/completions".into(),
+                method: "POST".into(),
+                base_url_env_var: None,
+                file: "llm.go".into(),
+                line: 20,
+            }],
+        )];
+        let servers = vec![(
+            "repo-b".into(),
+            vec![HttpServerRoute {
+                path: "/v1".into(),
+                method: "POST".into(),
+                framework: "fastapi".into(),
+                file: "api.py".into(),
+                line: 8,
+            }],
+        )];
+        let result = match_rest(&clients, &servers);
+        // Single segment "/v1" should not prefix-match
+        assert!(result.is_empty());
     }
 
     #[test]

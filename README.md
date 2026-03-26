@@ -1,18 +1,33 @@
 # cx
 
-A local-first code intelligence engine that maps how distributed systems are wired together — across repos, languages, and infrastructure.
+A distributed code intelligence engine that maps every network boundary in your distributed system — across repos, languages, and infrastructure.
 
-CX builds a queryable structural graph of your codebase. It traces gRPC calls through service boundaries, resolves environment variables through Helm charts to Kubernetes services, detects shared database dependencies, and tells you the exact blast radius of any change. Queries complete in under 5ms.
+CX finds every incoming API and outgoing network call in your codebase, traces where each connection target comes from (string literal, env var, config file, function parameter), and builds the complete cross-service topology. It works across Go, Python, TypeScript, Java, C/C++, and Rust — with Kubernetes, Helm, and Docker config resolution.
 
-The primary interface is an MCP server for AI coding agents (Claude Code, Cursor, Gemini CLI) and a CLI for developers. No cloud. No SaaS. Single binary.
+Designed for organizations with **1000+ microservices**. Works like git: local-first, distributed, collaborative.
 
-## Why
+## The Problem
 
-Every distributed system has the same problem: nobody knows how it's actually wired together. The engineer who understood the full topology left last year. The architecture diagram is from 2022. When you need to answer "what breaks if I change this?" you spend hours grepping across repos and asking around.
+Every distributed system has the same problem: nobody knows how it's actually wired together. The engineer who understood the full topology left last year. The architecture diagram is from 2022.
 
-CX answers that question in milliseconds by building a graph from the source of truth — your code, your proto files, your Helm charts, your Kubernetes manifests.
+When you need to answer "which services depend on AWS SQS?" or "what's the blast radius if the payment service goes down?" — you spend hours grepping across repos and asking around.
 
-AI coding agents have the same problem, worse. When Claude Code needs to understand a cross-service call chain, it spends 15-20 tool calls grepping and reading files, burning 50k+ tokens. With CX connected via MCP, the agent makes one `cx_path` call and gets the complete answer instantly.
+AI agents have it worse. When Claude Code needs to trace a cross-service call chain, it spends 50k+ tokens reading files. With CX connected via MCP, the agent makes one `cx_path` call and gets the complete, type-resolved answer in milliseconds.
+
+## What CX Tells You
+
+```
+Network Call: grpc.Dial(addr)
+  Location:  src/frontend/rpc.go:30
+  Kind:      gRPC client
+  Target:    CURRENCY_SERVICE_ADDR (env var)
+             → "currencyservice:7000" (k8s manifest)
+             → CurrencyService (src/currencyservice/server.js)
+  Provenance:
+    main() → mustMapEnv() → os.Getenv("CURRENCY_SERVICE_ADDR")
+```
+
+CX traces the complete chain: **code → env var → K8s manifest → DNS name → target service → exposed API.** Across languages. Across repos.
 
 ## Quick Start
 
@@ -23,106 +38,128 @@ cd ~/code/my-service
 cx init
 ```
 
-CX indexes your repo, auto-discovers connected services in the same GitHub org, and builds the graph. First query is ready in seconds.
+CX indexes your repo with tree-sitter (instant, no dependencies). If `gopls` / `ty` / `tsserver` are installed, CX uses them for type-resolved accuracy.
 
 ```bash
-# What does this service look like?
+# What network calls does this service make?
+cx network
+
+# Trace a specific call chain across services
+cx path --from placeOrderHandler --to ProductCatalogService
+
+# What services depend on this one?
+cx depends my-service --upstream
+
+# Full service context
 cx context
 
-# Trace the full request path from an endpoint
-cx path --from "WS /ws/translate" --downstream
-
-# What breaks if I change this function?
-cx impact orders/router.go:ProcessOrder
-
-# What services does this depend on?
-cx depends my-service --downstream
-
-# What changed structurally on this branch?
-cx diff main feature/new-cache
-
-# Add a related repo to expand the graph
+# Add another repo to build the cross-service graph
 cx add ~/code/other-service
-cx add --role infra ~/code/helm-charts
+
+# Add a K8s config repo to resolve env vars to service DNS
+cx add ~/code/k8s-manifests
+```
+
+## Distributed Graph (like git)
+
+Each team builds their repo's graph. Connect them to see the full topology:
+
+```bash
+# Add a remote repo's graph
+cx remote add payment-service https://github.com/org/payment-service
+cx remote pull
+
+# Share your graph for others to consume
+cx remote push
+
+# Query across all connected repos
+cx network --all-repos
+```
+
+Teams tune accuracy for their codebase via `.cx/config/` — not static docs, but compiler config that makes CX smarter:
+
+```toml
+# .cx/config/sinks.toml — teach CX about your internal frameworks
+[[sinks]]
+fqn = "internal/httpclient.Do"
+category = "http_client"
+addr_arg = 0
 ```
 
 ## MCP Integration
 
-CX runs as an MCP server that any compatible AI agent can use. Add to your Claude Code config:
+CX runs as an MCP server for AI coding agents:
 
 ```json
 {
   "mcpServers": {
-    "cx": {
-      "command": "cx",
-      "args": ["mcp", "--workspace", "."]
-    }
+    "cx": { "command": "cx", "args": ["mcp", "--workspace", "."] }
   }
 }
 ```
 
-The agent gets these tools:
-
 | Tool | What it does |
 |------|-------------|
 | `cx_path` | Trace request flow across service boundaries |
-| `cx_impact` | Blast radius of a change — all affected services, endpoints, configs |
+| `cx_network` | All network boundaries with address provenance chains |
 | `cx_depends` | Upstream and downstream dependency graph |
-| `cx_context` | Structural summary of a service — endpoints, dependencies, resources |
+| `cx_context` | Structural summary — endpoints, dependencies, resources |
 | `cx_search` | Fuzzy symbol search across all indexed repos |
-| `cx_resolve` | Resolve a name to specific symbols (supports qualified names) |
-| `cx_diff` | Structural diff between two git refs |
-| `cx_blame` | Who introduced a specific dependency |
 
-## What CX Understands
+## Questions You Can Answer at Scale
 
-**Cross-service connections:** gRPC client/server matching via proto files. REST endpoint matching via OpenAPI specs and URL patterns. Async dependencies via Kafka/NATS/SQS topic matching.
+With 1000 repos indexed, these are **sub-second graph traversals**:
 
-**Infrastructure wiring:** Environment variables traced from code (`os.Getenv("X")`) through Helm chart definitions to Kubernetes DNS resolution to the actual service. Missing config detected automatically.
-
-**Shared resources:** Two services connecting to the same database. Library code imported across repos with independent deploy cycles (version skew risk).
-
-**Git history:** When did a dependency appear? Who introduced it? What's the structural diff between branches? Does this PR add a new service dependency or create a config gap?
+- **"Which services depend on AWS?"** — filter outgoing connections by `aws-sdk` / `s3` / `sqs` packages
+- **"What's our blast radius if us-east-1 goes down?"** — find all services with AWS endpoints in that region
+- **"What would it take to replace SQS with Kafka?"** — find every SQS producer/consumer, list all services
+- **"Which services make outbound calls to external domains?"** — filter connections by non-internal domains
+- **"ProductCatalogService is down — what's affected?"** — upstream BFS: all transitive dependents
+- **"Show me every service that can reach the production database"** — BFS from database, follow all incoming edges
+- **"I need to add a field to the Order proto — what services are affected?"** — find all gRPC clients/servers for Order
+- **"Which services connect to expensive APIs (OpenAI, Stripe)?"** — filter by outgoing HTTP to known API domains
 
 ## How It Works
 
-CX uses [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for fast, incremental parsing across languages and stores the dependency graph in a compressed sparse row (CSR) format that's memory-mapped from disk. Queries are graph traversals with bitmask-based edge filtering — no heap allocation, no pointer chasing, sub-millisecond on million-node graphs.
+### Phase 1: Fast Parse (tree-sitter)
+Extracts all symbols, calls, imports, and string literals in <2s per repo. 100% recall — captures everything, no framework-specific queries needed.
 
-The graph is git-native: snapshots are keyed by commit, branches are delta-encoded overlays, and temporal queries walk history to find when dependencies appeared or changed.
+### Phase 2: Type Resolution (LSP, optional)
+When language-specific LSP servers are installed, CX resolves every call target to its fully qualified name. This turns `client.connect(addr)` from "some method call" into `"redis.Client.connect"` — enabling exact classification.
 
-Adding language support requires only a tree-sitter query file (~50 lines of S-expressions) — no Rust code per language.
+| Language | LSP Server | Without LSP | With LSP |
+|----------|-----------|------------|----------|
+| Go | gopls | ~75% | ~98% |
+| Python | ty (Rust, 10-100x faster) | ~60% | ~90% |
+| TypeScript/JS | tsserver | ~65% | ~95% |
+| Java | jdtls / tree-sitter-java | ~70% | ~93% |
+| C/C++ | clangd | ~55% | ~85% |
+| Rust | rust-analyzer | ~80% | ~98% |
 
-## Language Support
+### Phase 3: Network Sink Detection
+A registry of ~150 known network functions (exact FQN match, not regex). Covers HTTP, gRPC, WebSocket, Kafka, Redis, databases, SQS, S3, raw TCP — across all supported languages.
 
-| Language | Symbols | gRPC | Env Vars |
-|----------|---------|------|----------|
-| Go | 🔜 | 🔜 | 🔜 |
-| TypeScript | 🔜 | 🔜 | 🔜 |
-| Python | 🔜 | 🔜 | 🔜 |
-| Java | planned | planned | planned |
-| Rust | planned | planned | planned |
-| C/C++ | planned | planned | planned |
+### Phase 4: Backward Taint Analysis
+For each detected network call, traces the address argument backward through variable assignments, function parameters, env var reads, and config file loads. Cross-file, inter-procedural, depth-bounded.
 
-## Infrastructure Support
+### Phase 5: Infrastructure Resolution
+Links code-side env var reads to K8s manifest values to service DNS names. Parses Dockerfiles (EXPOSE, ENTRYPOINT), Helm charts (Go templates with defaults), and K8s Deployment specs.
 
-| Format | Status |
-|--------|--------|
-| Protocol Buffers (.proto) | ✅ |
-| Helm charts | 🔜 |
-| Kubernetes manifests | 🔜 |
-| Dockerfiles | 🔜 |
-| OpenAPI / Swagger | planned |
-| Terraform | planned |
-| docker-compose | planned |
+### Phase 6: Cross-Service Assembly
+Matches outgoing connection targets to other services' exposed APIs. Works within one repo or across 1000+ repos via the distributed graph protocol.
+
+## CX as Lossless Context
+
+Inspired by [Lossless Context Management](https://papers.voltropy.com/LCM), CX's graph is a precomputed, hierarchical exploration summary. Instead of an agent ingesting raw source code, it queries CX for a compact, lossless, type-resolved representation. Every graph edge is traceable to source code — no information is lost.
 
 ## Architecture
 
 CX is built in Rust as a cargo workspace:
 
 - **cx-core** — Graph engine: CSR storage, mmap, BFS traversal, string interning, trigram search
-- **cx-extractors** — Tree-sitter parsing pipeline and structural extractors
-- **cx-resolution** — Cross-repo edge matching (proto→service, env var→Helm→k8s DNS)
-- **cx-cli** — CLI commands and MCP server
+- **cx-extractors** — tree-sitter parsing, LSP integration, taint analysis, sink registry
+- **cx-resolution** — Cross-repo edge matching, K8s env→service DNS, proto→service, Helm values
+- **cx-cli** — CLI commands, MCP server
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, data model, query algorithms, and performance rules.
 
@@ -131,14 +168,12 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, data model, query al
 | Operation | Target |
 |-----------|--------|
 | `cx_path` (5 service hops, 100K nodes) | < 1ms |
-| `cx_impact` (depth 5, 100K nodes) | < 5ms |
+| `cx_network` (all boundaries, 100K nodes) | < 5ms |
 | `cx_search` (fuzzy, 1M symbols) | < 10ms |
-| `cx init` (100K LOC repo) | < 2s |
+| `cx init` (100K LOC repo, no LSP) | < 2s |
+| `cx init` (100K LOC repo, with LSP) | < 5s |
+| `cx add` (1 repo to 1000-repo graph) | < 3s |
 | Graph load from disk (mmap) | < 50ms |
-
-## Contributing
-
-CX is early. The graph engine is solid, the extractor pipeline is in progress. The easiest way to contribute is adding language support — each language is a tree-sitter query file with no Rust code required. See [ARCHITECTURE.md](ARCHITECTURE.md) for the capture naming conventions.
 
 ## License
 

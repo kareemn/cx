@@ -126,6 +126,159 @@ pub fn scan_go_grpc(
     }
 }
 
+/// Scan a Python file for gRPC patterns using regex-style line scanning.
+/// Detects:
+/// - Server: `add_{Service}Servicer_to_server(impl, server)`
+/// - Client: `{package}.{Service}Stub(channel)` or `{Service}Stub(channel)`
+pub fn scan_python_grpc(source: &[u8], file_path: &str) -> GrpcScanResult {
+    let mut client_stubs = Vec::new();
+    let mut server_registrations = Vec::new();
+
+    let text = match std::str::from_utf8(source) {
+        Ok(t) => t,
+        Err(_) => return GrpcScanResult { client_stubs, server_registrations },
+    };
+
+    for (i, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        let line_num = (i + 1) as u32;
+
+        // Server: add_*Servicer_to_server
+        if let Some(idx) = trimmed.find("add_") {
+            let rest = &trimmed[idx + 4..];
+            if let Some(end) = rest.find("Servicer_to_server") {
+                let svc = &rest[..end];
+                if !svc.is_empty() && svc.chars().next().is_some_and(|c| c.is_uppercase()) {
+                    server_registrations.push(GrpcServerRegistration {
+                        service_name: svc.to_string(),
+                        file: file_path.to_string(),
+                        line: line_num,
+                    });
+                }
+            }
+        }
+
+        // Client: SomeServiceStub(
+        if let Some(idx) = trimmed.find("Stub(") {
+            // Walk backwards to find the service name
+            let before = &trimmed[..idx];
+            let svc_name: String = before
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            // Strip trailing dots/module prefix
+            let svc = svc_name.split('.').next_back().unwrap_or("");
+            if !svc.is_empty()
+                && svc.chars().next().is_some_and(|c| c.is_uppercase())
+                && svc != "Stub"
+            {
+                // Keep full service name (e.g., "ProductCatalogService") to match Go clients
+                client_stubs.push(GrpcClientStub {
+                    service_name: svc.to_string(),
+                    file: file_path.to_string(),
+                    line: line_num,
+                });
+            }
+        }
+    }
+
+    GrpcScanResult { client_stubs, server_registrations }
+}
+
+/// Extract a gRPC service name from a line containing ".service" pattern.
+/// e.g., "shopProto.CurrencyService.service," → "CurrencyService"
+fn extract_js_service_name(line: &str) -> Option<String> {
+    let idx = line.find(".service")?;
+    let before = &line[..idx];
+    let svc: String = before
+        .chars()
+        .rev()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if !svc.is_empty() && svc.chars().next().is_some_and(|c| c.is_uppercase()) {
+        Some(svc)
+    } else {
+        None
+    }
+}
+
+/// Scan a JavaScript/TypeScript file for gRPC patterns using line scanning.
+/// Detects:
+/// - Server: `server.addService(proto.{Service}.service, ...)`
+/// - Client: `new proto.{Service}(address)` or `new {Package}.{Service}Client(address)`
+pub fn scan_js_grpc(source: &[u8], file_path: &str) -> GrpcScanResult {
+    let mut client_stubs = Vec::new();
+    let mut server_registrations = Vec::new();
+
+    let text = match std::str::from_utf8(source) {
+        Ok(t) => t,
+        Err(_) => return GrpcScanResult { client_stubs, server_registrations },
+    };
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut pending_add_service_line: Option<u32> = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let line_num = (i + 1) as u32;
+
+        // Server: server.addService(something.ServiceName.service, ...)
+        // Handle multiline: addService( on one line, Proto.Service.service on the next
+        if trimmed.contains("addService(") || trimmed.contains("addService (") {
+            // Try same-line match first
+            if let Some(svc) = extract_js_service_name(trimmed) {
+                server_registrations.push(GrpcServerRegistration {
+                    service_name: svc,
+                    file: file_path.to_string(),
+                    line: line_num,
+                });
+            } else {
+                // Mark as pending — check the next line
+                pending_add_service_line = Some(line_num);
+            }
+        } else if let Some(add_line) = pending_add_service_line {
+            // Check if this line contains the .service reference
+            if let Some(svc) = extract_js_service_name(trimmed) {
+                server_registrations.push(GrpcServerRegistration {
+                    service_name: svc,
+                    file: file_path.to_string(),
+                    line: add_line,
+                });
+            }
+            pending_add_service_line = None;
+        }
+
+        // Client: new proto.ServiceNameClient( or new ServiceName(
+        if trimmed.contains("Client(") {
+            let before_client = trimmed.split("Client(").next().unwrap_or("");
+            let svc: String = before_client
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            if !svc.is_empty() && svc.chars().next().is_some_and(|c| c.is_uppercase()) {
+                client_stubs.push(GrpcClientStub {
+                    service_name: svc.to_string(),
+                    file: file_path.to_string(),
+                    line: line_num,
+                });
+            }
+        }
+    }
+
+    GrpcScanResult { client_stubs, server_registrations }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
