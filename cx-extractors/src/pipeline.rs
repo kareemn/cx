@@ -804,16 +804,101 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
     let k8s_container_images = keyed_by_repo_name(&repo_names, k8s_images_by_repo);
     let k8s_env_bindings = keyed_by_repo_name(&repo_names, k8s_env_by_repo);
 
-    // Step 8: Run taint analysis on raw extractions to find network calls with provenance
-    let network_calls: Vec<ResolvedNetworkCall> = raw_extractions
-        .into_iter()
-        .flat_map(|(raw, mut file_strings, path_str)| {
-            taint::analyze_raw_file(&raw, &path_str, &mut file_strings)
+    // Step 8: Run taint analysis — per-file direct sinks + inter-procedural propagation
+    let mut network_calls: Vec<ResolvedNetworkCall> = Vec::new();
+    let mut all_summaries: Vec<taint::FunctionFlowSummary> = Vec::new();
+    let mut all_flow_facts: rustc_hash::FxHashMap<u32, Vec<taint::FlowFact>> =
+        rustc_hash::FxHashMap::default();
+    let mut all_const_map: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
+
+    for (raw, file_strings, path_str) in &raw_extractions {
+        // Use STRING_NONE as file_id — we extract direct sinks manually with the real path
+        let file_id = cx_core::graph::nodes::STRING_NONE;
+        let summaries = taint::analyze_file(raw, file_id, file_strings);
+
+        // Build string remap cache for this file's interner → merged interner
+        let mut str_remap: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
+
+        // Collect direct sinks as resolved calls
+        for summary in &summaries {
+            for sink in &summary.direct_sinks {
+                network_calls.push(ResolvedNetworkCall {
+                    net_kind: sink.net_kind,
+                    callee_fqn: sink.callee_name.clone(),
+                    address_source: sink.address_source.clone(),
+                    file: path_str.clone(),
+                    line: sink.line,
+                    confidence: taint::Confidence::Heuristic,
+                });
+            }
+        }
+
+        // Remap summaries to merged string interner
+        for mut summary in summaries {
+            summary.func_name = remap_string(summary.func_name, file_strings, &mut merged_strings, &mut str_remap);
+            summary.file = remap_string(summary.file, file_strings, &mut merged_strings, &mut str_remap);
+            all_summaries.push(summary);
+        }
+
+        // Remap and collect flow facts
+        let file_facts = taint::extract_flow_facts(raw, file_strings);
+        for (func_name, facts) in file_facts {
+            let remapped_fn = remap_string(func_name, file_strings, &mut merged_strings, &mut str_remap);
+            let remapped_facts: Vec<taint::FlowFact> = facts
+                .into_iter()
+                .map(|mut f| {
+                    f.target_var = remap_string(f.target_var, file_strings, &mut merged_strings, &mut str_remap);
+                    f.source = remap_flow_source(f.source, file_strings, &mut merged_strings, &mut str_remap);
+                    f
+                })
+                .collect();
+            all_flow_facts.entry(remapped_fn).or_default().extend(remapped_facts);
+        }
+
+        // Remap and collect constant map
+        for c in &raw.constants {
+            let name = remap_string(c.name, file_strings, &mut merged_strings, &mut str_remap);
+            let value = remap_string(c.value, file_strings, &mut merged_strings, &mut str_remap);
+            all_const_map.insert(name, value);
+        }
+    }
+
+    // Build call graph from merged Calls edges: (caller_name, callee_name) as StringIds
+    let call_graph: Vec<(u32, u32)> = all_edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Calls)
+        .filter_map(|e| {
+            let src = all_nodes.get(e.source as usize)?;
+            let tgt = all_nodes.get(e.target as usize)?;
+            Some((src.name, tgt.name))
         })
         .collect();
 
+    // Run inter-procedural propagation
+    let propagated = taint::propagate(
+        &all_summaries,
+        &call_graph,
+        &all_flow_facts,
+        &merged_strings,
+        &all_const_map,
+        10,
+    );
+
+    // Merge propagated results, deduplicating by (file, line)
+    let mut seen: rustc_hash::FxHashSet<(String, u32)> = network_calls
+        .iter()
+        .map(|c| (c.file.clone(), c.line))
+        .collect();
+    for call in propagated {
+        if seen.insert((call.file.clone(), call.line)) {
+            network_calls.push(call);
+        }
+    }
+
     if !network_calls.is_empty() {
-        eprintln!("Taint analysis: {} network call(s) with provenance", network_calls.len());
+        eprintln!("Taint analysis: {} network call(s) with provenance ({} inter-procedural)",
+            network_calls.len(),
+            network_calls.len().saturating_sub(all_summaries.iter().map(|s| s.direct_sinks.len()).sum::<usize>()));
     }
 
     // Step 9: Parse manifest files for dependency information
@@ -1329,6 +1414,44 @@ fn remap_string(
     let new_id = new_interner.intern(s);
     cache.insert(old_id, new_id);
     new_id
+}
+
+/// Remap StringIds inside a FlowSource from a per-file interner to the merged interner.
+fn remap_flow_source(
+    source: taint::FlowSource,
+    old_interner: &StringInterner,
+    new_interner: &mut StringInterner,
+    cache: &mut rustc_hash::FxHashMap<u32, u32>,
+) -> taint::FlowSource {
+    use taint::FlowSource;
+    match source {
+        FlowSource::StringLiteral(id) => FlowSource::StringLiteral(remap_string(id, old_interner, new_interner, cache)),
+        FlowSource::EnvVar(id) => FlowSource::EnvVar(remap_string(id, old_interner, new_interner, cache)),
+        FlowSource::LocalVar(id) => FlowSource::LocalVar(remap_string(id, old_interner, new_interner, cache)),
+        FlowSource::Parameter { func_name, param_index } => FlowSource::Parameter {
+            func_name: remap_string(func_name, old_interner, new_interner, cache),
+            param_index,
+        },
+        FlowSource::CallReturn { callee_name, receiver, args } => FlowSource::CallReturn {
+            callee_name: remap_string(callee_name, old_interner, new_interner, cache),
+            receiver: remap_string(receiver, old_interner, new_interner, cache),
+            args: args.into_iter().map(|a| remap_string(a, old_interner, new_interner, cache)).collect(),
+        },
+        FlowSource::FieldAccess { receiver, field } => FlowSource::FieldAccess {
+            receiver: remap_string(receiver, old_interner, new_interner, cache),
+            field: remap_string(field, old_interner, new_interner, cache),
+        },
+        FlowSource::FieldStore { receiver, field, value } => FlowSource::FieldStore {
+            receiver: remap_string(receiver, old_interner, new_interner, cache),
+            field: remap_string(field, old_interner, new_interner, cache),
+            value: remap_string(value, old_interner, new_interner, cache),
+        },
+        FlowSource::StringConcat { parts } => FlowSource::StringConcat {
+            parts: parts.into_iter().map(|p| remap_flow_source(p, old_interner, new_interner, cache)).collect(),
+        },
+        FlowSource::PointerAlias(id) => FlowSource::PointerAlias(remap_string(id, old_interner, new_interner, cache)),
+        FlowSource::Unknown => FlowSource::Unknown,
+    }
 }
 
 /// Collect all files in a directory, respecting .gitignore.

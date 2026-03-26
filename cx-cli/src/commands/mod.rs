@@ -7,4 +7,5 @@ pub mod inspect;
 pub mod network;
 pub mod path;
 pub mod refresh;
+pub mod remote;
 pub mod search;

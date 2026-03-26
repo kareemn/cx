@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 pub struct CxConfig {
     #[serde(default)]
     pub repos: Vec<RepoEntry>,
+    #[serde(default)]
+    pub remotes: Vec<RemoteEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -14,6 +16,14 @@ pub struct RepoEntry {
     /// Git HEAD hash at last index time, for change detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_hash: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RemoteEntry {
+    pub name: String,
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pulled: Option<String>,
 }
 
 fn config_path(root: &Path) -> PathBuf {
@@ -77,6 +87,19 @@ pub fn git_head_hash(repo_path: &Path) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Add a remote to the config if not already present by name. Returns true if added.
+pub fn add_remote(config: &mut CxConfig, name: String, path: PathBuf) -> bool {
+    if config.remotes.iter().any(|r| r.name == name) {
+        return false;
+    }
+    config.remotes.push(RemoteEntry {
+        name,
+        path,
+        last_pulled: None,
+    });
+    true
 }
 
 /// Derive a short repo name from a path (last component).

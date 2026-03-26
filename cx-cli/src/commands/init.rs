@@ -112,7 +112,16 @@ pub fn load_graph(root: &Path) -> Result<cx_core::graph::csr::CsrGraph> {
         return cx_core::store::mmap::load_graph(&graph_path).context("failed to load graph");
     }
 
-    // Try merging per-repo graphs
+    // Try layered loading (per-repo graphs + overlay)
+    load_graph_layered(root)
+}
+
+/// Load graph by merging per-repo graphs with overlay cross-repo edges.
+///
+/// This is the layered loading path: each per-repo graph is loaded independently,
+/// then merged with cross-repo edges from the overlay. This avoids needing a
+/// pre-built base.cxgraph and always reflects the latest overlay state.
+pub fn load_graph_layered(root: &Path) -> Result<cx_core::graph::csr::CsrGraph> {
     let repos_dir = root.join(".cx").join("graph").join("repos");
     if repos_dir.exists() {
         return crate::indexing::merge_per_repo_graphs(root);

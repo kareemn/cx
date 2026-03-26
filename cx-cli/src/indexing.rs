@@ -273,7 +273,7 @@ pub fn index_single_repo(repo_path: &std::path::Path, repo_id: u16) -> Result<In
 }
 
 /// Merge all per-repo .cxgraph files from .cx/graph/repos/ into a unified graph.
-/// Also applies cross-repo resolution and writes base.cxgraph + overlay.
+/// Loads the overlay graph and injects cross-repo edges into the merge.
 pub fn merge_per_repo_graphs(root: &std::path::Path) -> Result<cx_core::graph::csr::CsrGraph> {
     let repos_dir = root.join(".cx").join("graph").join("repos");
     if !repos_dir.exists() {
@@ -301,7 +301,17 @@ pub fn merge_per_repo_graphs(root: &std::path::Path) -> Result<cx_core::graph::c
         graphs.push(graph);
     }
 
-    let merged = cx_core::graph::csr::CsrGraph::merge(&graphs, vec![]);
+    // Load overlay and resolve cross-repo edges to EdgeInputs
+    let overlay = crate::overlay::OverlayGraph::load(root).unwrap_or_default();
+    let extra_edges = overlay.to_edge_inputs(&graphs);
+    let overlay_count = extra_edges.len();
+
+    let merged = cx_core::graph::csr::CsrGraph::merge(&graphs, extra_edges);
+
+    if overlay_count > 0 {
+        eprintln!("  Applied {} overlay edge(s)", overlay_count);
+    }
+
     Ok(merged)
 }
 

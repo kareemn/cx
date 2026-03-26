@@ -20,7 +20,7 @@ pub fn run(root: &Path) -> Result<()> {
     loop {
         match read_message(&mut reader) {
             Ok(body) => {
-                let response = handle_request(&body, &graph, &mut finder);
+                let response = handle_request(&body, &graph, &mut finder, root);
                 write_message(&mut writer, &response)?;
                 writer.flush()?;
             }
@@ -81,7 +81,7 @@ fn write_message(writer: &mut impl Write, body: &str) -> std::io::Result<()> {
 }
 
 /// Handle a JSON-RPC request and return a JSON-RPC response string.
-fn handle_request(body: &str, graph: &CsrGraph, finder: &mut PathFinder) -> String {
+fn handle_request(body: &str, graph: &CsrGraph, finder: &mut PathFinder, root: &Path) -> String {
     let req: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => return json_rpc_error(serde_json::Value::Null, -32700, "Parse error"),
@@ -122,7 +122,7 @@ fn handle_request(body: &str, graph: &CsrGraph, finder: &mut PathFinder) -> Stri
                 .cloned()
                 .unwrap_or_default();
 
-            match dispatch_tool(tool_name, &arguments, graph, finder) {
+            match dispatch_tool(tool_name, &arguments, graph, finder, root) {
                 Ok(content) => json_rpc_result(
                     id,
                     serde_json::json!({
@@ -148,6 +148,7 @@ fn dispatch_tool(
     args: &serde_json::Value,
     graph: &CsrGraph,
     finder: &mut PathFinder,
+    root: &Path,
 ) -> std::result::Result<String, String> {
     match name {
         "cx_path" => {
@@ -275,8 +276,9 @@ fn dispatch_tool(
             let direction = args.get("direction").and_then(|v| v.as_str());
             let service = args.get("service").and_then(|v| v.as_str());
 
+            let taint_calls = crate::commands::network::load_network_json(root);
             let report = crate::commands::network::build_network_report(
-                graph, &[], kind, direction, service,
+                graph, &taint_calls, kind, direction, service,
             );
             serde_json::to_string(&report).map_err(|e| e.to_string())
         }
@@ -386,7 +388,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn setup_mcp() -> (tempfile::TempDir, CsrGraph) {
+    fn setup_mcp_root() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("main.go"),
@@ -394,17 +396,17 @@ mod tests {
         )
         .unwrap();
         crate::commands::init::run(dir.path()).unwrap();
-        let graph = crate::commands::init::load_graph(dir.path()).unwrap();
-        (dir, graph)
+        dir
     }
 
     #[test]
     fn mcp_server_tool_listing() {
-        let (_dir, graph) = setup_mcp();
+        let dir = setup_mcp_root();
+        let graph = crate::commands::init::load_graph(dir.path()).unwrap();
         let mut finder = PathFinder::new(graph.node_count());
 
         let req = r#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
-        let resp = handle_request(req, &graph, &mut finder);
+        let resp = handle_request(req, &graph, &mut finder, dir.path());
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
 
         let tools = v["result"]["tools"].as_array().unwrap();
@@ -420,11 +422,12 @@ mod tests {
 
     #[test]
     fn mcp_cx_path_call() {
-        let (_dir, graph) = setup_mcp();
+        let dir = setup_mcp_root();
+        let graph = crate::commands::init::load_graph(dir.path()).unwrap();
         let mut finder = PathFinder::new(graph.node_count());
 
         let req = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"cx_path","arguments":{"from":"main"}},"id":2}"#;
-        let resp = handle_request(req, &graph, &mut finder);
+        let resp = handle_request(req, &graph, &mut finder, dir.path());
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
 
         assert!(v.get("error").is_none(), "should not have error: {}", resp);
@@ -436,11 +439,12 @@ mod tests {
 
     #[test]
     fn mcp_cx_context_call() {
-        let (_dir, graph) = setup_mcp();
+        let dir = setup_mcp_root();
+        let graph = crate::commands::init::load_graph(dir.path()).unwrap();
         let mut finder = PathFinder::new(graph.node_count());
 
         let req = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"cx_context","arguments":{}},"id":3}"#;
-        let resp = handle_request(req, &graph, &mut finder);
+        let resp = handle_request(req, &graph, &mut finder, dir.path());
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
 
         assert!(v.get("error").is_none(), "should not error: {}", resp);
@@ -469,21 +473,23 @@ mod tests {
 
     #[test]
     fn mcp_invalid_json() {
-        let (_dir, graph) = setup_mcp();
+        let dir = setup_mcp_root();
+        let graph = crate::commands::init::load_graph(dir.path()).unwrap();
         let mut finder = PathFinder::new(graph.node_count());
 
-        let resp = handle_request("not json at all{{{", &graph, &mut finder);
+        let resp = handle_request("not json at all{{{", &graph, &mut finder, dir.path());
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["error"]["code"], -32700);
     }
 
     #[test]
     fn mcp_unknown_tool() {
-        let (_dir, graph) = setup_mcp();
+        let dir = setup_mcp_root();
+        let graph = crate::commands::init::load_graph(dir.path()).unwrap();
         let mut finder = PathFinder::new(graph.node_count());
 
         let req = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}},"id":5}"#;
-        let resp = handle_request(req, &graph, &mut finder);
+        let resp = handle_request(req, &graph, &mut finder, dir.path());
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         // Unknown tool returns an error in the content
         assert!(v.get("error").is_some() || {
@@ -494,15 +500,16 @@ mod tests {
 
     #[test]
     fn mcp_query_after_error() {
-        let (_dir, graph) = setup_mcp();
+        let dir = setup_mcp_root();
+        let graph = crate::commands::init::load_graph(dir.path()).unwrap();
         let mut finder = PathFinder::new(graph.node_count());
 
         // First: invalid request
-        let _ = handle_request("invalid json", &graph, &mut finder);
+        let _ = handle_request("invalid json", &graph, &mut finder, dir.path());
 
         // Second: valid request — should still work
         let req = r#"{"jsonrpc":"2.0","method":"tools/list","id":6}"#;
-        let resp = handle_request(req, &graph, &mut finder);
+        let resp = handle_request(req, &graph, &mut finder, dir.path());
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert!(v["result"]["tools"].is_array(), "should return tools after error");
     }

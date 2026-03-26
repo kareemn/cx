@@ -3,6 +3,7 @@ mod config;
 mod graph_index;
 mod indexing;
 mod mcp;
+mod overlay;
 
 use clap::{Parser, Subcommand};
 
@@ -83,8 +84,34 @@ enum Commands {
     },
     /// Re-index repos that have changed since last index
     Refresh,
+    /// Manage remote graph sources for cross-team queries
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
     /// Start MCP server (JSON-RPC over stdio)
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum RemoteAction {
+    /// Add a remote graph source
+    Add {
+        /// Name for this remote
+        name: String,
+        /// Local path to the remote cx workspace
+        path: String,
+    },
+    /// Pull graphs from configured remotes
+    Pull {
+        /// Pull only from this specific remote
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Ensure local graph is ready for sharing
+    Push,
+    /// List all configured remotes
+    List,
 }
 
 fn main() {
@@ -120,6 +147,16 @@ fn main() {
             ref service,
         } => commands::network::run(&root, json, kind.as_deref(), direction.as_deref(), service.as_deref()),
         Commands::Refresh => commands::refresh::run(&root),
+        Commands::Remote { action } => match action {
+            RemoteAction::Add { ref name, ref path } => {
+                commands::remote::run_add(&root, name, path)
+            }
+            RemoteAction::Pull { ref name } => {
+                commands::remote::run_pull(&root, name.as_deref())
+            }
+            RemoteAction::Push => commands::remote::run_push(&root),
+            RemoteAction::List => commands::remote::run_list(&root),
+        },
         Commands::Mcp => mcp::run(&root),
     };
 

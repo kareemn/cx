@@ -86,7 +86,18 @@ pub fn run(root: &Path) -> Result<()> {
     // Save updated index
     index.save(root)?;
 
-    // Merge all per-repo graphs into base.cxgraph
+    // Rebuild overlay: re-resolve cross-repo edges for all repos against updated index
+    let mut overlay = crate::overlay::OverlayGraph::load(root).unwrap_or_default();
+    for (repo_idx, _entry) in config.repos.iter().enumerate() {
+        overlay.remove_repo(repo_idx as u16);
+        overlay.resolve_repo_against_index(repo_idx as u16, &index);
+    }
+    overlay.save(root)?;
+    if !overlay.edges.is_empty() {
+        eprintln!("  Overlay: {} cross-repo edge(s)", overlay.edges.len());
+    }
+
+    // Merge all per-repo graphs + overlay into base.cxgraph
     eprintln!("Merging {} repo graphs...", config.repos.len());
     let merged = crate::indexing::merge_per_repo_graphs(root)?;
     let graph_path = root.join(".cx").join("graph").join("base.cxgraph");

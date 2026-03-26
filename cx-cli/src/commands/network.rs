@@ -26,7 +26,7 @@ pub fn run(root: &Path, json: bool, kind: Option<&str>, direction: Option<&str>,
 
 /// Load ResolvedNetworkCall data from .cx/graph/network.json.
 /// Returns empty vec if file doesn't exist or can't be parsed.
-fn load_network_json(root: &Path) -> Vec<ResolvedNetworkCall> {
+pub fn load_network_json(root: &Path) -> Vec<ResolvedNetworkCall> {
     let path = root.join(".cx").join("graph").join("network.json");
     let Ok(content) = std::fs::read_to_string(&path) else {
         return Vec::new();
