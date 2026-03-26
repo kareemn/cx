@@ -42,11 +42,14 @@ enum Commands {
         #[arg(long, default_value = "20")]
         limit: usize,
     },
-    /// Trace execution path from a symbol
+    /// Trace execution path from/to a symbol
     Path {
-        /// Symbol to trace from
+        /// Symbol to trace from (downstream + upstream)
         #[arg(long)]
-        from: String,
+        from: Option<String>,
+        /// Symbol to trace to (find all paths reaching this symbol)
+        #[arg(long)]
+        to: Option<String>,
         /// Max traversal depth
         #[arg(long, default_value = "20")]
         max_depth: u32,
@@ -84,7 +87,9 @@ fn main() {
         Commands::Search { ref query } => commands::search::run(&root, query),
         Commands::Inspect { ref symbol } => commands::inspect::run(&root, symbol),
         Commands::Edges { ref kind, limit } => commands::edges::run(&root, kind.as_deref(), limit),
-        Commands::Path { ref from, max_depth } => commands::path::run(&root, from, max_depth),
+        Commands::Path { ref from, ref to, max_depth } => {
+            commands::path::run(&root, from.as_deref(), to.as_deref(), max_depth)
+        }
         Commands::Depends {
             ref symbol,
             upstream,

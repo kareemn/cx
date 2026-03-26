@@ -5,38 +5,79 @@ use cx_core::graph::nodes::NodeKind;
 use cx_core::query::path::PathFinder;
 use std::path::Path;
 
-/// Run `cx path --from <symbol> [--downstream|--upstream]`.
-pub fn run(root: &Path, from: &str, max_depth: u32) -> Result<()> {
+/// Run `cx path --from <symbol>` and/or `cx path --to <symbol>`.
+pub fn run(root: &Path, from: Option<&str>, to: Option<&str>, max_depth: u32) -> Result<()> {
     let graph = super::init::load_graph(root)?;
 
-    // Find the starting node by name
-    let start = graph
-        .nodes
-        .iter()
-        .position(|n| graph.strings.get(n.name) == from)
-        .map(|i| i as u32);
+    if from.is_none() && to.is_none() {
+        eprintln!("Provide --from <symbol> and/or --to <symbol>");
+        return Ok(());
+    }
 
-    let start = match start {
+    // --from --to: find shortest path between two symbols
+    if let (Some(from_name), Some(to_name)) = (from, to) {
+        let start = find_node(&graph, from_name);
+        let end = find_node(&graph, to_name);
+        match (start, end) {
+            (Some(s), Some(e)) => {
+                let mut finder = PathFinder::new(graph.node_count());
+                let result = finder.find_path(&graph, s, e, ALL_EDGES, max_depth);
+                if result.found {
+                    println!("Path from {} to {}:", from_name, to_name);
+                    print_path(&graph, 1, &result.hops);
+                } else {
+                    println!("No path found from {} to {}", from_name, to_name);
+                }
+            }
+            (None, _) => eprintln!("Symbol not found: {}", from_name),
+            (_, None) => eprintln!("Symbol not found: {}", to_name),
+        }
+        return Ok(());
+    }
+
+    // --to only: find all paths leading TO a symbol (upstream)
+    if let Some(to_name) = to {
+        let target = match find_node(&graph, to_name) {
+            Some(t) => t,
+            None => {
+                eprintln!("Symbol not found: {}", to_name);
+                return Ok(());
+            }
+        };
+        let upstream = find_upstream_paths(&graph, target, max_depth);
+        if upstream.is_empty() {
+            println!("No paths found to {}", to_name);
+        } else {
+            println!("Paths to {}:", to_name);
+            for (i, path) in upstream.iter().enumerate() {
+                if i > 0 {
+                    println!();
+                }
+                print_upstream_path(&graph, i + 1, path);
+            }
+        }
+        return Ok(());
+    }
+
+    // --from only: downstream + upstream from a symbol
+    let from_name = from.unwrap();
+    let start = match find_node(&graph, from_name) {
         Some(s) => s,
         None => {
-            eprintln!("Symbol not found: {}", from);
+            eprintln!("Symbol not found: {}", from_name);
             return Ok(());
         }
     };
 
-    // Downstream paths (forward edges)
     let mut finder = PathFinder::new(graph.node_count());
     let downstream = finder.find_all_downstream(&graph, start, ALL_EDGES, max_depth);
-
-    // Upstream paths (reverse edges) — especially useful for Endpoint/Resource nodes
-    // that have no outgoing edges but are targets of Exposes/Connects/Configures
     let upstream = find_upstream_paths(&graph, start, max_depth);
 
     let has_downstream = !downstream.is_empty();
     let has_upstream = !upstream.is_empty();
 
     if !has_downstream && !has_upstream {
-        println!("No paths found from {}", from);
+        println!("No paths found from {}", from_name);
         return Ok(());
     }
 
@@ -64,6 +105,14 @@ pub fn run(root: &Path, from: &str, max_depth: u32) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn find_node(graph: &CsrGraph, name: &str) -> Option<u32> {
+    graph
+        .nodes
+        .iter()
+        .position(|n| graph.strings.get(n.name) == name)
+        .map(|i| i as u32)
 }
 
 fn print_path(graph: &CsrGraph, idx: usize, hops: &[cx_core::query::path::Hop]) {
@@ -214,7 +263,7 @@ mod tests {
         super::super::init::run(dir.path()).unwrap();
 
         // Just verify it doesn't panic
-        let result = run(dir.path(), "a", 10);
+        let result = run(dir.path(), Some("a"), None, 10);
         assert!(result.is_ok());
     }
 
@@ -224,7 +273,21 @@ mod tests {
         fs::write(dir.path().join("main.go"), "package main\nfunc main() {}\n").unwrap();
         super::super::init::run(dir.path()).unwrap();
 
-        let result = run(dir.path(), "nonexistent", 10);
-        assert!(result.is_ok()); // prints message, doesn't error
+        let result = run(dir.path(), Some("nonexistent"), None, 10);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn path_to_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.go"),
+            "package main\n\nfunc a() { b() }\nfunc b() { c() }\nfunc c() {}\n",
+        )
+        .unwrap();
+        super::super::init::run(dir.path()).unwrap();
+
+        let result = run(dir.path(), None, Some("c"), 10);
+        assert!(result.is_ok());
     }
 }
