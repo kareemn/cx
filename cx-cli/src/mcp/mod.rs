@@ -276,7 +276,7 @@ fn dispatch_tool(
             let service = args.get("service").and_then(|v| v.as_str());
 
             let report = crate::commands::network::build_network_report(
-                graph, kind, direction, service,
+                graph, &[], kind, direction, service,
             );
             serde_json::to_string(&report).map_err(|e| e.to_string())
         }

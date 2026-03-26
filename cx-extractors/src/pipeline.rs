@@ -1,6 +1,9 @@
 use crate::grammars::{self, Language};
 use crate::grpc::{self, GrpcClientStub, GrpcScanResult, GrpcServerRegistration};
+use crate::manifest::{self, ManifestInfo};
 use crate::proto::{self, ProtoService};
+use crate::raw_extract::{RawExtractor, RawFileExtraction, RawLang};
+use crate::taint::{self, ResolvedNetworkCall};
 use crate::universal::{ExtractionResult, ParsedFile, UnresolvedCall};
 use cx_core::graph::csr::{CsrGraph, EdgeInput};
 use cx_core::graph::edges::EdgeKind;
@@ -17,6 +20,8 @@ pub struct IndexResult {
     pub node_count: u32,
     pub edge_count: u32,
     pub errors: Vec<String>,
+    /// Resolved network calls with full provenance chains from taint analysis.
+    pub network_calls: Vec<ResolvedNetworkCall>,
 }
 
 /// Intermediate result after extraction and merging, before CSR construction.
@@ -50,6 +55,23 @@ pub struct MergedResult {
     pub ws_servers: Vec<(String, Vec<WsServerEndpoint>)>,
     /// WebSocket client connections: (repo_name, connections)
     pub ws_clients: Vec<(String, Vec<WsClientConnection>)>,
+    /// Resolved network calls from taint analysis with provenance chains.
+    pub network_calls: Vec<ResolvedNetworkCall>,
+    /// K8s env var bindings from Deployment/StatefulSet/DaemonSet manifests.
+    pub k8s_env_bindings: Vec<(String, Vec<K8sEnvBinding>)>,
+    /// Parsed dependency manifests: (file_path, manifest).
+    pub manifests: Vec<(String, ManifestInfo)>,
+}
+
+/// An env var binding from a K8s Deployment/StatefulSet/DaemonSet manifest.
+/// Richer than HelmEnvDef: includes the deployment name for provenance.
+#[derive(Debug, Clone)]
+pub struct K8sEnvBinding {
+    pub var_name: String,
+    pub value: String,
+    pub file: String,
+    pub line: u32,
+    pub deployment_name: String,
 }
 
 /// An HTTP server route, for passing to the resolution engine.
@@ -240,6 +262,7 @@ pub fn index_repos(repos: &[(PathBuf, u16)]) -> crate::Result<IndexResult> {
 pub fn build_index(merged: MergedResult) -> IndexResult {
     let node_count = merged.nodes.len() as u32;
     let edge_count = merged.edges.len() as u32;
+    let network_calls = merged.network_calls.clone();
     let graph = CsrGraph::build(merged.nodes, merged.edges, merged.strings);
     IndexResult {
         graph,
@@ -247,6 +270,7 @@ pub fn build_index(merged: MergedResult) -> IndexResult {
         node_count,
         edge_count,
         errors: merged.errors,
+        network_calls,
     }
 }
 
@@ -259,12 +283,27 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
     let mut all_repo_files: Vec<RepoFile> = Vec::new();
     let mut proto_files: Vec<RepoFile> = Vec::new();
     let mut infra_files: Vec<RepoFile> = Vec::new();
+    let mut manifest_files: Vec<RepoFile> = Vec::new();
 
     for (root, repo_id) in repos {
         let files = collect_files(root)?;
         for path in files {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            // Detect manifest files for dependency parsing
+            if file_name == "go.mod"
+                || file_name == "package.json"
+                || file_name == "requirements.txt"
+                || file_name == "pyproject.toml"
+            {
+                manifest_files.push(RepoFile {
+                    path: path.clone(),
+                    root: root.clone(),
+                    repo_id: *repo_id,
+                });
+            }
+
             if ext == "proto" {
                 proto_files.push(RepoFile {
                     path,
@@ -318,6 +357,9 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
             k8s_container_images: vec![],
             ws_servers: vec![],
             ws_clients: vec![],
+            network_calls: vec![],
+            k8s_env_bindings: vec![],
+            manifests: vec![],
         });
     }
 
@@ -337,7 +379,8 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
     let id_counter = AtomicU32::new(0);
 
     // Step 2-4: Parse and extract in parallel, also scanning for gRPC patterns
-    let per_file_results: Vec<(ExtractionResult, StringInterner, Vec<String>, GrpcScanResult)> =
+    type PerFileResult = (ExtractionResult, StringInterner, Vec<String>, GrpcScanResult, Option<RawFileExtraction>, String);
+    let per_file_results: Vec<PerFileResult> =
         all_repo_files
             .par_iter()
             .filter_map(|rf| {
@@ -352,13 +395,14 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
                     client_stubs: vec![],
                     server_registrations: vec![],
                 };
+                let mut raw_extraction: Option<RawFileExtraction> = None;
 
                 // Read file
                 let source = match std::fs::read(&rf.path) {
                     Ok(s) => s,
                     Err(e) => {
                         errors.push(format!("{}: {}", rf.path.display(), e));
-                        return (result, strings, errors, grpc_result);
+                        return (result, strings, errors, grpc_result, raw_extraction, String::new());
                     }
                 };
 
@@ -367,21 +411,21 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
                 let mut parser = tree_sitter::Parser::new();
                 if parser.set_language(&ts_lang).is_err() {
                     errors.push(format!("{}: failed to set language", rf.path.display()));
-                    return (result, strings, errors, grpc_result);
+                    return (result, strings, errors, grpc_result, raw_extraction, String::new());
                 }
 
                 let tree = match parser.parse(&source, None) {
                     Some(t) => t,
                     None => {
                         errors.push(format!("{}: parse failed", rf.path.display()));
-                        return (result, strings, errors, grpc_result);
+                        return (result, strings, errors, grpc_result, raw_extraction, String::new());
                     }
                 };
 
                 // Create extractor
                 let extractor = match grammars::extractor_for_language(lang) {
                     Some(e) => e,
-                    None => return (result, strings, errors, grpc_result),
+                    None => return (result, strings, errors, grpc_result, raw_extraction, String::new()),
                 };
 
                 // Compute repo-relative path
@@ -422,7 +466,16 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
                     };
                 }
 
-                (result, strings, errors, grpc_result)
+                // Run raw extraction for taint analysis (Phase 1)
+                let raw_lang = RawLang::from_language(lang);
+                if let Ok(raw_extractor) = RawExtractor::new(lang) {
+                    raw_extraction = Some(raw_extractor.extract(&file.tree, &source, &mut strings));
+                    // Tag RawLang onto extraction for downstream use
+                    let _ = raw_lang;
+                }
+
+                let path_str_owned = path_str.to_string();
+                (result, strings, errors, grpc_result, raw_extraction, path_str_owned)
             })
             .collect();
 
@@ -461,6 +514,9 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
     let mut all_errors: Vec<String> = Vec::new();
     let mut all_unresolved: Vec<UnresolvedCall> = Vec::new();
 
+    // Collect raw extractions for taint analysis (run after merge when strings are unified)
+    let mut raw_extractions: Vec<(RawFileExtraction, StringInterner, String)> = Vec::new();
+
     // Collect gRPC data per repo
     let mut grpc_clients_by_repo: rustc_hash::FxHashMap<u16, Vec<GrpcClientStub>> =
         rustc_hash::FxHashMap::default();
@@ -477,7 +533,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
         })
         .collect();
 
-    for (i, (result, file_strings, errors, grpc_scan)) in per_file_results.into_iter().enumerate()
+    for (i, (result, file_strings, errors, grpc_scan, raw_ext, path_str)) in per_file_results.into_iter().enumerate()
     {
         all_errors.extend(errors);
 
@@ -551,6 +607,11 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
                     target_name: new_target_name,
                 });
             }
+        }
+
+        // Stash raw extraction for taint analysis (with its own string interner)
+        if let Some(raw) = raw_ext {
+            raw_extractions.push((raw, file_strings, path_str));
         }
     }
 
@@ -704,7 +765,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
         scan_nodes_for_resolution(&all_nodes, &all_edges, &merged_strings);
 
     // Step 7: Parse infrastructure files (Dockerfiles, Helm/k8s YAML)
-    let (docker_by_repo, k8s_images_by_repo, helm_env_by_repo) =
+    let (docker_by_repo, k8s_images_by_repo, helm_env_by_repo, k8s_env_by_repo) =
         parse_infra_files(&infra_files);
 
     // Build gRPC/proto output data
@@ -741,6 +802,38 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
     let helm_env_defs = keyed_by_repo_name(&repo_names, helm_env_by_repo);
     let docker_images = keyed_by_repo_name(&repo_names, docker_by_repo);
     let k8s_container_images = keyed_by_repo_name(&repo_names, k8s_images_by_repo);
+    let k8s_env_bindings = keyed_by_repo_name(&repo_names, k8s_env_by_repo);
+
+    // Step 8: Run taint analysis on raw extractions to find network calls with provenance
+    let network_calls: Vec<ResolvedNetworkCall> = raw_extractions
+        .into_iter()
+        .flat_map(|(raw, mut file_strings, path_str)| {
+            taint::analyze_raw_file(&raw, &path_str, &mut file_strings)
+        })
+        .collect();
+
+    if !network_calls.is_empty() {
+        eprintln!("Taint analysis: {} network call(s) with provenance", network_calls.len());
+    }
+
+    // Step 9: Parse manifest files for dependency information
+    let manifests: Vec<(String, ManifestInfo)> = manifest_files
+        .iter()
+        .filter_map(|rf| {
+            let content = std::fs::read_to_string(&rf.path).ok()?;
+            let file_name = rf.path.file_name()?.to_str()?;
+            let rel_path = rf.path.strip_prefix(&rf.root).unwrap_or(&rf.path)
+                .to_string_lossy().to_string();
+            let info = match file_name {
+                "go.mod" => manifest::parse_go_mod(&content),
+                "package.json" => manifest::parse_package_json(&content),
+                "requirements.txt" => manifest::parse_requirements_txt(&content),
+                "pyproject.toml" => manifest::parse_pyproject_toml(&content),
+                _ => return None,
+            };
+            Some((rel_path, info))
+        })
+        .collect();
 
     Ok(MergedResult {
         nodes: all_nodes,
@@ -759,6 +852,9 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
         k8s_container_images,
         ws_servers,
         ws_clients,
+        network_calls,
+        k8s_env_bindings,
+        manifests,
     })
 }
 
@@ -951,7 +1047,8 @@ fn looks_like_env_var(name: &str) -> bool {
 }
 
 /// Parse infrastructure files (Dockerfiles, Helm/k8s YAML) to extract
-/// Docker image references, env var definitions, and k8s container images.
+/// Docker image references, env var definitions, k8s container images,
+/// and K8s deployment env var bindings.
 #[allow(clippy::type_complexity)]
 fn parse_infra_files(
     infra_files: &[RepoFile],
@@ -959,12 +1056,15 @@ fn parse_infra_files(
     rustc_hash::FxHashMap<u16, Vec<DockerImage>>,
     rustc_hash::FxHashMap<u16, Vec<K8sContainerImage>>,
     rustc_hash::FxHashMap<u16, Vec<HelmEnvDef>>,
+    rustc_hash::FxHashMap<u16, Vec<K8sEnvBinding>>,
 ) {
     let mut docker_images: rustc_hash::FxHashMap<u16, Vec<DockerImage>> =
         rustc_hash::FxHashMap::default();
     let mut k8s_images: rustc_hash::FxHashMap<u16, Vec<K8sContainerImage>> =
         rustc_hash::FxHashMap::default();
     let mut helm_envs: rustc_hash::FxHashMap<u16, Vec<HelmEnvDef>> =
+        rustc_hash::FxHashMap::default();
+    let mut k8s_envs: rustc_hash::FxHashMap<u16, Vec<K8sEnvBinding>> =
         rustc_hash::FxHashMap::default();
 
     for rf in infra_files {
@@ -1039,12 +1139,12 @@ fn parse_infra_files(
                 });
             }
         } else {
-            // YAML: parse env var definitions and container image references
-            parse_yaml_for_resolution(&content, &rel_path, rf.repo_id, &mut k8s_images, &mut helm_envs);
+            // YAML: parse env var definitions, container image references, and K8s env bindings
+            parse_yaml_for_resolution(&content, &rel_path, rf.repo_id, &mut k8s_images, &mut helm_envs, &mut k8s_envs);
         }
     }
 
-    (docker_images, k8s_images, helm_envs)
+    (docker_images, k8s_images, helm_envs, k8s_envs)
 }
 
 /// Resolve a Go template value to its most useful form.
@@ -1097,7 +1197,8 @@ fn resolve_gotmpl_value(raw: &str) -> String {
     s.to_string()
 }
 
-/// Simple line-based YAML parser to extract env var definitions and container images.
+/// Simple line-based YAML parser to extract env var definitions, container images,
+/// and K8s deployment env bindings.
 /// Not a full YAML parser — handles the common patterns in k8s manifests and Helm charts.
 fn parse_yaml_for_resolution(
     content: &str,
@@ -1105,14 +1206,47 @@ fn parse_yaml_for_resolution(
     repo_id: u16,
     k8s_images: &mut rustc_hash::FxHashMap<u16, Vec<K8sContainerImage>>,
     helm_envs: &mut rustc_hash::FxHashMap<u16, Vec<HelmEnvDef>>,
+    k8s_envs: &mut rustc_hash::FxHashMap<u16, Vec<K8sEnvBinding>>,
 ) {
-    let lines: Vec<&str> = content.lines().collect();
     let mut pending_env_name: Option<String> = None;
     let mut pending_env_line: u32 = 0;
 
-    for (i, line) in lines.iter().enumerate() {
+    // Track current document's kind and metadata.name for K8s env bindings
+    let mut current_kind: Option<String> = None;
+    let mut current_metadata_name: Option<String> = None;
+
+    for (i, line) in content.lines().enumerate() {
         let trimmed = line.trim();
         let line_num = (i + 1) as u32;
+
+        // Document separator — reset document context
+        if trimmed == "---" {
+            current_kind = None;
+            current_metadata_name = None;
+            pending_env_name = None;
+            continue;
+        }
+
+        // Track document kind (top-level, no indentation or minimal)
+        if let Some(rest) = trimmed.strip_prefix("kind:") {
+            current_kind = Some(rest.trim().trim_matches('"').trim_matches('\'').to_string());
+        }
+
+        // Track metadata.name — look for "name:" at 2-space indent under "metadata:"
+        // Heuristic: if we see "metadata:" at column 0 followed by "  name:", capture it
+        if !line.starts_with(' ') && trimmed.starts_with("metadata:") {
+            // Next few lines might have "  name: foo"
+        } else if (line.starts_with("  name:") || line.starts_with("    name:"))
+            && !line.starts_with("      ")
+            && current_metadata_name.is_none()
+        {
+            if let Some(rest) = trimmed.strip_prefix("name:") {
+                let name = rest.trim().trim_matches('"').trim_matches('\'').to_string();
+                if !name.is_empty() && !name.contains("{{") {
+                    current_metadata_name = Some(name);
+                }
+            }
+        }
 
         // Container image references: "image: gcr.io/org/app:tag"
         if let Some(rest) = trimmed.strip_prefix("image:") {
@@ -1122,30 +1256,47 @@ fn parse_yaml_for_resolution(
                     image_ref,
                     file: file.to_string(),
                     line: line_num,
-                    deployment_name: None,
+                    deployment_name: current_metadata_name.clone(),
                 });
             }
         }
 
         // Env var definitions: look for "name: VAR_NAME" followed by "value: ..."
-        if let Some(rest) = trimmed.strip_prefix("name:") {
+        // Handle YAML list items: "- name: VAR" or "name: VAR"
+        let field_str = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+        if let Some(rest) = field_str.strip_prefix("name:") {
             let name = rest.trim().trim_matches('"').trim_matches('\'');
             if looks_like_env_var(name) {
                 pending_env_name = Some(name.to_string());
                 pending_env_line = line_num;
             }
-        } else if let Some(rest) = trimmed.strip_prefix("value:") {
+        } else if let Some(rest) = field_str.strip_prefix("value:") {
             if let Some(var_name) = pending_env_name.take() {
                 let raw = rest.trim().trim_matches('"').trim_matches('\'');
                 // Handle Go template expressions: extract default value or the template itself
                 let value = resolve_gotmpl_value(raw);
                 if !value.is_empty() {
                     helm_envs.entry(repo_id).or_default().push(HelmEnvDef {
-                        var_name,
-                        value,
+                        var_name: var_name.clone(),
+                        value: value.clone(),
                         file: file.to_string(),
                         line: pending_env_line,
                     });
+
+                    // For Deployment/StatefulSet/DaemonSet, also emit a K8sEnvBinding
+                    let is_k8s_workload = matches!(
+                        current_kind.as_deref(),
+                        Some("Deployment") | Some("StatefulSet") | Some("DaemonSet")
+                    );
+                    if is_k8s_workload {
+                        k8s_envs.entry(repo_id).or_default().push(K8sEnvBinding {
+                            var_name,
+                            value,
+                            file: file.to_string(),
+                            line: pending_env_line,
+                            deployment_name: current_metadata_name.clone().unwrap_or_default(),
+                        });
+                    }
                 }
             }
         } else if !trimmed.is_empty()

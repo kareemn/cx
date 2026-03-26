@@ -46,6 +46,27 @@ impl NetworkCategory {
             Self::TcpListen => "tcp_listen",
         }
     }
+
+    /// Parse from the string representation produced by `as_str()`.
+    pub fn parse_str(s: &str) -> Self {
+        match s {
+            "http_server" => Self::HttpServer,
+            "http_client" => Self::HttpClient,
+            "grpc_server" => Self::GrpcServer,
+            "grpc_client" => Self::GrpcClient,
+            "websocket_server" => Self::WebsocketServer,
+            "websocket_client" => Self::WebsocketClient,
+            "kafka_producer" => Self::KafkaProducer,
+            "kafka_consumer" => Self::KafkaConsumer,
+            "database" => Self::Database,
+            "redis" => Self::Redis,
+            "sqs" => Self::Sqs,
+            "s3" => Self::S3,
+            "tcp_dial" => Self::TcpDial,
+            "tcp_listen" => Self::TcpListen,
+            _ => Self::HttpClient, // fallback
+        }
+    }
 }
 
 /// Whether the call represents inbound (server/listener) or outbound (client/dial) traffic.

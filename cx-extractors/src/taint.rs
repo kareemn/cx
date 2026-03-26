@@ -15,19 +15,25 @@
 use crate::raw_extract::{RawCall, RawDef, RawFileExtraction, RawLang};
 use crate::sink_registry::{self, NetworkCategory};
 use serde::ser::Serializer;
+use serde::de::Deserializer;
 use cx_core::graph::nodes::{StringId, STRING_NONE};
 use cx_core::graph::string_interner::StringInterner;
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 
 fn serialize_net_category<S: Serializer>(cat: &NetworkCategory, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(cat.as_str())
 }
 
+fn deserialize_net_category<'de, D: Deserializer<'de>>(d: D) -> Result<NetworkCategory, D::Error> {
+    let s = String::deserialize(d)?;
+    Ok(NetworkCategory::parse_str(&s))
+}
+
 // ─── Address source provenance chain ─────────────────────────────────────────
 
 /// The resolved source of a network address/target argument.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AddressSource {
     /// A string literal known at parse time.
     Literal { value: String },
@@ -143,9 +149,9 @@ pub struct FunctionFlowSummary {
 }
 
 /// Fully resolved network call with complete provenance.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedNetworkCall {
-    #[serde(serialize_with = "serialize_net_category")]
+    #[serde(serialize_with = "serialize_net_category", deserialize_with = "deserialize_net_category")]
     pub net_kind: NetworkCategory,
     pub callee_fqn: String,
     pub address_source: AddressSource,
@@ -155,7 +161,7 @@ pub struct ResolvedNetworkCall {
 }
 
 /// Whether the result was type-confirmed (via LSP) or heuristic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Confidence {
     TypeConfirmed,
     Heuristic,

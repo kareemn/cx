@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod graph_index;
 mod indexing;
 mod mcp;
 
@@ -80,6 +81,8 @@ enum Commands {
         #[arg(long)]
         service: Option<String>,
     },
+    /// Re-index repos that have changed since last index
+    Refresh,
     /// Start MCP server (JSON-RPC over stdio)
     Mcp,
 }
@@ -116,6 +119,7 @@ fn main() {
             ref direction,
             ref service,
         } => commands::network::run(&root, json, kind.as_deref(), direction.as_deref(), service.as_deref()),
+        Commands::Refresh => commands::refresh::run(&root),
         Commands::Mcp => mcp::run(&root),
     };
 

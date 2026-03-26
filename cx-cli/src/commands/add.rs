@@ -2,14 +2,16 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::time::Instant;
 
-/// Run `cx add <path>` — add a repo and rebuild the unified graph.
+/// Run `cx add <path>` — add a repo using incremental per-repo graph storage.
 ///
 /// Flow:
 /// 1. Add path to .cx/config.toml under [[repos]]
-/// 2. Re-read all repo paths from config
-/// 3. Re-index ALL repos in parallel
-/// 4. Build single unified CsrGraph
-/// 5. Write to .cx/graph/base.cxgraph
+/// 2. Index ONLY the new repo → write to repos/NNNN-reponame.cxgraph
+/// 3. Update global index (index.json) with new repo's APIs and targets
+/// 4. Merge all per-repo graphs into base.cxgraph
+/// 5. Run cross-repo resolution for new repo against index
+///
+/// Existing repos are NOT re-indexed.
 pub fn run(root: &Path, repo_path: &str) -> Result<()> {
     let repo = Path::new(repo_path)
         .canonicalize()
@@ -25,52 +27,71 @@ pub fn run(root: &Path, repo_path: &str) -> Result<()> {
     }
     crate::config::save(root, &config)?;
 
-    let start = Instant::now();
-
-    // Re-index ALL repos from config
-    let repos: Vec<_> = config
+    // Find repo index
+    let repo_idx = config
         .repos
         .iter()
-        .enumerate()
-        .map(|(i, r)| (r.path.clone(), i as u16))
-        .collect();
+        .position(|r| r.path == repo)
+        .unwrap();
 
-    eprintln!(
-        "Indexing {} repo{}...",
-        repos.len(),
-        if repos.len() == 1 { "" } else { "s" }
-    );
+    let start = Instant::now();
 
-    let result = crate::indexing::index_repos_with_resolution(&repos)?;
+    // Ensure repos/ directory exists
+    let cx_dir = root.join(".cx").join("graph");
+    let repos_dir = cx_dir.join("repos");
+    std::fs::create_dir_all(&repos_dir)?;
+
+    // Check if per-repo graph already exists (re-add of same repo)
+    let per_repo_name = crate::config::per_repo_filename(repo_idx, &repo);
+    let per_repo_path = repos_dir.join(&per_repo_name);
+
+    if added || !per_repo_path.exists() {
+        // Index ONLY the new repo
+        eprintln!("Indexing {} (repo {})...", repo.display(), repo_idx);
+        let result = crate::indexing::index_single_repo(&repo, repo_idx as u16)?;
+
+        // Write per-repo graph
+        cx_core::store::mmap::write_graph(&result.graph, &per_repo_path)
+            .with_context(|| format!("failed to write per-repo graph {}", per_repo_name))?;
+
+        eprintln!(
+            "  {} files: {} symbols, {} edges",
+            result.file_count, result.node_count, result.edge_count,
+        );
+
+        if !result.errors.is_empty() {
+            eprintln!("  Warnings:");
+            for err in &result.errors {
+                eprintln!("    {}", err);
+            }
+        }
+
+        // Update global index
+        let mut index = crate::graph_index::GlobalIndex::load(root).unwrap_or_default();
+        index.remove_repo(repo_idx as u16);
+        let repo_name = crate::config::repo_name(&repo);
+        index.add_from_graph(repo_idx as u16, &repo_name, &result.graph);
+        index.save(root)?;
+    } else {
+        eprintln!("Per-repo graph already exists, skipping extraction");
+    }
+
+    // Merge all per-repo graphs into unified base.cxgraph
+    eprintln!("Merging {} repo graphs...", config.repos.len());
+    let merged = crate::indexing::merge_per_repo_graphs(root)?;
+    let graph_path = cx_dir.join("base.cxgraph");
+    cx_core::store::mmap::write_graph(&merged, &graph_path)?;
 
     let elapsed = start.elapsed();
 
-    // Write unified graph
-    let cx_dir = root.join(".cx").join("graph");
-    std::fs::create_dir_all(&cx_dir)?;
-    let graph_path = cx_dir.join("base.cxgraph");
-    cx_core::store::mmap::write_graph(&result.graph, &graph_path)?;
-
     eprintln!(
-        "Indexed {} files: {} symbols, {} edges in {:.1}ms",
-        result.file_count,
-        result.node_count,
-        result.edge_count,
+        "Unified graph: {} symbols, {} edges in {:.1}ms ({} repos)",
+        merged.node_count(),
+        merged.edge_count(),
         elapsed.as_secs_f64() * 1000.0,
+        config.repos.len(),
     );
-
-    eprintln!(
-        "Unified graph written to {} ({} repos)",
-        graph_path.display(),
-        repos.len(),
-    );
-
-    if !result.errors.is_empty() {
-        eprintln!("Warnings:");
-        for err in &result.errors {
-            eprintln!("  {}", err);
-        }
-    }
+    eprintln!("Graph written to {}", graph_path.display());
 
     Ok(())
 }
@@ -104,9 +125,13 @@ mod tests {
         // Add other repo
         run(main_dir.path(), other_dir.path().to_str().unwrap()).unwrap();
 
-        // Should have ONE graph file (base.cxgraph), not separate per-repo files
-        let cx_dir = main_dir.path().join(".cx").join("graph");
-        let entries: Vec<_> = fs::read_dir(&cx_dir)
+        // Should have base.cxgraph
+        let graph_path = main_dir.path().join(".cx").join("graph").join("base.cxgraph");
+        assert!(graph_path.exists(), "base.cxgraph should exist");
+
+        // Should have per-repo graphs in repos/
+        let repos_dir = main_dir.path().join(".cx").join("graph").join("repos");
+        let entries: Vec<_> = fs::read_dir(&repos_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -117,13 +142,9 @@ mod tests {
             .collect();
         assert_eq!(
             entries.len(),
-            1,
-            "should have exactly 1 graph file, got: {:?}",
+            2,
+            "should have 2 per-repo graph files, got: {:?}",
             entries.iter().map(|e| e.file_name()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            entries[0].file_name().to_str().unwrap(),
-            "base.cxgraph"
         );
 
         // Load the unified graph and verify it has nodes from both repos
@@ -251,5 +272,28 @@ mod tests {
             main_node.repo, other_node.repo,
             "nodes from different repos should have different repo IDs"
         );
+    }
+
+    #[test]
+    fn add_creates_index_json() {
+        let main_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+
+        fs::write(
+            main_dir.path().join("main.go"),
+            "package main\nfunc main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            other_dir.path().join("server.go"),
+            "package server\nfunc Serve() {}\n",
+        )
+        .unwrap();
+
+        super::super::init::run(main_dir.path()).unwrap();
+        run(main_dir.path(), other_dir.path().to_str().unwrap()).unwrap();
+
+        let index_path = main_dir.path().join(".cx").join("graph").join("index.json");
+        assert!(index_path.exists(), "index.json should exist after add");
     }
 }

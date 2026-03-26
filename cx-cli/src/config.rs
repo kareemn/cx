@@ -11,6 +11,9 @@ pub struct CxConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RepoEntry {
     pub path: PathBuf,
+    /// Git HEAD hash at last index time, for change detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_hash: Option<String>,
 }
 
 fn config_path(root: &Path) -> PathBuf {
@@ -42,8 +45,52 @@ pub fn add_repo(config: &mut CxConfig, repo_path: PathBuf) -> bool {
     if config.repos.iter().any(|r| r.path == repo_path) {
         return false;
     }
-    config.repos.push(RepoEntry { path: repo_path });
+    let git_hash = git_head_hash(&repo_path);
+    config.repos.push(RepoEntry {
+        path: repo_path,
+        git_hash,
+    });
     true
+}
+
+/// Update the git hash for a repo in the config. Returns true if found and updated.
+#[allow(dead_code)]
+pub fn update_git_hash(config: &mut CxConfig, repo_path: &Path) -> bool {
+    if let Some(entry) = config.repos.iter_mut().find(|r| r.path == repo_path) {
+        entry.git_hash = git_head_hash(repo_path);
+        true
+    } else {
+        false
+    }
+}
+
+/// Get the git HEAD hash for a repo path, or None if not a git repo.
+pub fn git_head_hash(repo_path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Derive a short repo name from a path (last component).
+pub fn repo_name(repo_path: &Path) -> String {
+    repo_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo")
+        .to_string()
+}
+
+/// Generate the per-repo graph filename: NNNN-reponame.cxgraph
+pub fn per_repo_filename(index: usize, repo_path: &Path) -> String {
+    format!("{:04}-{}.cxgraph", index, repo_name(repo_path))
 }
 
 #[cfg(test)]

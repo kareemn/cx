@@ -3,12 +3,17 @@ use cx_core::graph::csr::CsrGraph;
 use cx_core::graph::edges::EdgeKind;
 use cx_core::graph::kind_index::KindIndex;
 use cx_core::graph::nodes::NodeKind;
+use cx_extractors::taint::ResolvedNetworkCall;
 use std::path::Path;
 
 /// Run `cx network` — list all detected network calls and exposed APIs with provenance.
 pub fn run(root: &Path, json: bool, kind: Option<&str>, direction: Option<&str>, service: Option<&str>) -> Result<()> {
     let graph = super::init::load_graph(root)?;
-    let result = build_network_report(&graph, kind, direction, service);
+
+    // Load taint analysis results if available
+    let taint_calls = load_network_json(root);
+
+    let result = build_network_report(&graph, &taint_calls, kind, direction, service);
 
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -19,26 +24,68 @@ pub fn run(root: &Path, json: bool, kind: Option<&str>, direction: Option<&str>,
     Ok(())
 }
 
-/// Build the full network report from the graph.
+/// Load ResolvedNetworkCall data from .cx/graph/network.json.
+/// Returns empty vec if file doesn't exist or can't be parsed.
+fn load_network_json(root: &Path) -> Vec<ResolvedNetworkCall> {
+    let path = root.join(".cx").join("graph").join("network.json");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+/// Build the full network report from the graph and taint analysis results.
 pub fn build_network_report(
     graph: &CsrGraph,
+    taint_calls: &[ResolvedNetworkCall],
     kind_filter: Option<&str>,
     direction_filter: Option<&str>,
     service_filter: Option<&str>,
 ) -> serde_json::Value {
     let kind_idx = KindIndex::build(graph);
 
+    // Build taint lookup: (file, line) → &ResolvedNetworkCall
+    let taint_index: rustc_hash::FxHashMap<(&str, u32), &ResolvedNetworkCall> = taint_calls
+        .iter()
+        .map(|c| ((c.file.as_str(), c.line), c))
+        .collect();
+
     let mut network_calls = Vec::new();
     let mut exposed_apis = Vec::new();
 
-    // Collect outbound network calls from Connects edges (Symbol → Resource)
-    collect_connects_edges(graph, &kind_idx, &mut network_calls, kind_filter, service_filter);
+    // Collect outbound network calls from Connects edges (Symbol → Resource),
+    // enriching with taint provenance where available
+    collect_connects_edges(graph, &kind_idx, &taint_index, &mut network_calls, kind_filter, service_filter);
 
     // Collect inbound exposed APIs from Exposes edges (Deployable/Module → Endpoint)
     collect_exposes_edges(graph, &kind_idx, &mut exposed_apis, kind_filter, service_filter);
 
     // Collect Publishes/Subscribes edges as network calls
     collect_pubsub_edges(graph, &kind_idx, &mut network_calls, kind_filter, service_filter);
+
+    // Merge in taint-only calls not already covered by graph edges
+    let mut seen_locations: rustc_hash::FxHashSet<(String, u32)> = rustc_hash::FxHashSet::default();
+    for call in &network_calls {
+        let file = call["file"].as_str().unwrap_or("").to_string();
+        let line = call["line"].as_u64().unwrap_or(0) as u32;
+        seen_locations.insert((file, line));
+    }
+
+    for tc in taint_calls {
+        if seen_locations.contains(&(tc.file.clone(), tc.line)) {
+            continue;
+        }
+
+        let kind_str = tc.net_kind.as_str();
+        if let Some(kf) = kind_filter {
+            if !kind_matches(kind_str, kf) {
+                continue;
+            }
+        }
+
+        let entry = taint_call_to_json(tc);
+        network_calls.push(entry);
+    }
 
     // Apply direction filter
     let show_outbound = direction_filter.is_none()
@@ -58,10 +105,104 @@ pub fn build_network_report(
     serde_json::Value::Object(result)
 }
 
+/// Convert a ResolvedNetworkCall to a JSON value for the report.
+fn taint_call_to_json(tc: &ResolvedNetworkCall) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "file": tc.file,
+        "line": tc.line,
+        "kind": tc.net_kind.as_str(),
+        "direction": taint_direction(tc.net_kind),
+        "callee": tc.callee_fqn,
+        "confidence": format!("{:?}", tc.confidence).to_lowercase(),
+        "address_source": tc.address_source,
+    });
+
+    // Add human-readable provenance chain
+    let chain = format_address_source(&tc.address_source);
+    if !chain.is_empty() {
+        entry["provenance_chain"] = serde_json::Value::String(chain);
+    }
+
+    entry
+}
+
+/// Determine direction from NetworkCategory.
+fn taint_direction(cat: cx_extractors::sink_registry::NetworkCategory) -> &'static str {
+    use cx_extractors::sink_registry::NetworkCategory::*;
+    match cat {
+        HttpServer | GrpcServer | WebsocketServer | KafkaConsumer | TcpListen => "inbound",
+        HttpClient | GrpcClient | WebsocketClient | KafkaProducer
+        | Database | Redis | Sqs | S3 | TcpDial => "outbound",
+    }
+}
+
+/// Format an AddressSource into a human-readable provenance chain string.
+fn format_address_source(source: &cx_extractors::taint::AddressSource) -> String {
+    use cx_extractors::taint::AddressSource;
+    match source {
+        AddressSource::Literal { value } => format!("\"{}\"", value),
+        AddressSource::EnvVar { var_name, k8s_value } => {
+            if let Some(k8s) = k8s_value {
+                format!("env({}) \u{2192} \"{}\" (k8s)", var_name, k8s)
+            } else {
+                format!("env({})", var_name)
+            }
+        }
+        AddressSource::ConfigKey { key, file } => {
+            if let Some(f) = file {
+                format!("config(\"{}\", {})", key, f)
+            } else {
+                format!("config(\"{}\")", key)
+            }
+        }
+        AddressSource::Parameter { func, param_idx, caller_sources } => {
+            let callers: Vec<String> = caller_sources.iter()
+                .map(format_address_source)
+                .collect();
+            if callers.is_empty() {
+                format!("param({}, #{})", func, param_idx)
+            } else {
+                format!("{} \u{2192} param({}, #{})", callers.join(" | "), func, param_idx)
+            }
+        }
+        AddressSource::FieldAccess { type_name, field, assignment_sources } => {
+            let assigns: Vec<String> = assignment_sources.iter()
+                .map(format_address_source)
+                .collect();
+            if assigns.is_empty() {
+                format!("{}.{}", type_name, field)
+            } else {
+                format!("{} \u{2192} {}.{}", assigns.join(" | "), type_name, field)
+            }
+        }
+        AddressSource::Concat { parts } => {
+            let formatted: Vec<String> = parts.iter()
+                .map(format_address_source)
+                .collect();
+            formatted.join(" + ")
+        }
+        AddressSource::Flag { flag_name, default_value } => {
+            if let Some(d) = default_value {
+                format!("flag(--{}, default=\"{}\")", flag_name, d)
+            } else {
+                format!("flag(--{})", flag_name)
+            }
+        }
+        AddressSource::Dynamic { hint } => {
+            if hint.is_empty() {
+                "dynamic".to_string()
+            } else {
+                format!("dynamic({})", hint)
+            }
+        }
+    }
+}
+
 /// Collect outbound network calls from Connects edges.
 fn collect_connects_edges(
     graph: &CsrGraph,
     _kind_idx: &KindIndex,
+    taint_index: &rustc_hash::FxHashMap<(&str, u32), &ResolvedNetworkCall>,
     calls: &mut Vec<serde_json::Value>,
     kind_filter: Option<&str>,
     service_filter: Option<&str>,
@@ -93,13 +234,6 @@ fn collect_connects_edges(
             // Infer kind from target name prefix (resource:redis, resource:grpc, etc.)
             let inferred_kind = infer_kind_from_resource(target_name);
 
-            // Apply kind filter
-            if let Some(kf) = kind_filter {
-                if !kind_matches(inferred_kind, kf) {
-                    continue;
-                }
-            }
-
             // Apply service filter: check if source belongs to the requested service
             if let Some(sf) = service_filter {
                 if !node_belongs_to_service(graph, src_idx, sf) {
@@ -113,13 +247,28 @@ fn collect_connects_edges(
                 None
             };
 
-            // Build provenance chain by walking backward through Calls edges
-            let chain = build_provenance_chain(graph, src_idx);
+            // Try to enrich with taint analysis data
+            let taint_match = file.as_deref()
+                .and_then(|f| taint_index.get(&(f, src.line)));
+
+            // Use taint-detected kind if available, otherwise fall back to inference
+            let kind = if let Some(tc) = taint_match {
+                tc.net_kind.as_str()
+            } else {
+                inferred_kind
+            };
+
+            // Apply kind filter with enriched kind
+            if let Some(kf) = kind_filter {
+                if !kind_matches(kind, kf) {
+                    continue;
+                }
+            }
 
             let mut entry = serde_json::json!({
                 "file": file,
                 "line": if src.line > 0 { Some(src.line) } else { None },
-                "kind": inferred_kind,
+                "kind": kind,
                 "direction": "outbound",
                 "target": {
                     "source": "graph_edge",
@@ -128,8 +277,24 @@ fn collect_connects_edges(
                 "symbol": src_name,
             });
 
-            if !chain.is_empty() {
-                entry["provenance"] = serde_json::Value::Array(chain);
+            // Enrich with taint provenance if available
+            if let Some(tc) = taint_match {
+                entry["callee"] = serde_json::Value::String(tc.callee_fqn.clone());
+                entry["confidence"] = serde_json::Value::String(
+                    format!("{:?}", tc.confidence).to_lowercase()
+                );
+                entry["address_source"] = serde_json::to_value(&tc.address_source)
+                    .unwrap_or(serde_json::Value::Null);
+                let chain = format_address_source(&tc.address_source);
+                if !chain.is_empty() {
+                    entry["provenance_chain"] = serde_json::Value::String(chain);
+                }
+            } else {
+                // Fall back to graph-based provenance chain
+                let chain = build_provenance_chain(graph, src_idx);
+                if !chain.is_empty() {
+                    entry["provenance"] = serde_json::Value::Array(chain);
+                }
             }
 
             calls.push(entry);
@@ -440,7 +605,7 @@ fn parse_endpoint_name(name: &str) -> (Option<&str>, &str) {
 fn print_human_readable(report: &serde_json::Value) {
     if let Some(calls) = report.get("network_calls").and_then(|v| v.as_array()) {
         if !calls.is_empty() {
-            println!("Network Calls (outbound):");
+            println!("Network Calls:");
             for call in calls {
                 let file = call["file"].as_str().unwrap_or("unknown");
                 let line = call["line"].as_u64().unwrap_or(0);
@@ -452,34 +617,39 @@ fn print_human_readable(report: &serde_json::Value) {
                 println!("  {}", location);
 
                 let kind = call["kind"].as_str().unwrap_or("unknown");
-                println!("    Kind:      {}", format_kind(kind));
+                let direction = call["direction"].as_str().unwrap_or("outbound");
+                let confidence = call.get("confidence").and_then(|v| v.as_str());
+                let conf_tag = match confidence {
+                    Some("typeconfirmed") => " [type-confirmed]",
+                    Some("heuristic") => " [heuristic]",
+                    _ => "",
+                };
+                println!("    Kind:      {} ({}){}", format_kind(kind), direction, conf_tag);
 
-                if let Some(target) = call.get("target") {
-                    let target_name = target["name"].as_str().unwrap_or("unknown");
-                    let source = target["source"].as_str().unwrap_or("");
-                    if source == "env_var" {
-                        let var_name = target.get("var_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(target_name);
-                        let k8s = target.get("k8s_value")
-                            .and_then(|v| v.as_str());
-                        if let Some(k8s_val) = k8s {
-                            println!("    Target:    {} (env var) \u{2192} \"{}\" (k8s)", var_name, k8s_val);
-                        } else {
-                            println!("    Target:    {} (env var)", var_name);
-                        }
-                    } else {
-                        println!("    Target:    {}", target_name);
-                    }
+                // Show callee FQN if from taint analysis
+                if let Some(callee) = call.get("callee").and_then(|v| v.as_str()) {
+                    println!("    Callee:    {}", callee);
                 }
 
-                if let Some(provenance) = call.get("provenance").and_then(|v| v.as_array()) {
-                    if !provenance.is_empty() {
-                        let chain_parts: Vec<String> = provenance.iter().map(|p| {
-                            let sym = p["symbol"].as_str().unwrap_or("?");
-                            sym.to_string()
-                        }).collect();
-                        println!("    Chain:     {}", chain_parts.join(" \u{2192} "));
+                // Show taint provenance chain if available
+                if let Some(chain) = call.get("provenance_chain").and_then(|v| v.as_str()) {
+                    println!("    Source:    {}", chain);
+                } else if let Some(target) = call.get("target") {
+                    // Fall back to graph-edge target
+                    let target_name = target["name"].as_str().unwrap_or("unknown");
+                    println!("    Target:    {}", target_name);
+                }
+
+                // Show graph-based provenance if no taint data
+                if call.get("provenance_chain").is_none() {
+                    if let Some(provenance) = call.get("provenance").and_then(|v| v.as_array()) {
+                        if !provenance.is_empty() {
+                            let chain_parts: Vec<String> = provenance.iter().map(|p| {
+                                let sym = p["symbol"].as_str().unwrap_or("?");
+                                sym.to_string()
+                            }).collect();
+                            println!("    Chain:     {}", chain_parts.join(" \u{2192} "));
+                        }
                     }
                 }
                 println!();
@@ -593,7 +763,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
     #[test]
     fn network_report_returns_valid_json() {
         let (_dir, graph) = setup_project();
-        let report = build_network_report(&graph, None, None, None);
+        let report = build_network_report(&graph, &[], None, None, None);
         // Should be a valid JSON object
         assert!(report.is_object());
         // Should have the expected top-level keys
@@ -604,11 +774,11 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
     fn network_report_direction_filter() {
         let (_dir, graph) = setup_project();
 
-        let outbound_only = build_network_report(&graph, None, Some("outbound"), None);
+        let outbound_only = build_network_report(&graph, &[], None, Some("outbound"), None);
         assert!(outbound_only.get("network_calls").is_some());
         assert!(outbound_only.get("exposed_apis").is_none());
 
-        let inbound_only = build_network_report(&graph, None, Some("inbound"), None);
+        let inbound_only = build_network_report(&graph, &[], None, Some("inbound"), None);
         assert!(inbound_only.get("exposed_apis").is_some());
         assert!(inbound_only.get("network_calls").is_none());
     }
@@ -617,7 +787,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
     fn network_report_kind_filter() {
         let (_dir, graph) = setup_project();
         // Filter for HTTP — should not error
-        let report = build_network_report(&graph, Some("http"), None, None);
+        let report = build_network_report(&graph, &[], Some("http"), None, None);
         assert!(report.is_object());
     }
 
@@ -659,7 +829,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
     #[test]
     fn human_readable_output_no_panic() {
         let (_dir, graph) = setup_project();
-        let report = build_network_report(&graph, None, None, None);
+        let report = build_network_report(&graph, &[], None, None, None);
         // Just ensure it doesn't panic
         print_human_readable(&report);
     }
@@ -673,7 +843,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
         fs::write(dir.path().join("main.go"), "package main\n\nfunc main() {}\n").unwrap();
         super::super::init::run(dir.path()).unwrap();
         let graph = super::super::init::load_graph(dir.path()).unwrap();
-        let report = build_network_report(&graph, None, None, None);
+        let report = build_network_report(&graph, &[], None, None, None);
         assert!(report.is_object());
     }
 }

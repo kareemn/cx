@@ -181,6 +181,80 @@ impl CsrGraph {
             .position(|n| n.name == name)
             .map(|i| i as u32)
     }
+
+    /// Merge multiple CsrGraphs into a single unified graph.
+    ///
+    /// Each input graph has its own node ID space and string table.
+    /// This function remaps all IDs so the result is a coherent single graph.
+    /// Additional cross-repo edges can be injected via `extra_edges`.
+    pub fn merge(graphs: &[CsrGraph], extra_edges: Vec<EdgeInput>) -> Self {
+        let total_nodes: usize = graphs.iter().map(|g| g.nodes.len()).sum();
+        let total_edges: usize = graphs.iter().map(|g| g.edges.len()).sum();
+
+        let mut merged_strings = StringInterner::new();
+        let mut merged_nodes = Vec::with_capacity(total_nodes);
+        let mut merged_edges = Vec::with_capacity(total_edges + extra_edges.len());
+
+        let mut node_offset: u32 = 0;
+
+        for graph in graphs {
+            // Build string remap: old StringId → new StringId in merged table
+            let mut string_remap = rustc_hash::FxHashMap::default();
+            // Walk the string table by re-reading each node's strings
+            for node in &graph.nodes {
+                if node.name != super::nodes::STRING_NONE && !string_remap.contains_key(&node.name) {
+                    let s = graph.strings.get(node.name);
+                    string_remap.insert(node.name, merged_strings.intern(s));
+                }
+                if node.file != super::nodes::STRING_NONE && !string_remap.contains_key(&node.file) {
+                    let s = graph.strings.get(node.file);
+                    string_remap.insert(node.file, merged_strings.intern(s));
+                }
+            }
+
+            let remap_string = |sid: super::nodes::StringId| -> super::nodes::StringId {
+                if sid == super::nodes::STRING_NONE {
+                    super::nodes::STRING_NONE
+                } else {
+                    *string_remap.get(&sid).unwrap_or(&sid)
+                }
+            };
+
+            // Remap nodes
+            for node in &graph.nodes {
+                let mut new_node = *node;
+                new_node.id = node.id + node_offset;
+                new_node.name = remap_string(node.name);
+                new_node.file = remap_string(node.file);
+                if node.parent != super::nodes::NODE_NONE {
+                    new_node.parent = node.parent + node_offset;
+                }
+                merged_nodes.push(new_node);
+            }
+
+            // Extract forward edges and remap
+            for (src_idx, node) in graph.nodes.iter().enumerate() {
+                let _ = node;
+                let edges = graph.edges_for(src_idx as u32);
+                for edge in edges {
+                    merged_edges.push(EdgeInput {
+                        source: src_idx as u32 + node_offset,
+                        target: edge.target + node_offset,
+                        kind: EdgeKind::from_u8(edge.kind).unwrap_or(EdgeKind::Calls),
+                        confidence_u8: edge.confidence_u8,
+                        flags: edge.flags,
+                    });
+                }
+            }
+
+            node_offset += graph.nodes.len() as u32;
+        }
+
+        // Add extra cross-repo edges (already in global ID space)
+        merged_edges.extend(extra_edges);
+
+        CsrGraph::build(merged_nodes, merged_edges, merged_strings)
+    }
 }
 
 #[cfg(test)]
