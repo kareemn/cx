@@ -1,12 +1,9 @@
 use anyhow::{Context, Result};
 use cx_extractors::lsp::LspOrchestrator;
 use cx_extractors::pipeline::{self, IndexResult, MergedResult};
-use cx_extractors::sink_registry::{self, NetworkCategory};
-use cx_extractors::taint::{Confidence, ResolvedNetworkCall};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use cx_extractors::sink_registry;
+use cx_extractors::taint::Confidence;
 use std::path::PathBuf;
-
 
 /// Run the full indexing pipeline with cross-repo resolution:
 /// 1. Extract and merge all repos
@@ -27,14 +24,6 @@ pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)]) -> Result<IndexResu
         let workspace_root = repos.first().map(|(p, _)| p.as_path());
         if let Some(root) = workspace_root {
             upgrade_via_lsp(&mut merged, root);
-        }
-    }
-
-    // LLM integration: try to upgrade remaining Heuristic calls via Claude CLI
-    if !merged.network_calls.is_empty() {
-        let workspace_root = repos.first().map(|(p, _)| p.as_path());
-        if let Some(root) = workspace_root {
-            upgrade_via_llm(&mut merged.network_calls, root);
         }
     }
 
@@ -85,207 +74,6 @@ fn upgrade_via_lsp(merged: &mut MergedResult, workspace_root: &std::path::Path) 
     }
 
     orchestrator.shutdown();
-}
-
-/// LLM cache for persisting classification results across runs.
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct LlmCache {
-    version: u32,
-    entries: HashMap<String, LlmCacheEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LlmCacheEntry {
-    kind: String,
-    direction: String,
-}
-
-/// Upgrade heuristic network calls via Claude CLI (Haiku model).
-/// Silently skips if `claude` CLI is not on PATH.
-fn upgrade_via_llm(network_calls: &mut Vec<ResolvedNetworkCall>, root: &std::path::Path) {
-    // Check if claude CLI is available (portable: use claude --version, not which)
-    let claude_check = std::process::Command::new("claude")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    match claude_check {
-        Ok(s) if s.success() => {}
-        _ => return, // claude not available, skip silently
-    }
-
-    // Load cache
-    let cache_path = root.join(".cx").join("graph").join("llm_cache.json");
-    let mut cache: LlmCache = std::fs::read_to_string(&cache_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    cache.version = 1;
-
-    // Collect heuristic calls that need classification
-    let heuristic_indices: Vec<usize> = network_calls
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.confidence == Confidence::Heuristic)
-        .map(|(i, _)| i)
-        .collect();
-
-    if heuristic_indices.is_empty() {
-        return;
-    }
-
-    // Check cache first, collect uncached indices
-    let mut uncached_indices: Vec<usize> = Vec::new();
-    let mut cache_hits = 0u32;
-
-    for &idx in &heuristic_indices {
-        let call = &network_calls[idx];
-        let cache_key = format!("{}:{}:{}", call.file, call.line, call.callee_fqn);
-        if let Some(entry) = cache.entries.get(&cache_key) {
-            if let Some(cat) = parse_network_category(&entry.kind) {
-                network_calls[idx].net_kind = cat;
-                network_calls[idx].confidence = Confidence::LLMClassified;
-                cache_hits += 1;
-            }
-        } else {
-            uncached_indices.push(idx);
-        }
-    }
-
-    if cache_hits > 0 {
-        eprintln!("LLM cache: {} call(s) resolved from cache", cache_hits);
-    }
-
-    if uncached_indices.is_empty() {
-        return;
-    }
-
-    eprintln!("LLM: classifying {} heuristic call(s) via Claude CLI...", uncached_indices.len());
-
-    // Batch into groups of 20
-    let mut upgraded = 0u32;
-    for batch in uncached_indices.chunks(20) {
-        let mut prompt = String::from(
-            "Classify these network call sites from a codebase. For each, respond with ONLY a JSON array.\n\
-             Each entry: {\"idx\": N, \"kind\": \"...\", \"direction\": \"inbound|outbound\"}\n\n\
-             Kinds: http_client, http_server, grpc_client, grpc_server, websocket_client, websocket_server,\n\
-                    kafka_producer, kafka_consumer, database, redis, sqs, s3, tcp_dial, tcp_listen, not_network\n\n"
-        );
-
-        for (batch_idx, &call_idx) in batch.iter().enumerate() {
-            let call = &network_calls[call_idx];
-            let hint = serde_json::to_string(&call.address_source).unwrap_or_default();
-            prompt.push_str(&format!(
-                "[{}] file: {}, line: {}, callee: {}, current_kind: {}, address_hint: {}\n",
-                batch_idx, call.file, call.line, call.callee_fqn,
-                call.net_kind.as_str(), hint
-            ));
-        }
-
-        prompt.push_str("\nRespond ONLY with a JSON array, no other text.\n");
-
-        // Call claude CLI
-        let result = std::process::Command::new("claude")
-            .args(["-p", &prompt, "--output-format", "json", "--model", "haiku"])
-            .output();
-
-        let output = match result {
-            Ok(o) if o.status.success() => o,
-            Ok(o) => {
-                eprintln!("LLM: claude returned non-zero exit code: {}", o.status);
-                continue;
-            }
-            Err(e) => {
-                eprintln!("LLM: claude CLI error: {}", e);
-                continue;
-            }
-        };
-
-        // Parse the JSON output
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // claude --output-format json wraps in {"type":"result","result":"..."}
-        let result_text = if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&stdout) {
-            wrapper.get("result")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&stdout)
-                .to_string()
-        } else {
-            stdout.to_string()
-        };
-
-        // Try to parse the inner JSON array
-        let classifications: Vec<serde_json::Value> = match serde_json::from_str(&result_text) {
-            Ok(arr) => arr,
-            Err(_) => {
-                // Try to extract JSON array from the text (LLM might add markdown)
-                if let Some(start) = result_text.find('[') {
-                    if let Some(end) = result_text.rfind(']') {
-                        serde_json::from_str(&result_text[start..=end]).unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    eprintln!("LLM: could not parse response as JSON array");
-                    Vec::new()
-                }
-            }
-        };
-
-        for entry in &classifications {
-            let idx = entry.get("idx").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
-            let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-            let direction = entry.get("direction").and_then(|v| v.as_str()).unwrap_or("");
-
-            if idx >= batch.len() || kind == "not_network" || kind.is_empty() {
-                continue;
-            }
-
-            if let Some(cat) = parse_network_category(kind) {
-                let call_idx = batch[idx];
-                let call = &mut network_calls[call_idx];
-                call.net_kind = cat;
-                call.confidence = Confidence::LLMClassified;
-                upgraded += 1;
-
-                // Update cache
-                let cache_key = format!("{}:{}:{}", call.file, call.line, call.callee_fqn);
-                cache.entries.insert(cache_key, LlmCacheEntry {
-                    kind: kind.to_string(),
-                    direction: direction.to_string(),
-                });
-            }
-        }
-    }
-
-    // Write cache
-    if let Ok(json) = serde_json::to_string_pretty(&cache) {
-        let _ = std::fs::write(&cache_path, json);
-    }
-
-    if upgraded > 0 {
-        eprintln!("LLM: upgraded {} call(s) to LLMClassified", upgraded);
-    }
-}
-
-/// Parse a network category string from LLM output.
-fn parse_network_category(kind: &str) -> Option<NetworkCategory> {
-    match kind {
-        "http_client" => Some(NetworkCategory::HttpClient),
-        "http_server" => Some(NetworkCategory::HttpServer),
-        "grpc_client" => Some(NetworkCategory::GrpcClient),
-        "grpc_server" => Some(NetworkCategory::GrpcServer),
-        "websocket_client" => Some(NetworkCategory::WebsocketClient),
-        "websocket_server" => Some(NetworkCategory::WebsocketServer),
-        "kafka_producer" => Some(NetworkCategory::KafkaProducer),
-        "kafka_consumer" => Some(NetworkCategory::KafkaConsumer),
-        "database" => Some(NetworkCategory::Database),
-        "redis" => Some(NetworkCategory::Redis),
-        "sqs" => Some(NetworkCategory::Sqs),
-        "s3" => Some(NetworkCategory::S3),
-        "tcp_dial" => Some(NetworkCategory::TcpDial),
-        "tcp_listen" => Some(NetworkCategory::TcpListen),
-        _ => None,
-    }
 }
 
 /// Run the full resolution engine on merged extraction data.

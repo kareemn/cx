@@ -84,6 +84,9 @@ enum Commands {
         /// Show only local repo data (exclude remote repos)
         #[arg(long)]
         local_only: bool,
+        /// Include test, archive, example, and vendor files (excluded by default)
+        #[arg(long)]
+        include_all: bool,
     },
     /// Re-index repos that have changed since last index
     Refresh,
@@ -149,7 +152,8 @@ fn main() {
             ref direction,
             ref service,
             local_only,
-        } => commands::network::run(&root, json, kind.as_deref(), direction.as_deref(), service.as_deref(), local_only),
+            include_all,
+        } => commands::network::run(&root, json, kind.as_deref(), direction.as_deref(), service.as_deref(), local_only, include_all),
         Commands::Refresh => commands::refresh::run(&root),
         Commands::Remote { action } => match action {
             RemoteAction::Add { ref name, ref path } => {

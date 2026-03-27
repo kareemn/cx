@@ -7,7 +7,7 @@ use cx_extractors::taint::ResolvedNetworkCall;
 use std::path::Path;
 
 /// Run `cx network` — list all detected network calls and exposed APIs with provenance.
-pub fn run(root: &Path, json: bool, kind: Option<&str>, direction: Option<&str>, service: Option<&str>, local_only: bool) -> Result<()> {
+pub fn run(root: &Path, json: bool, kind: Option<&str>, direction: Option<&str>, service: Option<&str>, local_only: bool, include_all: bool) -> Result<()> {
     let graph = super::init::load_graph(root)?;
 
     // Load local taint analysis results
@@ -19,10 +19,23 @@ pub fn run(root: &Path, json: bool, kind: Option<&str>, direction: Option<&str>,
         taint_calls.extend(remote_calls);
     }
 
+    // Noise filtering: exclude test/archive/example/vendor paths by default
+    if !include_all {
+        taint_calls.retain(|c| !is_noise_path(&c.file));
+    }
+
     // Deduplicate by (file, line) — keep highest confidence entry
     dedup_by_location(&mut taint_calls);
 
-    let result = build_network_report(&graph, &taint_calls, kind, direction, service);
+    let mut result = build_network_report(&graph, &taint_calls, kind, direction, service);
+
+    // Find cross-repo matches from local report data + remote data + global index
+    if !local_only {
+        let matches = find_cross_repo_matches(&result, root);
+        if !matches.is_empty() {
+            result["cross_repo_connections"] = serde_json::Value::Array(matches);
+        }
+    }
 
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -43,51 +56,54 @@ pub fn load_network_json(root: &Path) -> Vec<ResolvedNetworkCall> {
     serde_json::from_str(&content).unwrap_or_default()
 }
 
+/// Check whether a file path looks like test, archive, example, or vendor noise.
+fn is_noise_path(path: &str) -> bool {
+    let p = path.to_lowercase();
+    p.contains("/test/") || p.contains("/tests/") || p.ends_with("_test.go")
+        || p.contains("/archive/") || p.contains("/examples/") || p.contains("/vendor/")
+        || p.contains("/dist/") || p.contains("/build/") || p.contains("/node_modules/")
+        || p.ends_with(".min.js")
+}
+
 /// Load network.json files from all pulled remotes in .cx/remotes/.
 /// Prefixes file paths with [remote_name] for disambiguation.
+/// Deduplicates entries from remotes pointing to the same repo.
 fn load_remote_network_json(root: &Path) -> Vec<ResolvedNetworkCall> {
     let remotes_dir = root.join(".cx").join("remotes");
     let mut all_calls = Vec::new();
-
     let entries = match std::fs::read_dir(&remotes_dir) {
         Ok(e) => e,
         Err(_) => return all_calls,
     };
-
     for entry in entries.flatten() {
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !name.ends_with(".network.json") {
-            continue;
-        }
+        if !name.ends_with(".network.json") { continue; }
         let remote_name = name.trim_end_matches(".network.json");
-
         let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
+            Ok(c) => c, Err(_) => continue,
         };
         let mut calls: Vec<ResolvedNetworkCall> = match serde_json::from_str(&content) {
-            Ok(c) => c,
-            Err(_) => continue,
+            Ok(c) => c, Err(_) => continue,
         };
-
-        // Prefix file paths with remote name for disambiguation
         for call in &mut calls {
             call.file = format!("[{}] {}", remote_name, call.file);
         }
         all_calls.extend(calls);
     }
-
+    // Dedup across remotes pointing to same repo
+    let mut seen: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
+    all_calls.retain(|call| {
+        let bare = call.file.split("] ").last().unwrap_or(&call.file);
+        seen.insert((bare.to_string(), call.line))
+    });
     all_calls
 }
 
-/// Deduplicate network calls by (file, line).
-/// When the same location appears with multiple confidence levels, keep the highest.
+/// Deduplicate network calls by (file, line), keeping highest confidence.
 fn dedup_by_location(calls: &mut Vec<ResolvedNetworkCall>) {
     use std::collections::HashMap;
     let mut best: HashMap<(String, u32), usize> = HashMap::new();
-
-    // Confidence ordering: TypeConfirmed > LLMClassified > ImportResolved > Heuristic
     fn confidence_rank(c: cx_extractors::taint::Confidence) -> u8 {
         match c {
             cx_extractors::taint::Confidence::TypeConfirmed => 4,
@@ -96,7 +112,6 @@ fn dedup_by_location(calls: &mut Vec<ResolvedNetworkCall>) {
             cx_extractors::taint::Confidence::Heuristic => 1,
         }
     }
-
     let mut keep = vec![false; calls.len()];
     for (i, call) in calls.iter().enumerate() {
         let key = (call.file.clone(), call.line);
@@ -106,19 +121,13 @@ fn dedup_by_location(calls: &mut Vec<ResolvedNetworkCall>) {
                 keep[i] = true;
                 best.insert(key, i);
             }
-            // else: keep the previous one, skip this duplicate
         } else {
             keep[i] = true;
             best.insert(key, i);
         }
     }
-
     let mut i = 0;
-    calls.retain(|_| {
-        let k = keep[i];
-        i += 1;
-        k
-    });
+    calls.retain(|_| { let k = keep[i]; i += 1; k });
 }
 
 /// Build the full network report from the graph and taint analysis results.
@@ -174,14 +183,7 @@ pub fn build_network_report(
         network_calls.push(entry);
     }
 
-    // Apply direction filter to network_calls (not just top-level sections)
-    if let Some(dir) = direction_filter {
-        network_calls.retain(|call| {
-            let call_dir = call["direction"].as_str().unwrap_or("outbound");
-            call_dir == dir
-        });
-    }
-
+    // Apply direction filter
     let show_outbound = direction_filter.is_none()
         || direction_filter == Some("outbound");
     let show_inbound = direction_filter.is_none()
@@ -189,14 +191,613 @@ pub fn build_network_report(
 
     let mut result = serde_json::Map::new();
 
-    if show_outbound || direction_filter.is_none() {
+    if show_outbound {
         result.insert("network_calls".to_string(), serde_json::Value::Array(network_calls));
     }
-    if show_inbound || direction_filter.is_none() {
+    if show_inbound {
         result.insert("exposed_apis".to_string(), serde_json::Value::Array(exposed_apis));
     }
 
     serde_json::Value::Object(result)
+}
+
+/// A collected endpoint (inbound exposed API) for matching.
+#[allow(dead_code)]
+struct CollectedEndpoint {
+    file: String,
+    line: u64,
+    kind: String,
+    path: String,
+    method: Option<String>,
+    service: String,
+    repo_name: Option<String>,
+}
+
+/// A collected outbound call for matching.
+struct CollectedOutbound {
+    file: String,
+    line: u64,
+    kind: String,
+    callee: String,
+    address_hint: String,
+    repo_name: Option<String>,
+}
+
+/// A single cross-repo connection match.
+struct CrossRepoMatch {
+    client_file: String,
+    client_line: u64,
+    client_callee: String,
+    client_kind: String,
+    client_repo: Option<String>,
+    server_file: String,
+    server_line: u64,
+    server_path: String,
+    server_kind: String,
+    server_repo: Option<String>,
+    match_type: String,
+}
+
+/// Find cross-repo connections by matching outbound calls to inbound endpoints.
+///
+/// This function:
+/// 1. Collects all exposed APIs (inbound) and outbound calls from the report
+/// 2. Loads remote network data from .cx/remotes/*.network.json
+/// 3. Loads the GlobalIndex from .cx/graph/index.json for additional matches
+/// 4. Matches outbound calls to exposed APIs by path, gRPC service name, or URL
+fn find_cross_repo_matches(report: &serde_json::Value, root: &Path) -> Vec<serde_json::Value> {
+    let mut endpoints = collect_endpoints_from_report(report);
+    let mut outbounds = collect_outbounds_from_report(report);
+
+    // Load remote network data and add to our collections
+    load_remote_network_data(root, &mut endpoints, &mut outbounds);
+
+    // Load global index for additional endpoint/target data
+    load_global_index_data(root, &mut endpoints, &mut outbounds);
+
+    // Perform matching
+    let matches = match_outbounds_to_endpoints(&outbounds, &endpoints);
+
+    // Convert matches to JSON
+    matches.iter().map(|m| {
+        serde_json::json!({
+            "client_file": m.client_file,
+            "client_line": m.client_line,
+            "client_callee": m.client_callee,
+            "client_kind": m.client_kind,
+            "client_repo": m.client_repo,
+            "server_file": m.server_file,
+            "server_line": m.server_line,
+            "server_path": m.server_path,
+            "server_kind": m.server_kind,
+            "server_repo": m.server_repo,
+            "match_type": m.match_type,
+        })
+    }).collect()
+}
+
+/// Collect exposed API endpoints from the report JSON.
+fn collect_endpoints_from_report(report: &serde_json::Value) -> Vec<CollectedEndpoint> {
+    let mut endpoints = Vec::new();
+
+    if let Some(apis) = report.get("exposed_apis").and_then(|v| v.as_array()) {
+        for api in apis {
+            let file = api["file"].as_str().unwrap_or("").to_string();
+            let line = api["line"].as_u64().unwrap_or(0);
+            let kind = api["kind"].as_str().unwrap_or("").to_string();
+            let path = api["path"].as_str().unwrap_or("").to_string();
+            let method = api["method"].as_str().map(String::from);
+            let service = api["service"].as_str().unwrap_or("").to_string();
+
+            endpoints.push(CollectedEndpoint {
+                file, line, kind, path, method, service, repo_name: None,
+            });
+        }
+    }
+
+    endpoints
+}
+
+/// Collect outbound network calls from the report JSON.
+fn collect_outbounds_from_report(report: &serde_json::Value) -> Vec<CollectedOutbound> {
+    let mut outbounds = Vec::new();
+
+    if let Some(calls) = report.get("network_calls").and_then(|v| v.as_array()) {
+        for call in calls {
+            let direction = call["direction"].as_str().unwrap_or("");
+            if direction != "outbound" {
+                continue;
+            }
+
+            let file = call["file"].as_str().unwrap_or("").to_string();
+            let line = call["line"].as_u64().unwrap_or(0);
+            let kind = call["kind"].as_str().unwrap_or("").to_string();
+            let callee = call.get("callee").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+            // Extract address hint from provenance_chain, address_source, or target
+            let address_hint = extract_address_hint(call);
+
+            outbounds.push(CollectedOutbound {
+                file, line, kind, callee, address_hint, repo_name: None,
+            });
+        }
+    }
+
+    outbounds
+}
+
+/// Extract a usable address hint from an outbound call's data.
+///
+/// Looks at provenance_chain for dynamic hints containing paths (e.g. "dynamic(unresolved var: /ws/s2s)"),
+/// address_source for literal values, and target name as fallback.
+fn extract_address_hint(call: &serde_json::Value) -> String {
+    // First check provenance_chain for dynamic hints containing paths
+    if let Some(chain) = call.get("provenance_chain").and_then(|v| v.as_str()) {
+        if let Some(extracted) = extract_path_from_hint(chain) {
+            return extracted;
+        }
+        return chain.to_string();
+    }
+
+    // Check address_source object (from taint analysis)
+    if let Some(source) = call.get("address_source") {
+        if let Some(hint) = extract_from_address_source(source) {
+            return hint;
+        }
+    }
+
+    // Fall back to target name from graph edges
+    if let Some(target) = call.get("target") {
+        if let Some(name) = target["name"].as_str() {
+            return name.to_string();
+        }
+    }
+
+    String::new()
+}
+
+/// Extract a path from a hint string like "dynamic(unresolved var: /ws/s2s)".
+fn extract_path_from_hint(hint: &str) -> Option<String> {
+    // Look for paths starting with / inside the hint
+    for part in hint.split_whitespace() {
+        let cleaned = part.trim_end_matches(')');
+        if cleaned.starts_with('/') && cleaned.len() > 1 {
+            return Some(cleaned.to_string());
+        }
+    }
+    // Also try to find path after "var: " or similar patterns
+    if let Some(idx) = hint.find("var: ") {
+        let rest = &hint[idx + 5..];
+        let path = rest.trim_end_matches(')').trim();
+        if path.starts_with('/') {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+/// Extract address info from a serialized AddressSource JSON value.
+fn extract_from_address_source(source: &serde_json::Value) -> Option<String> {
+    // Literal value
+    if let Some(val) = source.get("Literal").and_then(|v| v.get("value")).and_then(|v| v.as_str()) {
+        return Some(val.to_string());
+    }
+    // Dynamic hint
+    if let Some(hint) = source.get("Dynamic").and_then(|v| v.get("hint")).and_then(|v| v.as_str()) {
+        if let Some(path) = extract_path_from_hint(hint) {
+            return Some(path);
+        }
+        return Some(hint.to_string());
+    }
+    // EnvVar with k8s resolved value
+    if let Some(env) = source.get("EnvVar") {
+        if let Some(k8s) = env.get("k8s_value").and_then(|v| v.as_str()) {
+            return Some(k8s.to_string());
+        }
+        if let Some(name) = env.get("var_name").and_then(|v| v.as_str()) {
+            return Some(format!("env:{}", name));
+        }
+    }
+    None
+}
+
+/// Load remote network.json files and add their entries to the endpoint/outbound collections.
+fn load_remote_network_data(
+    root: &Path,
+    endpoints: &mut Vec<CollectedEndpoint>,
+    outbounds: &mut Vec<CollectedOutbound>,
+) {
+    let remotes_dir = root.join(".cx").join("remotes");
+    let Ok(entries) = std::fs::read_dir(&remotes_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !filename.ends_with(".network.json") {
+            continue;
+        }
+        let remote_name = filename.trim_end_matches(".network.json").to_string();
+
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(calls): Result<Vec<ResolvedNetworkCall>, _> = serde_json::from_str(&content) else {
+            continue;
+        };
+
+        for call in &calls {
+            let direction = taint_direction(call.net_kind);
+            let kind = call.net_kind.as_str().to_string();
+            let file = call.file.clone();
+            let line = call.line as u64;
+
+            if direction == "inbound" {
+                // Remote inbound = exposed API from the remote repo
+                let path_str = extract_path_from_callee(&call.callee_fqn, &call.address_source);
+                endpoints.push(CollectedEndpoint {
+                    file, line, kind,
+                    path: path_str,
+                    method: None,
+                    service: call.callee_fqn.clone(),
+                    repo_name: Some(remote_name.clone()),
+                });
+            } else {
+                // Remote outbound = network call from the remote repo
+                let address_hint = format_address_source(&call.address_source);
+                let mut hint = address_hint.clone();
+                if let Some(path) = extract_path_from_hint(&hint) {
+                    hint = path;
+                }
+                outbounds.push(CollectedOutbound {
+                    file, line, kind,
+                    callee: call.callee_fqn.clone(),
+                    address_hint: hint,
+                    repo_name: Some(remote_name.clone()),
+                });
+            }
+        }
+    }
+}
+
+/// Extract a path string from a callee name or address source.
+fn extract_path_from_callee(callee: &str, source: &cx_extractors::taint::AddressSource) -> String {
+    use cx_extractors::taint::AddressSource;
+
+    // Check address source first
+    match source {
+        AddressSource::Literal { value } => {
+            // If literal contains a path, extract it
+            if let Some(path) = extract_url_path(value) {
+                return path;
+            }
+            return value.clone();
+        }
+        AddressSource::Dynamic { hint } => {
+            if let Some(path) = extract_path_from_hint(hint) {
+                return path;
+            }
+        }
+        _ => {}
+    }
+
+    // Try extracting from callee name
+    callee.to_string()
+}
+
+/// Extract the path component from a URL string.
+fn extract_url_path(url: &str) -> Option<String> {
+    // Handle full URLs like "http://host:port/path" or "ws://host/path"
+    if let Some(idx) = url.find("://") {
+        let after_scheme = &url[idx + 3..];
+        if let Some(slash_idx) = after_scheme.find('/') {
+            let path = &after_scheme[slash_idx..];
+            if !path.is_empty() && path != "/" {
+                return Some(path.to_string());
+            }
+        }
+    }
+    // Handle bare paths
+    if url.starts_with('/') && url.len() > 1 {
+        return Some(url.to_string());
+    }
+    None
+}
+
+/// Load GlobalIndex data and add entries to endpoint/outbound collections.
+fn load_global_index_data(
+    root: &Path,
+    endpoints: &mut Vec<CollectedEndpoint>,
+    outbounds: &mut Vec<CollectedOutbound>,
+) {
+    let Ok(index) = crate::graph_index::GlobalIndex::load(root) else {
+        return;
+    };
+
+    // Add exposed_apis from global index
+    for (endpoint_key, entries) in &index.exposed_apis {
+        for entry in entries {
+            // Skip entries that might already be in our local data (repo_id < 1000 = local)
+            if entry.repo_id < 1000 {
+                continue;
+            }
+            let (method, path) = parse_endpoint_name(endpoint_key);
+            endpoints.push(CollectedEndpoint {
+                file: entry.file.clone(),
+                line: entry.line as u64,
+                kind: infer_kind_from_endpoint(endpoint_key).to_string(),
+                path: path.to_string(),
+                method: method.map(String::from),
+                service: entry.symbol.clone(),
+                repo_name: Some(entry.repo_name.clone()),
+            });
+        }
+    }
+
+    // Add outgoing_targets from global index
+    for (target_key, entries) in &index.outgoing_targets {
+        for entry in entries {
+            if entry.repo_id < 1000 {
+                continue;
+            }
+            outbounds.push(CollectedOutbound {
+                file: entry.file.clone(),
+                line: entry.line as u64,
+                kind: infer_kind_from_resource(target_key).to_string(),
+                callee: entry.symbol.clone(),
+                address_hint: target_key.clone(),
+                repo_name: Some(entry.repo_name.clone()),
+            });
+        }
+    }
+
+    // Add gRPC servers as endpoints
+    for (service_name, entries) in &index.grpc_servers {
+        for entry in entries {
+            if entry.repo_id < 1000 {
+                continue;
+            }
+            endpoints.push(CollectedEndpoint {
+                file: entry.file.clone(),
+                line: entry.line as u64,
+                kind: "grpc_server".to_string(),
+                path: format!("grpc:{}", service_name),
+                method: None,
+                service: entry.symbol.clone(),
+                repo_name: Some(entry.repo_name.clone()),
+            });
+        }
+    }
+
+    // Add gRPC clients as outbound calls
+    for (service_name, entries) in &index.grpc_clients {
+        for entry in entries {
+            if entry.repo_id < 1000 {
+                continue;
+            }
+            outbounds.push(CollectedOutbound {
+                file: entry.file.clone(),
+                line: entry.line as u64,
+                kind: "grpc_client".to_string(),
+                callee: entry.symbol.clone(),
+                address_hint: format!("grpc:{}", service_name),
+                repo_name: Some(entry.repo_name.clone()),
+            });
+        }
+    }
+}
+
+/// Match outbound calls against exposed endpoints using multiple strategies.
+fn match_outbounds_to_endpoints(
+    outbounds: &[CollectedOutbound],
+    endpoints: &[CollectedEndpoint],
+) -> Vec<CrossRepoMatch> {
+    let mut matches = Vec::new();
+    let mut seen = rustc_hash::FxHashSet::default();
+
+    for outbound in outbounds {
+        for endpoint in endpoints {
+            // Skip matching within the same repo (both must have repo names, and they must differ,
+            // or one must be local and the other remote)
+            if !is_cross_repo(outbound.repo_name.as_deref(), endpoint.repo_name.as_deref()) {
+                continue;
+            }
+
+            let match_type = check_match(outbound, endpoint);
+            if let Some(mt) = match_type {
+                // Dedup key: client file+line to server file+line
+                let dedup_key = format!(
+                    "{}:{}->{}:{}",
+                    outbound.file, outbound.line, endpoint.file, endpoint.line
+                );
+                if !seen.insert(dedup_key) {
+                    continue;
+                }
+
+                matches.push(CrossRepoMatch {
+                    client_file: outbound.file.clone(),
+                    client_line: outbound.line,
+                    client_callee: outbound.callee.clone(),
+                    client_kind: format_kind(&outbound.kind).to_string(),
+                    client_repo: outbound.repo_name.clone(),
+                    server_file: endpoint.file.clone(),
+                    server_line: endpoint.line,
+                    server_path: endpoint.path.clone(),
+                    server_kind: format_kind(&endpoint.kind).to_string(),
+                    server_repo: endpoint.repo_name.clone(),
+                    match_type: mt,
+                });
+            }
+        }
+    }
+
+    matches
+}
+
+/// Check whether an outbound call and an endpoint are from different repos.
+fn is_cross_repo(outbound_repo: Option<&str>, endpoint_repo: Option<&str>) -> bool {
+    match (outbound_repo, endpoint_repo) {
+        // One local (None) and one remote (Some) = cross-repo
+        (None, Some(_)) | (Some(_), None) => true,
+        // Both remote but different repos = cross-repo
+        (Some(a), Some(b)) => a != b,
+        // Both local = not cross-repo
+        (None, None) => false,
+    }
+}
+
+/// Check if an outbound call matches an endpoint. Returns the match type if matched.
+fn check_match(outbound: &CollectedOutbound, endpoint: &CollectedEndpoint) -> Option<String> {
+    // 1. Path match: outbound's address hint contains a path that matches an endpoint's path
+    if let Some(mt) = try_path_match(outbound, endpoint) {
+        return Some(mt);
+    }
+
+    // 2. gRPC service match: New{Service}Client ↔ Register{Service}Server
+    if let Some(mt) = try_grpc_match(outbound, endpoint) {
+        return Some(mt);
+    }
+
+    // 3. URL/hostname match: .svc.cluster.local or direct service name
+    if let Some(mt) = try_url_match(outbound, endpoint) {
+        return Some(mt);
+    }
+
+    None
+}
+
+/// Try to match by path string (e.g., both reference "/ws/s2s").
+fn try_path_match(outbound: &CollectedOutbound, endpoint: &CollectedEndpoint) -> Option<String> {
+    if endpoint.path.is_empty() {
+        return None;
+    }
+
+    let ep_path = &endpoint.path;
+
+    // Direct path match in address hint
+    if !outbound.address_hint.is_empty() && outbound.address_hint.contains(ep_path.as_str()) {
+        return Some("path".to_string());
+    }
+
+    // Check if callee contains the path
+    if !outbound.callee.is_empty() && outbound.callee.contains(ep_path.as_str()) {
+        return Some("path".to_string());
+    }
+
+    // Extract path from address hint and compare
+    if let Some(hint_path) = extract_url_path(&outbound.address_hint) {
+        if hint_path == *ep_path {
+            return Some("path".to_string());
+        }
+    }
+
+    None
+}
+
+/// Try to match by gRPC service name.
+/// Matches patterns like: New{Service}Client ↔ Register{Service}Server
+/// Also matches grpc:{ServiceName} keys from the global index.
+fn try_grpc_match(outbound: &CollectedOutbound, endpoint: &CollectedEndpoint) -> Option<String> {
+    let out_service = extract_grpc_service_name(&outbound.callee);
+    let ep_service = extract_grpc_service_name(&endpoint.service)
+        .or_else(|| extract_grpc_service_name(&endpoint.path));
+
+    if let (Some(out_svc), Some(ep_svc)) = (out_service, ep_service) {
+        if out_svc.eq_ignore_ascii_case(&ep_svc) {
+            return Some("grpc".to_string());
+        }
+    }
+
+    // Match grpc:{name} format from global index
+    let out_grpc = outbound.address_hint.strip_prefix("grpc:");
+    let ep_grpc = endpoint.path.strip_prefix("grpc:");
+    if let (Some(out_name), Some(ep_name)) = (out_grpc, ep_grpc) {
+        if out_name.eq_ignore_ascii_case(ep_name) {
+            return Some("grpc".to_string());
+        }
+    }
+
+    None
+}
+
+/// Extract the gRPC service name from a callee/symbol string.
+/// Handles Go: New{Service}Client, Register{Service}Server
+/// Handles Python: add_{Service}Servicer_to_server, {Service}Stub
+fn extract_grpc_service_name(name: &str) -> Option<String> {
+    // Go client: New{Service}Client → {Service}
+    if let Some(rest) = name.strip_prefix("New") {
+        if let Some(service) = rest.strip_suffix("Client") {
+            if !service.is_empty() {
+                return Some(service.to_string());
+            }
+        }
+    }
+
+    // Go server: Register{Service}Server → {Service}
+    if let Some(rest) = name.strip_prefix("Register") {
+        if let Some(service) = rest.strip_suffix("Server") {
+            if !service.is_empty() {
+                return Some(service.to_string());
+            }
+        }
+    }
+
+    // Also handle the full FQN like "pb.NewOrderClient" → extract after last dot
+    if let Some(dot_idx) = name.rfind('.') {
+        let short = &name[dot_idx + 1..];
+        return extract_grpc_service_name(short);
+    }
+
+    // Python: add_{Service}Servicer_to_server → {Service}
+    if let Some(rest) = name.strip_prefix("add_") {
+        if let Some(service) = rest.strip_suffix("Servicer_to_server") {
+            if !service.is_empty() {
+                return Some(service.to_string());
+            }
+        }
+    }
+
+    // Python: {Service}Stub → {Service}
+    if let Some(service) = name.strip_suffix("Stub") {
+        if !service.is_empty() {
+            return Some(service.to_string());
+        }
+    }
+
+    None
+}
+
+/// Try to match by URL hostname (e.g., .svc.cluster.local or service name in address).
+fn try_url_match(outbound: &CollectedOutbound, endpoint: &CollectedEndpoint) -> Option<String> {
+    if outbound.address_hint.is_empty() || endpoint.service.is_empty() {
+        return None;
+    }
+
+    let hint_lower = outbound.address_hint.to_lowercase();
+    let service_lower = endpoint.service.to_lowercase();
+
+    // Match "service-name.svc.cluster.local" pattern
+    if hint_lower.contains(".svc.cluster.local") {
+        // Extract service name from the hostname
+        let hostname = hint_lower.split("://").last().unwrap_or(&hint_lower);
+        let hostname = hostname.split(':').next().unwrap_or(hostname);
+        let hostname = hostname.split('/').next().unwrap_or(hostname);
+        let svc_name = hostname.split(".svc.cluster.local").next().unwrap_or(hostname);
+        // The svc_name might have a namespace: "service.namespace"
+        let bare_name = svc_name.split('.').next().unwrap_or(svc_name);
+
+        if bare_name == service_lower || service_lower.contains(bare_name) {
+            return Some("url".to_string());
+        }
+    }
+
+    // Match direct service name in address (e.g., "productcatalogservice:3550")
+    if hint_lower.contains(&service_lower) {
+        return Some("url".to_string());
+    }
+
+    None
 }
 
 /// Convert a ResolvedNetworkCall to a JSON value for the report.
@@ -207,9 +808,7 @@ fn taint_call_to_json(tc: &ResolvedNetworkCall) -> serde_json::Value {
         "kind": tc.net_kind.as_str(),
         "direction": taint_direction(tc.net_kind),
         "callee": tc.callee_fqn,
-        "confidence": serde_json::to_value(&tc.confidence).ok()
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_else(|| "heuristic".to_string()),
+        "confidence": format!("{:?}", tc.confidence).to_lowercase(),
         "address_source": tc.address_source,
     });
 
@@ -380,9 +979,7 @@ fn collect_connects_edges(
             if let Some(tc) = taint_match {
                 entry["callee"] = serde_json::Value::String(tc.callee_fqn.clone());
                 entry["confidence"] = serde_json::Value::String(
-                    serde_json::to_value(&tc.confidence).ok()
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_else(|| "heuristic".to_string())
+                    format!("{:?}", tc.confidence).to_lowercase()
                 );
                 entry["address_source"] = serde_json::to_value(&tc.address_source)
                     .unwrap_or(serde_json::Value::Null);
@@ -721,9 +1318,7 @@ fn print_human_readable(report: &serde_json::Value) {
                 let direction = call["direction"].as_str().unwrap_or("outbound");
                 let confidence = call.get("confidence").and_then(|v| v.as_str());
                 let conf_tag = match confidence {
-                    Some("type_confirmed") => " [type-confirmed]",
-                    Some("llm_classified") => " [llm-classified]",
-                    Some("import_resolved") => " [import-resolved]",
+                    Some("typeconfirmed") => " [type-confirmed]",
                     Some("heuristic") => " [heuristic]",
                     _ => "",
                 };
@@ -790,6 +1385,53 @@ fn print_human_readable(report: &serde_json::Value) {
         }
     }
 
+    // Print cross-repo connections
+    if let Some(connections) = report.get("cross_repo_connections").and_then(|v| v.as_array()) {
+        if !connections.is_empty() {
+            println!("Cross-Repo Connections:");
+            for conn in connections {
+                let client_file = conn["client_file"].as_str().unwrap_or("unknown");
+                let client_line = conn["client_line"].as_u64().unwrap_or(0);
+                let server_file = conn["server_file"].as_str().unwrap_or("unknown");
+                let server_line = conn["server_line"].as_u64().unwrap_or(0);
+
+                let client_loc = if client_line > 0 {
+                    format!("{}:{}", client_file, client_line)
+                } else {
+                    client_file.to_string()
+                };
+                let server_loc = if server_line > 0 {
+                    format!("{}:{}", server_file, server_line)
+                } else {
+                    server_file.to_string()
+                };
+
+                // Show repo tags if available
+                let client_tag = conn["client_repo"].as_str()
+                    .map(|r| format!("[{}] ", r))
+                    .unwrap_or_default();
+                let server_tag = conn["server_repo"].as_str()
+                    .map(|r| format!("[{}] ", r))
+                    .unwrap_or_default();
+
+                println!("  {}{}  -->  {}{}", client_tag, client_loc, server_tag, server_loc);
+
+                let client_callee = conn["client_callee"].as_str().unwrap_or("?");
+                let client_kind = conn["client_kind"].as_str().unwrap_or("?");
+                let server_path = conn["server_path"].as_str().unwrap_or("?");
+                let server_kind = conn["server_kind"].as_str().unwrap_or("?");
+                let match_type = conn["match_type"].as_str().unwrap_or("?");
+
+                println!(
+                    "    Client: {} ({})  -->  Server: {} ({})",
+                    client_callee, client_kind, server_path, server_kind,
+                );
+                println!("    Match:  {}", match_type);
+                println!();
+            }
+        }
+    }
+
     // If nothing was found
     let has_calls = report.get("network_calls")
         .and_then(|v| v.as_array())
@@ -797,8 +1439,11 @@ fn print_human_readable(report: &serde_json::Value) {
     let has_apis = report.get("exposed_apis")
         .and_then(|v| v.as_array())
         .is_some_and(|a| !a.is_empty());
+    let has_connections = report.get("cross_repo_connections")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
 
-    if !has_calls && !has_apis {
+    if !has_calls && !has_apis && !has_connections {
         println!("No network boundaries detected.");
         println!("Hint: Run `cx init` first, then `cx network` to see results.");
     }
@@ -938,16 +1583,6 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     #[test]
-    fn format_service_discovery() {
-        let source = cx_extractors::taint::AddressSource::ServiceDiscovery {
-            service_name: "payment-service".to_string(),
-            mechanism: "consul".to_string(),
-        };
-        let formatted = format_address_source(&source);
-        assert_eq!(formatted, "service-discovery(consul, payment-service)");
-    }
-
-    #[test]
     fn empty_graph_no_crash() {
         let dir = tempfile::tempdir().unwrap();
         // Create a minimal file so init succeeds
@@ -958,5 +1593,423 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
         let graph = super::super::init::load_graph(dir.path()).unwrap();
         let report = build_network_report(&graph, &[], None, None, None);
         assert!(report.is_object());
+    }
+
+    // ─── Cross-repo matching tests ────────────────────────────────────
+
+    #[test]
+    fn extract_path_from_hint_dynamic() {
+        // "dynamic(unresolved var: /ws/s2s)" → "/ws/s2s"
+        assert_eq!(
+            extract_path_from_hint("dynamic(unresolved var: /ws/s2s)"),
+            Some("/ws/s2s".to_string()),
+        );
+        // No path
+        assert_eq!(extract_path_from_hint("dynamic(unknown)"), None);
+        // Path in middle
+        assert_eq!(
+            extract_path_from_hint("some context /api/health)"),
+            Some("/api/health".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_url_path_from_full_url() {
+        assert_eq!(
+            extract_url_path("http://example.com/api/v1/users"),
+            Some("/api/v1/users".to_string()),
+        );
+        assert_eq!(
+            extract_url_path("ws://host:8080/ws/s2s"),
+            Some("/ws/s2s".to_string()),
+        );
+        assert_eq!(extract_url_path("http://example.com/"), None);
+        assert_eq!(extract_url_path("http://example.com"), None);
+        assert_eq!(
+            extract_url_path("/api/health"),
+            Some("/api/health".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_grpc_service_name_go_patterns() {
+        assert_eq!(
+            extract_grpc_service_name("NewS2SClient"),
+            Some("S2S".to_string()),
+        );
+        assert_eq!(
+            extract_grpc_service_name("RegisterS2SServer"),
+            Some("S2S".to_string()),
+        );
+        assert_eq!(
+            extract_grpc_service_name("NewOrderProcessingClient"),
+            Some("OrderProcessing".to_string()),
+        );
+        assert_eq!(
+            extract_grpc_service_name("RegisterOrderProcessingServer"),
+            Some("OrderProcessing".to_string()),
+        );
+        // With package prefix
+        assert_eq!(
+            extract_grpc_service_name("pb.NewOrderClient"),
+            Some("Order".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_grpc_service_name_python_patterns() {
+        assert_eq!(
+            extract_grpc_service_name("add_OrderServicer_to_server"),
+            Some("Order".to_string()),
+        );
+        assert_eq!(
+            extract_grpc_service_name("OrderStub"),
+            Some("Order".to_string()),
+        );
+    }
+
+    #[test]
+    fn is_cross_repo_checks() {
+        // Local vs remote = cross-repo
+        assert!(is_cross_repo(None, Some("remote-svc")));
+        assert!(is_cross_repo(Some("remote-svc"), None));
+        // Different remotes = cross-repo
+        assert!(is_cross_repo(Some("svc-a"), Some("svc-b")));
+        // Same repo = not cross-repo
+        assert!(!is_cross_repo(Some("svc-a"), Some("svc-a")));
+        // Both local = not cross-repo
+        assert!(!is_cross_repo(None, None));
+    }
+
+    #[test]
+    fn path_match_websocket() {
+        let outbound = CollectedOutbound {
+            file: "s2s_client.cpp".to_string(),
+            line: 188,
+            kind: "websocket_client".to_string(),
+            callee: "ws_.async_handshake".to_string(),
+            address_hint: "/ws/s2s".to_string(),
+            repo_name: Some("cpp-client".to_string()),
+        };
+        let endpoint = CollectedEndpoint {
+            file: "transport/ws.go".to_string(),
+            line: 471,
+            kind: "websocket_server".to_string(),
+            path: "/ws/s2s".to_string(),
+            method: None,
+            service: "wsHandler".to_string(),
+            repo_name: None,
+        };
+
+        let result = check_match(&outbound, &endpoint);
+        assert_eq!(result, Some("path".to_string()));
+    }
+
+    #[test]
+    fn grpc_match_client_to_server() {
+        let outbound = CollectedOutbound {
+            file: "client.go".to_string(),
+            line: 20,
+            kind: "grpc_client".to_string(),
+            callee: "pb.NewOrderProcessingClient".to_string(),
+            address_hint: "localhost:50051".to_string(),
+            repo_name: Some("frontend".to_string()),
+        };
+        let endpoint = CollectedEndpoint {
+            file: "server.go".to_string(),
+            line: 10,
+            kind: "grpc_server".to_string(),
+            path: "RegisterOrderProcessingServer".to_string(),
+            method: None,
+            service: "RegisterOrderProcessingServer".to_string(),
+            repo_name: None,
+        };
+
+        let result = check_match(&outbound, &endpoint);
+        assert_eq!(result, Some("grpc".to_string()));
+    }
+
+    #[test]
+    fn url_match_svc_cluster_local() {
+        let outbound = CollectedOutbound {
+            file: "api.go".to_string(),
+            line: 30,
+            kind: "http_client".to_string(),
+            callee: "http.Get".to_string(),
+            address_hint: "http://order-service.default.svc.cluster.local:8080/api/orders".to_string(),
+            repo_name: Some("frontend".to_string()),
+        };
+        let endpoint = CollectedEndpoint {
+            file: "handler.go".to_string(),
+            line: 15,
+            kind: "http_server".to_string(),
+            path: "/api/orders".to_string(),
+            method: Some("GET".to_string()),
+            service: "order-service".to_string(),
+            repo_name: None,
+        };
+
+        let result = check_match(&outbound, &endpoint);
+        // Should match on URL hostname
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn match_outbounds_to_endpoints_dedup() {
+        let outbounds = vec![
+            CollectedOutbound {
+                file: "client.cpp".to_string(),
+                line: 100,
+                kind: "websocket_client".to_string(),
+                callee: "connect".to_string(),
+                address_hint: "/ws/s2s".to_string(),
+                repo_name: Some("cpp-client".to_string()),
+            },
+        ];
+        let endpoints = vec![
+            CollectedEndpoint {
+                file: "ws.go".to_string(),
+                line: 50,
+                kind: "websocket_server".to_string(),
+                path: "/ws/s2s".to_string(),
+                method: None,
+                service: "wsHandler".to_string(),
+                repo_name: None,
+            },
+            // Same endpoint listed again (e.g., from index + graph)
+            CollectedEndpoint {
+                file: "ws.go".to_string(),
+                line: 50,
+                kind: "websocket_server".to_string(),
+                path: "/ws/s2s".to_string(),
+                method: None,
+                service: "wsHandler2".to_string(),
+                repo_name: None,
+            },
+        ];
+
+        let matches = match_outbounds_to_endpoints(&outbounds, &endpoints);
+        // Should dedup: same client:line → server:line pair should appear once
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn no_match_within_same_repo() {
+        let outbounds = vec![
+            CollectedOutbound {
+                file: "client.go".to_string(),
+                line: 10,
+                kind: "http_client".to_string(),
+                callee: "http.Get".to_string(),
+                address_hint: "/api/internal".to_string(),
+                repo_name: None,
+            },
+        ];
+        let endpoints = vec![
+            CollectedEndpoint {
+                file: "server.go".to_string(),
+                line: 20,
+                kind: "http_server".to_string(),
+                path: "/api/internal".to_string(),
+                method: None,
+                service: "internalHandler".to_string(),
+                repo_name: None,
+            },
+        ];
+
+        let matches = match_outbounds_to_endpoints(&outbounds, &endpoints);
+        // Both are local (None repo) → not cross-repo
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn find_cross_repo_matches_from_report() {
+        // Build a report with local endpoints and inject remote calls
+        let report = serde_json::json!({
+            "exposed_apis": [
+                {
+                    "file": "transport/ws.go",
+                    "line": 471,
+                    "kind": "websocket_server",
+                    "path": "/ws/s2s",
+                    "method": null,
+                    "service": "wsTransport",
+                }
+            ],
+            "network_calls": [
+                {
+                    "file": "s2s_client.cpp",
+                    "line": 188,
+                    "kind": "websocket_client",
+                    "direction": "outbound",
+                    "callee": "ws_.async_handshake",
+                    "provenance_chain": "dynamic(unresolved var: /ws/s2s)",
+                }
+            ]
+        });
+
+        // Without a root dir, remote data won't load, but local matching
+        // still won't match because both sides have repo_name=None (same repo).
+        // This is correct behavior: local-to-local is not cross-repo.
+        let dir = tempfile::tempdir().unwrap();
+        let matches = find_cross_repo_matches(&report, dir.path());
+        assert!(matches.is_empty(), "local-to-local should not produce cross-repo matches");
+    }
+
+    #[test]
+    fn find_cross_repo_matches_with_remote_network_data() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create .cx/remotes directory with remote network data
+        let remotes_dir = dir.path().join(".cx").join("remotes");
+        fs::create_dir_all(&remotes_dir).unwrap();
+
+        // Write a remote network.json for "cpp-client"
+        let remote_calls = serde_json::json!([
+            {
+                "net_kind": "websocket_client",
+                "callee_fqn": "ws_.async_handshake",
+                "address_source": {
+                    "Dynamic": { "hint": "unresolved var: /ws/s2s" }
+                },
+                "file": "native/src/s2s_client.cpp",
+                "line": 188,
+                "confidence": "heuristic"
+            }
+        ]);
+        fs::write(
+            remotes_dir.join("cpp-client.network.json"),
+            serde_json::to_string(&remote_calls).unwrap(),
+        ).unwrap();
+
+        // Build a report with local exposed APIs
+        let report = serde_json::json!({
+            "exposed_apis": [
+                {
+                    "file": "transport/ws.go",
+                    "line": 471,
+                    "kind": "websocket_server",
+                    "path": "/ws/s2s",
+                    "method": null,
+                    "service": "wsTransport",
+                }
+            ],
+            "network_calls": []
+        });
+
+        let matches = find_cross_repo_matches(&report, dir.path());
+        assert_eq!(matches.len(), 1, "should find one cross-repo match");
+        assert_eq!(matches[0]["client_repo"], "cpp-client");
+        assert_eq!(matches[0]["server_path"], "/ws/s2s");
+        assert_eq!(matches[0]["match_type"], "path");
+    }
+
+    #[test]
+    fn find_cross_repo_matches_bidirectional_with_index() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create .cx/graph directory
+        let graph_dir = dir.path().join(".cx").join("graph");
+        fs::create_dir_all(&graph_dir).unwrap();
+
+        // Create a global index with a remote gRPC server
+        let index = crate::graph_index::GlobalIndex {
+            exposed_apis: std::collections::HashMap::new(),
+            outgoing_targets: std::collections::HashMap::new(),
+            grpc_servers: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("OrderProcessing".to_string(), vec![
+                    crate::graph_index::IndexEntry {
+                        repo_id: 1000,
+                        repo_name: "order-svc".to_string(),
+                        file: "server.go".to_string(),
+                        line: 10,
+                        symbol: "RegisterOrderProcessingServer".to_string(),
+                    },
+                ]);
+                m
+            },
+            grpc_clients: std::collections::HashMap::new(),
+        };
+        index.save(dir.path()).unwrap();
+
+        // Build a report with a local gRPC client call
+        let report = serde_json::json!({
+            "exposed_apis": [],
+            "network_calls": [
+                {
+                    "file": "client.go",
+                    "line": 20,
+                    "kind": "grpc_client",
+                    "direction": "outbound",
+                    "callee": "pb.NewOrderProcessingClient",
+                    "provenance_chain": "\"localhost:50051\"",
+                }
+            ]
+        });
+
+        let matches = find_cross_repo_matches(&report, dir.path());
+        assert_eq!(matches.len(), 1, "should find gRPC cross-repo match from index");
+        assert_eq!(matches[0]["match_type"], "grpc");
+        assert_eq!(matches[0]["server_repo"], "order-svc");
+    }
+
+    #[test]
+    fn human_readable_cross_repo_output() {
+        let report = serde_json::json!({
+            "network_calls": [],
+            "exposed_apis": [],
+            "cross_repo_connections": [
+                {
+                    "client_file": "native/src/s2s_client.cpp",
+                    "client_line": 188,
+                    "client_callee": "ws_.async_handshake",
+                    "client_kind": "WebSocket client",
+                    "client_repo": "cpp-client",
+                    "server_file": "transport/ws.go",
+                    "server_line": 471,
+                    "server_path": "/ws/s2s",
+                    "server_kind": "WebSocket server",
+                    "server_repo": null,
+                    "match_type": "path",
+                }
+            ]
+        });
+
+        // Should not panic
+        print_human_readable(&report);
+    }
+
+    #[test]
+    fn extract_from_address_source_literal() {
+        let source = serde_json::json!({
+            "Literal": { "value": "http://example.com/api/v1" }
+        });
+        assert_eq!(
+            extract_from_address_source(&source),
+            Some("http://example.com/api/v1".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_from_address_source_dynamic() {
+        let source = serde_json::json!({
+            "Dynamic": { "hint": "unresolved var: /ws/s2s" }
+        });
+        assert_eq!(
+            extract_from_address_source(&source),
+            Some("/ws/s2s".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_from_address_source_env_with_k8s() {
+        let source = serde_json::json!({
+            "EnvVar": { "var_name": "SVC_ADDR", "k8s_value": "productcatalog:3550" }
+        });
+        assert_eq!(
+            extract_from_address_source(&source),
+            Some("productcatalog:3550".to_string()),
+        );
     }
 }
