@@ -59,10 +59,47 @@ Every edge is traceable to source code. No information is lost — the graph is 
 ## How CX Achieves This
 
 1. **tree-sitter** for fast structural parsing — always available, <2s per repo, extracts all symbols, calls, imports, and string literals with 100% recall.
-2. **LSP servers** (ty, gopls, tsserver, jdtls, clangd) for type-resolved call graphs — optional, graceful degradation. When available, every call target is resolved to its fully qualified name. Without LSP, falls back to import-based heuristics.
-3. **Backward taint analysis** tracing address arguments through variable assignments, function parameters, env var reads, and config file loads — cross-file, inter-procedural, depth-bounded.
-4. **Infrastructure resolution** linking code-side env var reads to K8s manifest values to service DNS names to target services' exposed APIs.
-5. **Distributed graph protocol** enabling teams to share graphs via remotes, with collaborative parser config refinement via `.cx/config/`.
+2. **Import-aware FQN resolution** maps receiver names to import paths, constructing fully-qualified names that match the sink registry — deterministic, no external dependencies.
+3. **LLM classification (optional)** sends source context to Claude Haiku for calls that FQN resolution misses — resolves both call type and target address.
+4. **LSP servers** (ty, gopls, tsserver, jdtls, clangd) for type-resolved accuracy when installed.
+5. **Backward taint analysis** tracing address arguments through variable assignments, function parameters, env var reads, and config file loads — cross-file, inter-procedural, depth-bounded.
+6. **Infrastructure resolution** linking code-side env var reads to K8s manifest values to service DNS names to target services' exposed APIs.
+7. **Distributed graph protocol** enabling teams to share graphs via remotes, with collaborative parser config refinement via `.cx/config/`.
+
+## Classification Pipeline
+
+After tree-sitter extracts raw call sites, each outgoing call must be classified — what kind of network call is it (gRPC, HTTP, database, etc.) and where does it connect? CX uses a three-tier pipeline, falling through from highest to lowest confidence:
+
+### Tier 1: Import-Aware FQN Resolution
+
+`build_fqn_candidates()` in `taint.rs` uses `raw.imports` to construct fully-qualified names for each call's receiver. `default_alias_for_lang()` derives the default alias for a given import path per language convention (e.g., Go uses the last path segment, Python uses the module name). For Go, versioned module paths with `/v8` suffixes are stripped before matching. The constructed FQN is matched against the sink registry to classify the call.
+
+This tier is deterministic, fast, and requires no external dependencies. It handles the majority of calls in well-structured codebases where import paths are unambiguous.
+
+### Tier 2: LLM Classification
+
+For calls that Tier 1 cannot resolve (ambiguous receivers, aliased imports, dynamic dispatch), `upgrade_via_llm()` in `indexing.rs` sends source context to Claude Haiku via the `claude` CLI or the Anthropic API. The LLM receives the call site with surrounding context and returns both the call kind and target address.
+
+Results are cached in `.cx/graph/llm_cache.json` or `.cx/cache/llm_classifications.json` to avoid redundant API calls. `apply_llm_classification()` merges LLM results into the existing call data, and `LLMClassification` structs carry the LLM's response alongside the original extraction.
+
+This tier is optional. CX never requires an API key or network access to function.
+
+### Tier 3: Heuristic Classification
+
+`heuristic_classify_call()` in `sink_registry.rs` pattern-matches on receiver and method names (e.g., a method named `Dial` on a receiver containing `grpc` is classified as gRPC). This tier is always available and has no external dependencies, but produces the lowest confidence results.
+
+### Confidence Enum
+
+Each classified call carries a `Confidence` level reflecting how it was resolved:
+
+| Level | Source | Typical Score |
+|-------|--------|---------------|
+| TypeConfirmed | LSP-resolved fully-qualified type | 0.95+ |
+| LLMClassified | Claude Haiku classification | 0.80-0.90 |
+| ImportResolved | FQN constructed from import paths | 0.70-0.85 |
+| Heuristic | Pattern-matched receiver/method names | 0.40-0.65 |
+
+Higher tiers always take precedence. If Tier 1 resolves a call, Tier 2 and 3 are skipped. If Tier 2 resolves it, Tier 3 is skipped.
 
 ## Core Design Principles
 
@@ -70,11 +107,11 @@ Every edge is traceable to source code. No information is lost — the graph is 
 
 2. **Git-native.** The fundamental unit of indexing is a commit, not a directory. Branches are graph states. Diffs between branches are graph diffs. Temporal queries ("when did this dependency appear") walk git history.
 
-3. **Progressive resolution.** CX is honest about what it doesn't know. Every query response carries a completeness score and explicit gap information. Dangling edges (references to unindexed services) are first-class objects, not silent omissions. Results are marked as "type-confirmed" (via LSP) or "heuristic" (tree-sitter only).
+3. **Progressive resolution.** CX is honest about what it doesn't know. Every query response carries a completeness score and explicit gap information. Dangling edges (references to unindexed services) are first-class objects, not silent omissions. Results carry a confidence level from the classification pipeline: TypeConfirmed (LSP-resolved), LLMClassified (Claude Haiku), ImportResolved (FQN via import paths), or Heuristic (pattern-matched).
 
 4. **Incremental.** File changes trigger incremental re-parsing via tree-sitter. Cross-repo updates happen in the background. Per-repo graphs are independent — adding repo 1000 is as fast as adding repo 2.
 
-5. **Single binary, optional LSP.** CX compiles to one static Rust binary. It always works standalone with tree-sitter. When language-specific LSP servers (ty, gopls, tsserver, jdtls, clangd) are installed, CX uses them for type-resolved accuracy. The LSP integration is always optional — never a hard dependency.
+5. **Single binary, optional LSP and LLM.** CX compiles to one static Rust binary. It always works standalone with tree-sitter and import-aware FQN resolution. LSP servers (ty, gopls, tsserver, jdtls, clangd) and LLM classification (Claude Haiku) enhance accuracy but are never required. CX always works standalone.
 
 6. **Distributed like git.** Each repo has a `.cx/` directory. Teams build their own graph. `cx remote add/pull/push` shares graphs. Custom parser config (`.cx/config/sinks.toml`, `.cx/config/taxonomy.toml`) is version-controlled and shareable — enabling teams to reach 100% coverage without modifying CX source code.
 
@@ -271,6 +308,20 @@ struct EdgeMeta {
 - **0.0–0.4 (speculative):** Heuristic matches. Same-org repo name similarity. Commit author cross-referencing.
 
 High-confidence edges are stated as fact. Low-confidence edges are presented as possibilities with explicit gaps. The MCP responses separate `resolved_edges` from `possible_edges`.
+
+### Address Provenance
+
+The `AddressSource` enum tracks where a network call's target address originates. In addition to the core variants (string literal, env var, function parameter, config file), the following variants support service discovery and LLM-augmented classification:
+
+```rust
+/// Service discovery mechanisms (Consul, K8s DNS, etc.)
+AddressSource::ServiceDiscovery {
+    service_name: StringId,   // e.g., "acme-orders"
+    mechanism: StringId,      // e.g., "k8s-dns", "consul", "eureka"
+}
+```
+
+`LLMClassification` structs carry the LLM's response for calls classified via Tier 2: the inferred call kind, target address, and a confidence score. `apply_llm_classification()` merges these results into the call's existing metadata, upgrading its confidence from Heuristic to LLMClassified and filling in the target address when the LLM provides one.
 
 ## Graph Storage
 
@@ -764,6 +815,14 @@ struct ParsedFile<'src> {
 }
 ```
 
+### Source Context Preservation
+
+The indexing pipeline preserves source bytes alongside each `RawFileExtraction` so that downstream stages (particularly LLM classification) can access original source code without re-reading files from disk.
+
+`extract_call_context()` reads approximately 30 lines around each call site, providing enough surrounding code for the LLM to understand the call's purpose and classify it accurately. `RawDef.byte_start` and `RawDef.byte_end` fields provide exact function boundaries within the source bytes, enabling precise slicing of function bodies for context extraction.
+
+This design avoids re-opening files during classification while keeping memory usage bounded — source bytes are only retained for files that contain unresolved calls requiring LLM analysis.
+
 ### Extractors to Build (Priority Order)
 
 #### Phase 1: Core (Weeks 1-4)
@@ -859,6 +918,25 @@ Find all publish calls, find all subscribe calls, match by topic string. When to
 #### Edge Type 5: Database Connections (Resource Nodes)
 
 Databases become resource nodes, not service nodes. CX infers what the database stores by analyzing ORM models, migrations, or raw SQL. If two services connect to the same `DATABASE_URL` (or a read replica), CX detects the shared data dependency — two services coupled through a database.
+
+#### Cross-Repo Endpoint Matching
+
+`find_cross_repo_matches()` in `network.rs` matches outbound calls to inbound endpoints across all indexed repos. Three matching strategies are applied in order:
+
+1. **Path match.** An outbound HTTP call to `/api/v1/orders` is matched against an inbound endpoint registered at `/api/v1/orders` in another repo.
+2. **gRPC service name match.** A gRPC client stub for `OrderProcessing` is matched against a `RegisterOrderProcessingServer` registration.
+3. **K8s DNS URL match.** An outbound call to `acme-orders.prod.svc.cluster.local:50051` is matched against a repo whose Helm chart deploys under the service name `acme-orders`.
+
+Noise filtering via `is_noise_path()` excludes test files, archive directories, and vendored code from matching to avoid false positives. Deduplication handles cases where multiple git remotes point to the same repository.
+
+#### K8s Gotmpl Parsing
+
+The resolution engine handles Helm Go template syntax in Kubernetes manifests:
+
+- `extract_helm_env_vars()` scans YAML and `.gotmpl` files for environment variable definitions (`name`/`value` pairs in container specs).
+- `replace_gotmpl_expressions()` resolves `{{ }}` template expressions against `values.yaml` defaults.
+- `infer_category_from_url()` classifies resolved URLs by scheme (e.g., `postgres://` becomes a database connection, `grpc://` becomes a gRPC dial).
+- `is_network_value()` detects values that look like network addresses (URLs, host:port patterns, DNS names) to separate network config from non-network config.
 
 ### Progressive Resolution
 
@@ -1164,6 +1242,7 @@ Direct terminal queries for developers:
 cx init                              # index current repo
 cx add <path-or-url>                 # add a repo to the graph
 cx add --role infra <path-or-url>    # add infrastructure repo
+cx remote add <git-url>              # add a remote repo by git URL
 cx context [service]                 # show service structure
 cx path --from <endpoint> --downstream  # trace request flow
 cx impact <symbol>                   # show blast radius
@@ -1173,7 +1252,12 @@ cx log <symbol>                      # edge history
 cx blame <edge>                      # who introduced this
 cx status                            # show index health, gaps, staleness
 cx setup claude-code                 # configure MCP for Claude Code
+cx network                           # show all network boundaries with provenance
+cx network --local-only              # skip cross-repo resolution, show only local calls
+cx network --include-all             # include low-confidence and heuristic-only results
 ```
+
+`cx network` prints a summary header with counts of inbound endpoints, outbound calls, and cross-repo matches, followed by the detailed listing. `cx remote add` accepts a git URL and clones the repo for cross-repo resolution. The `--local-only` flag restricts output to the current repo's calls without pulling remote graphs. The `--include-all` flag disables confidence filtering to show every detected call regardless of classification tier.
 
 ### 3. CI Integration (Third Priority)
 

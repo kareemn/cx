@@ -53,12 +53,34 @@ cd ~/code/my-service
 cx init
 ```
 
-cx indexes your repo with tree-sitter (instant, no dependencies). If `gopls` / `ty` / `tsserver` are installed, cx uses them for type-resolved accuracy.
+cx indexes your repo with tree-sitter (instant, no dependencies). Import-aware FQN resolution classifies most network calls automatically. If `claude` CLI is on PATH, cx optionally uses LLM classification for ambiguous calls (~$0.04/repo).
 
 ```bash
-# What network calls does this service make?
 cx network
+```
 
+```
+Network Boundaries — my-service
+  Inbound: 4 endpoints    Outbound: 7 calls
+
+Inbound Endpoints
+  POST /api/v1/orders           [import-resolved]     src/handlers/orders.go:42
+  POST /api/v1/checkout         [import-resolved]     src/handlers/checkout.go:18
+  GET  /healthz                 [import-resolved]     src/handlers/health.go:10
+  gRPC OrderService.PlaceOrder  [import-resolved]     src/grpc/order.go:25
+
+Outbound Calls
+  grpc    productcatalog:3550   [import-resolved]     src/clients/catalog.go:31
+          ← env PRODUCT_CATALOG_ADDR ← K8s frontend.yaml
+  grpc    cart:7070              [llm-classified]      src/clients/cart.go:19
+          ← env CART_SERVICE_ADDR ← K8s frontend.yaml
+  http    payment-svc:8080/charge [import-resolved]   src/clients/payment.go:44
+  redis   cart-redis:6379       [import-resolved]     src/cache/redis.go:12
+          ← env REDIS_ADDR ← K8s frontend.yaml
+  kafka   order-events          [heuristic]           src/events/publish.go:28
+```
+
+```bash
 # Trace a specific call chain across services
 cx path --from placeOrderHandler --to ProductCatalogService
 
@@ -75,6 +97,44 @@ cx add ~/code/other-service
 cx add ~/code/k8s-manifests
 ```
 
+## Classification Pipeline
+
+cx uses a three-tier approach to classify network calls. Each tier acts as a fallback — you get accurate results even with zero external dependencies, and they improve as you add optional tools.
+
+```
+           ┌──────────────────────────────┐
+Tier 1     │  Import-Aware FQN Resolution │  Free, deterministic, no dependencies
+           │  import "net/http" + http.Get│  → FQN net/http.Get → sink registry
+           └──────────┬───────────────────┘
+                      │ unresolved calls
+           ┌──────────▼───────────────────┐
+Tier 2     │  LLM Classification          │  Optional: claude CLI or ANTHROPIC_API_KEY
+           │  ~30 lines of context → Haiku│  ~$0.04/repo, cached in .cx/graph/llm_cache.json
+           └──────────┬───────────────────┘
+                      │ still unresolved
+           ┌──────────▼───────────────────┐
+Tier 3     │  Heuristic Fallback          │  Pattern matching on receiver/method names
+           └──────────────────────────────┘
+```
+
+**Tier 1: Import-Aware FQN Resolution** — Uses import statements to construct fully-qualified names. `import "net/http"` + `http.Get()` resolves to FQN `net/http.Get`, which matches exactly in the sink registry. Works for Go, Python, TypeScript, and Java. No external dependencies.
+
+**Tier 2: LLM Classification (optional)** — When `claude` CLI is on PATH or `ANTHROPIC_API_KEY` is set, sends ~30 lines of context around each unresolved call to Haiku. Resolves both the KIND (http_client, websocket_server, etc.) and the TARGET (URL, env var, service name). Cached in `.cx/graph/llm_cache.json` so subsequent runs are instant.
+
+**Tier 3: Heuristic Fallback** — Pattern matching on receiver/method names for calls that tiers 1-2 don't cover. Catches obvious patterns like `*.Dial()`, `*.connect()`, `fetch()`.
+
+Every result is tagged with its confidence level:
+- `[import-resolved]` — FQN matched via import alias (deterministic)
+- `[llm-classified]` — LLM confirmed classification and target
+- `[heuristic]` / `[unconfirmed]` — pattern-matched only
+
+| Language | Tier 1 only | + LLM (Tier 2) | + LSP |
+|----------|------------|-----------------|-------|
+| Go | ~85% | ~95% | ~98% |
+| Python | ~70% | ~88% | ~90% |
+| TypeScript/JS | ~75% | ~92% | ~95% |
+| Java | ~80% | ~93% | ~93% |
+
 ## Distributed Graph (like git)
 
 Each repo has a `.cx/` directory (like `.git/`). Teams maintain their own graph and connect to others:
@@ -86,6 +146,8 @@ repo/
     graph/
       self.cxgraph           # this repo's graph (symbols, calls, network boundaries)
       self.network.json      # taint analysis results (provenance chains)
+      llm_cache.json         # cached LLM classification results
+      cache/                 # intermediate analysis artifacts
     config/
       sinks.toml             # custom network function definitions for this repo
       taxonomy.toml          # custom package classifications for this repo
@@ -95,7 +157,7 @@ repo/
 ```
 
 ```bash
-# Add a remote repo's graph
+# Add a remote by git URL — clones, auto-inits, and registers
 cx remote add payment-service https://github.com/org/payment-service
 cx remote pull
 
@@ -107,7 +169,24 @@ cx refresh
 
 # Query across all connected repos
 cx network --all-repos
+
+# Suppress remote data to see local boundaries only
+cx network --local-only
 ```
+
+### Cross-Repo Connections
+
+`cx network` shows data from pulled remotes with a `[remote-name]` prefix and includes a cross-repo connections section that matches outbound calls to inbound endpoints across repos:
+
+```
+Cross-Repo Connections
+  my-service → payment-service
+    grpc payment-svc:8080/charge  →  [payment-service] POST /charge
+  my-service → productcatalog
+    grpc productcatalog:3550      →  [productcatalog] gRPC ProductCatalogService
+```
+
+Matching works by: path (`/ws/s2s`), gRPC service name (`NewS2SClient` ↔ `RegisterS2SServer`), and K8s DNS URL (`.svc.cluster.local`).
 
 ### Getting from 95% to 100%
 
@@ -192,18 +271,12 @@ Extracts all symbols, calls, imports, and string literals in <2s per repo. 100% 
 ### Phase 2: Type Resolution (LSP, optional)
 When language-specific LSP servers are installed, cx resolves every call target to its fully qualified name. This turns `client.connect(addr)` from "some method call" into `"redis.Client.connect"` — enabling exact classification.
 
-| Language | LSP Server | Without LSP | With LSP |
-|----------|-----------|------------|----------|
-| Go | gopls | ~75% | ~98% |
-| Python | ty (Rust, 10-100x faster) | ~60% | ~90% |
-| TypeScript/JS | tsserver | ~65% | ~95% |
-| Java | jdtls / tree-sitter-java | ~70% | ~93% |
-| Kotlin | kotlin-lsp | ~65% | ~88% |
-| C/C++ | clangd | ~55% | ~85% |
-| Rust | rust-analyzer | ~80% | ~98% |
+### Phase 3: Classification Pipeline
+Three-tier classification resolves each call to a network sink (see [Classification Pipeline](#classification-pipeline) above):
 
-### Phase 3: Network Sink Detection
-A registry of ~150 known network functions (exact FQN match, not regex). Covers HTTP, gRPC, WebSocket, Kafka, Redis, databases, SQS, S3, raw TCP — across all supported languages.
+1. **Import-Aware FQN** — constructs fully-qualified names from import statements and matches against the sink registry (~150 known network functions). Free, deterministic, handles most calls.
+2. **LLM (optional)** — sends ambiguous call context to Haiku for classification. Cached per-repo.
+3. **Heuristic** — pattern matching on receiver/method names as final fallback.
 
 ### Phase 4: Backward Taint Analysis
 For each detected network call, traces the address argument backward to its origin. cx classifies each source it finds:
@@ -220,7 +293,7 @@ For each detected network call, traces the address argument backward to its orig
 Cross-file, inter-procedural, depth-bounded at 10 levels with cycle detection.
 
 ### Phase 5: Infrastructure Resolution
-Links code-side env var reads to K8s manifest values to service DNS names. Parses Dockerfiles (EXPOSE, ENTRYPOINT), Helm charts (Go templates with defaults), and K8s Deployment specs.
+Links code-side env var reads to K8s manifest values to service DNS names. Parses Dockerfiles (EXPOSE, ENTRYPOINT), Helm charts (Go templates with defaults), K8s Deployment specs, and Helm `values.yaml.gotmpl` files (extracts env var definitions, detects `.svc.cluster.local` URLs, handles `{{ }}` template expressions).
 
 ### Phase 6: Cross-Service Assembly
 Matches outgoing connection targets to other services' exposed APIs. Works within one repo or across 1000+ repos via the distributed graph protocol.
@@ -276,8 +349,13 @@ cx never re-indexes all repos when adding one. Per-repo graphs are independent:
 | `cx_search` (fuzzy, 1M symbols) | < 10ms |
 | `cx init` (100K LOC repo, no LSP) | < 2s |
 | `cx init` (100K LOC repo, with LSP) | < 5s |
+| `cx init` (100K LOC repo, with LLM) | < 8-15s |
 | `cx add` (1 repo to 1000-repo graph) | < 3s |
 | Graph load from disk (mmap) | < 50ms |
+
+## Output Filtering
+
+cx filters noise by default: test files, archives, examples, vendor directories, and dist folders are excluded from results. Use `--include-all` to see everything. Direction filters (`--inbound`, `--outbound`) apply to all output sections.
 
 ## License
 
