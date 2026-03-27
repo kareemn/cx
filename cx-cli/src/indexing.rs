@@ -27,7 +27,136 @@ pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)]) -> Result<IndexResu
         }
     }
 
+    // LLM integration: try to resolve unresolved targets via Claude CLI
+    if !merged.network_calls.is_empty() {
+        let workspace_root = repos.first().map(|(p, _)| p.as_path());
+        if let Some(root) = workspace_root {
+            upgrade_via_llm(&mut merged.network_calls, root);
+        }
+    }
+
     Ok(pipeline::build_index(merged))
+}
+
+/// Extract ~30 lines of source context around a call site for LLM analysis.
+fn extract_call_context(file_path: &str, line: u32, workspace_root: &std::path::Path) -> Option<String> {
+    let full_path = workspace_root.join(file_path);
+    let content = std::fs::read_to_string(&full_path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let target = (line as usize).saturating_sub(1);
+    let start = target.saturating_sub(15);
+    let end = (target + 15).min(lines.len());
+    Some(lines[start..end].join("\n"))
+}
+
+/// Upgrade heuristic network calls via Claude CLI with source context.
+/// Sends function context to Haiku and asks for both classification AND target resolution.
+/// Silently skips if `claude` CLI is not available.
+fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetworkCall>, workspace_root: &std::path::Path) {
+    // Check if claude CLI is available
+    let claude_check = std::process::Command::new("claude")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match claude_check {
+        Ok(s) if s.success() => {}
+        _ => return,
+    }
+
+    // Collect heuristic calls
+    let heuristic_indices: Vec<usize> = network_calls
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.confidence == Confidence::Heuristic)
+        .map(|(i, _)| i)
+        .collect();
+
+    if heuristic_indices.is_empty() {
+        return;
+    }
+
+    eprintln!("LLM: classifying {} heuristic call(s) via Claude CLI...", heuristic_indices.len());
+
+    let mut upgraded = 0u32;
+    for batch in heuristic_indices.chunks(10) {
+        let mut prompt = String::from(
+            "Classify these network call sites and resolve their targets. For each, respond with ONLY a JSON array.\n\
+             Each entry: {\"idx\": N, \"kind\": \"...\", \"direction\": \"inbound|outbound\", \"target\": \"...\", \"target_source\": \"...\"}\n\n\
+             Kinds: http_client, http_server, grpc_client, grpc_server, websocket_client, websocket_server,\n\
+                    kafka_producer, kafka_consumer, database, redis, sqs, s3, tcp_dial, tcp_listen, not_network\n\
+             Target: the resolved URL, hostname, env var, or \"dynamic\" if unresolvable\n\
+             Target source: literal|env_var|config|parameter|field|concat|service_discovery|dynamic\n\n"
+        );
+
+        for (batch_idx, &call_idx) in batch.iter().enumerate() {
+            let call = &network_calls[call_idx];
+            let context = extract_call_context(&call.file, call.line, workspace_root)
+                .unwrap_or_default();
+            let hint = serde_json::to_string(&call.address_source).unwrap_or_default();
+            prompt.push_str(&format!(
+                "[{}] {}:{} (callee: {}, current: {}, hint: {})\n{}\n\n",
+                batch_idx, call.file, call.line, call.callee_fqn,
+                call.net_kind.as_str(), hint, context
+            ));
+        }
+
+        prompt.push_str("Respond ONLY with a JSON array.\n");
+
+        let result = std::process::Command::new("claude")
+            .args(["-p", &prompt, "--output-format", "json", "--model", "haiku"])
+            .output();
+
+        let output = match result {
+            Ok(o) if o.status.success() => o,
+            _ => continue,
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let result_text = if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            wrapper.get("result").and_then(|v| v.as_str()).unwrap_or(&stdout).to_string()
+        } else {
+            stdout.to_string()
+        };
+
+        // Extract JSON array
+        let classifications: Vec<serde_json::Value> = if let Some(start) = result_text.find('[') {
+            if let Some(end) = result_text.rfind(']') {
+                serde_json::from_str(&result_text[start..=end]).unwrap_or_default()
+            } else { Vec::new() }
+        } else { Vec::new() };
+
+        for entry in &classifications {
+            let idx = entry.get("idx").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+            let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if idx >= batch.len() || kind == "not_network" || kind.is_empty() { continue; }
+
+            if let Some(cat) = parse_network_category(kind) {
+                let call_idx = batch[idx];
+                network_calls[call_idx].net_kind = cat;
+                network_calls[call_idx].confidence = Confidence::LLMClassified;
+                upgraded += 1;
+            }
+        }
+    }
+
+    if upgraded > 0 {
+        eprintln!("LLM: upgraded {} call(s) to LLMClassified", upgraded);
+    }
+}
+
+fn parse_network_category(kind: &str) -> Option<sink_registry::NetworkCategory> {
+    use sink_registry::NetworkCategory::*;
+    match kind {
+        "http_client" => Some(HttpClient), "http_server" => Some(HttpServer),
+        "grpc_client" => Some(GrpcClient), "grpc_server" => Some(GrpcServer),
+        "websocket_client" => Some(WebsocketClient), "websocket_server" => Some(WebsocketServer),
+        "kafka_producer" => Some(KafkaProducer), "kafka_consumer" => Some(KafkaConsumer),
+        "database" => Some(Database), "redis" => Some(Redis),
+        "sqs" => Some(Sqs), "s3" => Some(S3),
+        "tcp_dial" => Some(TcpDial), "tcp_listen" => Some(TcpListen),
+        _ => None,
+    }
 }
 
 /// Try to upgrade heuristic network call classifications using LSP type info.
