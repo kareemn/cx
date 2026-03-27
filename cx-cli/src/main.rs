@@ -81,6 +81,9 @@ enum Commands {
         /// Filter by service/deployable name
         #[arg(long)]
         service: Option<String>,
+        /// Show only local repo data (exclude remote repos)
+        #[arg(long)]
+        local_only: bool,
     },
     /// Re-index repos that have changed since last index
     Refresh,
@@ -145,7 +148,8 @@ fn main() {
             ref kind,
             ref direction,
             ref service,
-        } => commands::network::run(&root, json, kind.as_deref(), direction.as_deref(), service.as_deref()),
+            local_only,
+        } => commands::network::run(&root, json, kind.as_deref(), direction.as_deref(), service.as_deref(), local_only),
         Commands::Refresh => commands::refresh::run(&root),
         Commands::Remote { action } => match action {
             RemoteAction::Add { ref name, ref path } => {

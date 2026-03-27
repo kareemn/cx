@@ -293,18 +293,36 @@ fn update_index_from_remotes(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Return current UTC timestamp as ISO 8601 string (no chrono dependency).
+/// Return current UTC timestamp as ISO 8601 string using std::time (portable, no subprocess).
 fn chrono_now() -> String {
-    // Use std::process::Command to get UTC time to avoid adding a dependency
-    let output = std::process::Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
-        _ => "unknown".to_string(),
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Manual UTC formatting to avoid chrono dependency
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+    // Days since Unix epoch to Y-M-D (simplified calendar)
+    let mut y = 1970i64;
+    let mut remaining = days as i64;
+    loop {
+        let year_days = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+        if remaining < year_days { break; }
+        remaining -= year_days;
+        y += 1;
     }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0usize;
+    while m < 12 && remaining >= month_days[m] {
+        remaining -= month_days[m];
+        m += 1;
+    }
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m + 1, remaining + 1, hours, minutes, seconds)
 }
 
 #[cfg(test)]

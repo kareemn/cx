@@ -7,17 +7,17 @@ use cx_extractors::taint::ResolvedNetworkCall;
 use std::path::Path;
 
 /// Run `cx network` — list all detected network calls and exposed APIs with provenance.
-pub fn run(root: &Path, json: bool, kind: Option<&str>, direction: Option<&str>, service: Option<&str>) -> Result<()> {
+pub fn run(root: &Path, json: bool, kind: Option<&str>, direction: Option<&str>, service: Option<&str>, local_only: bool) -> Result<()> {
     let graph = super::init::load_graph(root)?;
 
     // Load local taint analysis results
     let mut taint_calls = load_network_json(root);
 
-    // Load remote network data from .cx/remotes/*.network.json
-    let remote_calls = load_remote_network_json(root);
-
-    // Merge remote calls (prefixed with remote name)
-    taint_calls.extend(remote_calls);
+    // Load remote network data unless --local-only
+    if !local_only {
+        let remote_calls = load_remote_network_json(root);
+        taint_calls.extend(remote_calls);
+    }
 
     // Deduplicate by (file, line) — keep highest confidence entry
     dedup_by_location(&mut taint_calls);

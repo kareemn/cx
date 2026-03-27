@@ -103,12 +103,14 @@ struct LlmCacheEntry {
 /// Upgrade heuristic network calls via Claude CLI (Haiku model).
 /// Silently skips if `claude` CLI is not on PATH.
 fn upgrade_via_llm(network_calls: &mut Vec<ResolvedNetworkCall>, root: &std::path::Path) {
-    // Check if claude CLI is available
-    let claude_check = std::process::Command::new("which")
-        .arg("claude")
-        .output();
+    // Check if claude CLI is available (portable: use claude --version, not which)
+    let claude_check = std::process::Command::new("claude")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     match claude_check {
-        Ok(o) if o.status.success() => {}
+        Ok(s) if s.success() => {}
         _ => return, // claude not available, skip silently
     }
 
