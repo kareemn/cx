@@ -379,7 +379,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
     let id_counter = AtomicU32::new(0);
 
     // Step 2-4: Parse and extract in parallel, also scanning for gRPC patterns
-    type PerFileResult = (ExtractionResult, StringInterner, Vec<String>, GrpcScanResult, Option<RawFileExtraction>, String);
+    type PerFileResult = (ExtractionResult, StringInterner, Vec<String>, GrpcScanResult, Option<RawFileExtraction>, String, Vec<u8>);
     let per_file_results: Vec<PerFileResult> =
         all_repo_files
             .par_iter()
@@ -402,7 +402,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
                     Ok(s) => s,
                     Err(e) => {
                         errors.push(format!("{}: {}", rf.path.display(), e));
-                        return (result, strings, errors, grpc_result, raw_extraction, String::new());
+                        return (result, strings, errors, grpc_result, raw_extraction, String::new(), Vec::new());
                     }
                 };
 
@@ -411,21 +411,21 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
                 let mut parser = tree_sitter::Parser::new();
                 if parser.set_language(&ts_lang).is_err() {
                     errors.push(format!("{}: failed to set language", rf.path.display()));
-                    return (result, strings, errors, grpc_result, raw_extraction, String::new());
+                    return (result, strings, errors, grpc_result, raw_extraction, String::new(), Vec::new());
                 }
 
                 let tree = match parser.parse(&source, None) {
                     Some(t) => t,
                     None => {
                         errors.push(format!("{}: parse failed", rf.path.display()));
-                        return (result, strings, errors, grpc_result, raw_extraction, String::new());
+                        return (result, strings, errors, grpc_result, raw_extraction, String::new(), Vec::new());
                     }
                 };
 
                 // Create extractor
                 let extractor = match grammars::extractor_for_language(lang) {
                     Some(e) => e,
-                    None => return (result, strings, errors, grpc_result, raw_extraction, String::new()),
+                    None => return (result, strings, errors, grpc_result, raw_extraction, String::new(), Vec::new()),
                 };
 
                 // Compute repo-relative path
@@ -475,7 +475,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
                 }
 
                 let path_str_owned = path_str.to_string();
-                (result, strings, errors, grpc_result, raw_extraction, path_str_owned)
+                (result, strings, errors, grpc_result, raw_extraction, path_str_owned, source)
             })
             .collect();
 
@@ -515,7 +515,8 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
     let mut all_unresolved: Vec<UnresolvedCall> = Vec::new();
 
     // Collect raw extractions for taint analysis (run after merge when strings are unified)
-    let mut raw_extractions: Vec<(RawFileExtraction, StringInterner, String)> = Vec::new();
+    // 4th element is the source bytes for later LLM classification.
+    let mut raw_extractions: Vec<(RawFileExtraction, StringInterner, String, Vec<u8>)> = Vec::new();
 
     // Collect gRPC data per repo
     let mut grpc_clients_by_repo: rustc_hash::FxHashMap<u16, Vec<GrpcClientStub>> =
@@ -533,7 +534,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
         })
         .collect();
 
-    for (i, (result, file_strings, errors, grpc_scan, raw_ext, path_str)) in per_file_results.into_iter().enumerate()
+    for (i, (result, file_strings, errors, grpc_scan, raw_ext, path_str, source_bytes)) in per_file_results.into_iter().enumerate()
     {
         all_errors.extend(errors);
 
@@ -610,8 +611,9 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
         }
 
         // Stash raw extraction for taint analysis (with its own string interner)
+        // Preserve source bytes for later LLM classification.
         if let Some(raw) = raw_ext {
-            raw_extractions.push((raw, file_strings, path_str));
+            raw_extractions.push((raw, file_strings, path_str, source_bytes));
         }
     }
 
@@ -811,7 +813,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
         rustc_hash::FxHashMap::default();
     let mut all_const_map: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
 
-    for (raw, file_strings, path_str) in &raw_extractions {
+    for (raw, file_strings, path_str, _source_bytes) in &raw_extractions {
         // Use STRING_NONE as file_id — we extract direct sinks manually with the real path
         let file_id = cx_core::graph::nodes::STRING_NONE;
         let summaries = taint::analyze_file(raw, file_id, file_strings);
@@ -828,7 +830,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
                     address_source: sink.address_source.clone(),
                     file: path_str.clone(),
                     line: sink.line,
-                    confidence: taint::Confidence::Heuristic,
+                    confidence: sink.confidence,
                 });
             }
         }

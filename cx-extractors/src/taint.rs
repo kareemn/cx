@@ -63,8 +63,78 @@ pub enum AddressSource {
         flag_name: String,
         default_value: Option<String>,
     },
+    /// A service discovery lookup (e.g. Consul, Eureka, K8s DNS).
+    ServiceDiscovery {
+        service_name: String,
+        mechanism: String,
+    },
     /// Dynamically computed — cannot resolve statically.
     Dynamic { hint: String },
+}
+
+// ─── LLM result merging ──────────────────────────────────────────────────────
+
+/// Merge an LLM classification into an existing `ResolvedNetworkCall`.
+///
+/// Returns `true` if the call was updated, `false` if the LLM result was
+/// "not_network" or otherwise unrecognized (the call is left unchanged).
+pub fn apply_llm_classification(call: &mut ResolvedNetworkCall, llm: &LLMClassification) -> bool {
+    // 1. Parse kind — reject "not_network" and unrecognized values.
+    let category = match llm.kind.as_str() {
+        "not_network" => return false,
+        "http_server" => NetworkCategory::HttpServer,
+        "http_client" => NetworkCategory::HttpClient,
+        "grpc_server" => NetworkCategory::GrpcServer,
+        "grpc_client" => NetworkCategory::GrpcClient,
+        "websocket_server" => NetworkCategory::WebsocketServer,
+        "websocket_client" => NetworkCategory::WebsocketClient,
+        "kafka_producer" => NetworkCategory::KafkaProducer,
+        "kafka_consumer" => NetworkCategory::KafkaConsumer,
+        "database" => NetworkCategory::Database,
+        "redis" => NetworkCategory::Redis,
+        "sqs" => NetworkCategory::Sqs,
+        "s3" => NetworkCategory::S3,
+        "tcp_dial" => NetworkCategory::TcpDial,
+        "tcp_listen" => NetworkCategory::TcpListen,
+        _ => return false,
+    };
+
+    // 2. Update net_kind.
+    call.net_kind = category;
+
+    // 3. Set confidence to LLMClassified.
+    call.confidence = Confidence::LLMClassified;
+
+    // 4. If LLM provides a target and existing address_source is Dynamic with empty hint,
+    //    upgrade the source based on target_source.
+    if let (Some(target), Some(source_type)) = (&llm.target, &llm.target_source) {
+        let is_empty_dynamic = matches!(&call.address_source, AddressSource::Dynamic { hint } if hint.is_empty());
+        if is_empty_dynamic {
+            call.address_source = match source_type.as_str() {
+                "literal" => AddressSource::Literal {
+                    value: target.clone(),
+                },
+                "env_var" => AddressSource::EnvVar {
+                    var_name: target.clone(),
+                    k8s_value: None,
+                },
+                "parameter" => AddressSource::Parameter {
+                    func: target.clone(),
+                    param_idx: 0,
+                    caller_sources: vec![],
+                },
+                "service_discovery" => AddressSource::ServiceDiscovery {
+                    service_name: llm.service_name.clone().unwrap_or_else(|| target.clone()),
+                    mechanism: "unknown".to_string(),
+                },
+                _ => AddressSource::Dynamic {
+                    hint: format!("llm: {}", target),
+                },
+            };
+        }
+    }
+
+    true
 }
 
 // ─── Flow facts ──────────────────────────────────────────────────────────────
@@ -134,6 +204,7 @@ pub struct NetworkSink {
     pub address_source: AddressSource,
     pub file: StringId,
     pub line: u32,
+    pub confidence: Confidence,
 }
 
 /// Per-function summary of data flow to network sinks.
@@ -160,11 +231,33 @@ pub struct ResolvedNetworkCall {
     pub confidence: Confidence,
 }
 
-/// Whether the result was type-confirmed (via LSP) or heuristic.
+/// Whether the result was type-confirmed (via LSP), import-resolved, or heuristic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Confidence {
     TypeConfirmed,
+    #[serde(rename = "llm_classified")]
+    LLMClassified,
+    ImportResolved,
     Heuristic,
+}
+
+/// Classification result from an LLM analyzing ambiguous network calls.
+///
+/// Used by the LLM classification pipeline to enrich `ResolvedNetworkCall` entries
+/// that were originally tagged as Dynamic or heuristic-only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LLMClassification {
+    /// The network category string (e.g. "http_client", "grpc_client", "not_network").
+    pub kind: String,
+    /// Direction: "inbound" or "outbound".
+    pub direction: String,
+    /// The resolved target address/URL, if the LLM could determine it.
+    pub target: Option<String>,
+    /// How the target was sourced: "literal", "env_var", "parameter", "service_discovery".
+    pub target_source: Option<String>,
+    /// Service name for service-discovery targets.
+    pub service_name: Option<String>,
 }
 
 // ─── Known env var reader patterns ───────────────────────────────────────────
@@ -612,7 +705,7 @@ pub fn analyze_file(
             };
 
             // Try exact FQN match first (if we had LSP, the callee would be fully qualified)
-            let fqn_candidates = build_fqn_candidates(receiver, callee, raw);
+            let (fqn_candidates, resolved_via_import) = build_fqn_candidates(receiver, callee, raw, strings);
             let sink_entry = fqn_candidates
                 .iter()
                 .find_map(|fqn| sink_registry::lookup_sink(fqn));
@@ -624,10 +717,15 @@ pub fn analyze_file(
                 ""
             };
 
-            let (net_kind, addr_arg_idx) = if let Some(entry) = sink_entry {
-                (entry.category, entry.addr_arg_index)
+            let (net_kind, addr_arg_idx, confidence) = if let Some(entry) = sink_entry {
+                let conf = if resolved_via_import {
+                    Confidence::ImportResolved
+                } else {
+                    Confidence::Heuristic
+                };
+                (entry.category, entry.addr_arg_index, conf)
             } else if let Some(cat) = sink_registry::heuristic_classify_call(receiver, callee, first_arg_str) {
-                (cat, 0) // heuristic defaults to arg 0
+                (cat, 0, Confidence::Heuristic) // heuristic defaults to arg 0
             } else {
                 continue; // not a network sink
             };
@@ -644,6 +742,7 @@ pub fn analyze_file(
                 address_source,
                 file: file_id,
                 line: call.line,
+                confidence,
             });
         }
 
@@ -663,18 +762,89 @@ pub fn analyze_file(
     summaries
 }
 
-/// Build FQN candidates from receiver + callee, considering import aliases.
-fn build_fqn_candidates(receiver: &str, callee: &str, _raw: &RawFileExtraction) -> Vec<String> {
-    let mut candidates = Vec::new();
+/// Derive the default alias a language would use for an import path when no
+/// explicit alias is given.
+///
+/// - Go: last segment after `/` (e.g. `"github.com/gorilla/websocket"` -> `"websocket"`)
+/// - Python: the path itself (e.g. `"requests"` -> `"requests"`)
+/// - Java: last segment after `.` (e.g. `"java.net.HttpURLConnection"` -> `"HttpURLConnection"`)
+/// - C/C++: `None` (no alias concept)
+fn default_alias_for_lang(import_path: &str, lang: RawLang) -> Option<String> {
+    match lang {
+        RawLang::Go => {
+            // Strip Go major version suffix (/v2, /v3, ...) before taking last segment
+            let path = if let Some(stripped) = import_path.strip_suffix(|c: char| c.is_ascii_digit()) {
+                stripped.strip_suffix("/v").unwrap_or(import_path)
+            } else {
+                import_path
+            };
+            path.rsplit('/').next().map(|s| s.to_string())
+        }
+        RawLang::Python => {
+            // The import path itself serves as the alias
+            Some(import_path.to_string())
+        }
+        RawLang::Java => {
+            // Last segment after '.'
+            import_path.rsplit('.').next().map(|s| s.to_string())
+        }
+        RawLang::C | RawLang::Cpp => None,
+        RawLang::TypeScript => {
+            // Use last segment after '/'
+            import_path.rsplit('/').next().map(|s| s.to_string())
+        }
+    }
+}
 
+/// Build FQN candidates from receiver + callee, using import aliases to
+/// reconstruct fully-qualified names that match the sink registry.
+///
+/// Returns a tuple of (candidates, resolved_via_import) so callers can set
+/// confidence to `ImportResolved` when an import alias produced the match.
+fn build_fqn_candidates(
+    receiver: &str,
+    callee: &str,
+    raw: &RawFileExtraction,
+    strings: &StringInterner,
+) -> (Vec<String>, bool) {
+    let mut candidates = Vec::new();
+    let mut resolved_via_import = false;
+
+    // Always include the direct "receiver.callee" or bare callee
     if !receiver.is_empty() {
-        // Direct: receiver.callee
         candidates.push(format!("{}.{}", receiver, callee));
     } else {
         candidates.push(callee.to_string());
     }
 
-    candidates
+    // Build alias -> import_path map from raw.imports
+    if !receiver.is_empty() {
+        for imp in &raw.imports {
+            let import_path = strings.get(imp.path);
+
+            // Determine the effective alias for this import
+            let effective_alias = if imp.alias != STRING_NONE {
+                // Explicit alias provided
+                Some(strings.get(imp.alias).to_string())
+            } else {
+                // Derive default alias from the language conventions
+                default_alias_for_lang(import_path, imp.lang)
+            };
+
+            if let Some(alias) = effective_alias {
+                if alias == receiver {
+                    // Construct FQN: import_path.callee
+                    let fqn = format!("{}.{}", import_path, callee);
+                    resolved_via_import = true;
+                    if !candidates.contains(&fqn) {
+                        candidates.push(fqn);
+                    }
+                }
+            }
+        }
+    }
+
+    (candidates, resolved_via_import)
 }
 
 // ─── Inter-procedural propagation ────────────────────────────────────────────
@@ -1245,6 +1415,73 @@ func handler() {
         assert!(json.contains("localhost:50051"));
     }
 
+    // ─── LLM classification integration ────────────────────────────
+
+    #[test]
+    fn apply_llm_upgrades_dynamic_to_literal() {
+        let mut call = ResolvedNetworkCall {
+            net_kind: NetworkCategory::HttpClient,
+            callee_fqn: "http.Get".to_string(),
+            address_source: AddressSource::Dynamic { hint: String::new() },
+            file: "main.go".to_string(),
+            line: 10,
+            confidence: Confidence::Heuristic,
+        };
+        let llm = LLMClassification {
+            kind: "http_client".to_string(),
+            direction: "outbound".to_string(),
+            target: Some("http://api.example.com".to_string()),
+            target_source: Some("literal".to_string()),
+            service_name: None,
+        };
+        let updated = apply_llm_classification(&mut call, &llm);
+        assert!(updated, "should return true when call is updated");
+        assert_eq!(call.net_kind, NetworkCategory::HttpClient);
+        match &call.address_source {
+            AddressSource::Literal { value } => {
+                assert_eq!(value, "http://api.example.com");
+            }
+            other => panic!("expected Literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn apply_llm_not_network_returns_false() {
+        let mut call = ResolvedNetworkCall {
+            net_kind: NetworkCategory::HttpClient,
+            callee_fqn: "doSomething".to_string(),
+            address_source: AddressSource::Dynamic { hint: String::new() },
+            file: "main.go".to_string(),
+            line: 5,
+            confidence: Confidence::Heuristic,
+        };
+        let original_kind = call.net_kind;
+        let llm = LLMClassification {
+            kind: "not_network".to_string(),
+            direction: "outbound".to_string(),
+            target: None,
+            target_source: None,
+            service_name: None,
+        };
+        let updated = apply_llm_classification(&mut call, &llm);
+        assert!(!updated, "should return false for not_network");
+        assert_eq!(call.net_kind, original_kind, "kind should remain unchanged");
+    }
+
+    #[test]
+    fn service_discovery_round_trips_json() {
+        let source = AddressSource::ServiceDiscovery {
+            service_name: "payment-service".to_string(),
+            mechanism: "consul".to_string(),
+        };
+        let json = serde_json::to_string(&source).expect("serialize");
+        assert!(json.contains("payment-service"));
+        assert!(json.contains("consul"));
+
+        let deserialized: AddressSource = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized, source);
+    }
+
     // ─── looks_like_address ──────────────────────────────────────────
 
     #[test]
@@ -1257,5 +1494,89 @@ func handler() {
         assert!(!looks_like_address("hello"));
         assert!(!looks_like_address("myVariable"));
         assert!(!looks_like_address("fmt"));
+    }
+
+    // ─── FQN resolution via import aliases ────────────────────────────
+
+    /// Helper to build a minimal RawFileExtraction with given imports and calls,
+    /// then run build_fqn_candidates.
+    fn make_raw_with_imports(
+        lang: RawLang,
+        imports: Vec<(&str, &str)>, // (path, alias) — alias="" means no alias
+        strings: &mut StringInterner,
+    ) -> RawFileExtraction {
+        use crate::raw_extract::RawImport;
+
+        let mut raw = RawFileExtraction::new(lang);
+        for (path, alias) in imports {
+            let path_id = strings.intern(path);
+            let alias_id = if alias.is_empty() {
+                STRING_NONE
+            } else {
+                strings.intern(alias)
+            };
+            raw.imports.push(RawImport {
+                path: path_id,
+                alias: alias_id,
+                line: 1,
+                is_system: false,
+                lang,
+            });
+        }
+        raw
+    }
+
+    #[test]
+    fn go_aliased_import_resolves_fqn() {
+        let mut strings = StringInterner::new();
+        let raw = make_raw_with_imports(
+            RawLang::Go,
+            vec![("github.com/gorilla/websocket", "ws")],
+            &mut strings,
+        );
+
+        let (candidates, resolved) = build_fqn_candidates("ws", "Dial", &raw, &strings);
+        assert!(
+            candidates.contains(&"github.com/gorilla/websocket.Dial".to_string()),
+            "should resolve aliased import to FQN, got: {:?}",
+            candidates
+        );
+        assert!(resolved, "should flag as resolved via import");
+    }
+
+    #[test]
+    fn go_default_import_resolves_fqn() {
+        let mut strings = StringInterner::new();
+        let raw = make_raw_with_imports(
+            RawLang::Go,
+            vec![("net/http", "")], // no explicit alias
+            &mut strings,
+        );
+
+        let (candidates, resolved) = build_fqn_candidates("http", "Get", &raw, &strings);
+        assert!(
+            candidates.contains(&"net/http.Get".to_string()),
+            "should resolve default Go alias to FQN, got: {:?}",
+            candidates
+        );
+        assert!(resolved, "should flag as resolved via import");
+    }
+
+    #[test]
+    fn python_import_resolves_fqn() {
+        let mut strings = StringInterner::new();
+        let raw = make_raw_with_imports(
+            RawLang::Python,
+            vec![("requests", "")], // no explicit alias
+            &mut strings,
+        );
+
+        let (candidates, resolved) = build_fqn_candidates("requests", "get", &raw, &strings);
+        assert!(
+            candidates.contains(&"requests.get".to_string()),
+            "should resolve Python import to FQN, got: {:?}",
+            candidates
+        );
+        assert!(resolved, "should flag as resolved via import");
     }
 }

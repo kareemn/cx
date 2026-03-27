@@ -1,20 +1,61 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
-/// Run `cx remote add <name> <path>` — register a remote graph source.
+/// Run `cx remote add <name> <path_or_url>` — register a remote graph source.
+/// Accepts either a local filesystem path or a git URL (https:// or git@).
+/// For git URLs, clones the repo into .cx/remotes/clones/{name}/ and uses that as the path.
 pub fn run_add(root: &Path, name: &str, remote_path: &str) -> Result<()> {
-    let remote = Path::new(remote_path)
-        .canonicalize()
-        .with_context(|| format!("remote path not found: {}", remote_path))?;
+    let remote = if is_git_url(remote_path) {
+        // Clone the git repo into .cx/remotes/clones/{name}/
+        let clones_dir = root.join(".cx").join("remotes").join("clones");
+        std::fs::create_dir_all(&clones_dir)?;
+        let clone_dest = clones_dir.join(name);
 
-    // Validate that the remote has a .cx directory
-    let remote_cx = remote.join(".cx");
-    if !remote_cx.exists() {
-        bail!(
-            "{} is not a cx workspace (no .cx/ directory). Run `cx init` there first.",
-            remote.display()
-        );
-    }
+        if clone_dest.exists() {
+            // Pull latest instead of re-cloning
+            eprintln!("Updating existing clone for '{}'...", name);
+            let status = std::process::Command::new("git")
+                .args(["pull", "--ff-only"])
+                .current_dir(&clone_dest)
+                .status()
+                .with_context(|| "failed to run git pull")?;
+            if !status.success() {
+                eprintln!("Warning: git pull failed, using existing clone");
+            }
+        } else {
+            eprintln!("Cloning {} into {}...", remote_path, clone_dest.display());
+            let status = std::process::Command::new("git")
+                .args(["clone", "--depth", "1", remote_path, clone_dest.to_str().unwrap_or(".")])
+                .status()
+                .with_context(|| format!("failed to clone {}", remote_path))?;
+            if !status.success() {
+                bail!("git clone failed for {}", remote_path);
+            }
+        }
+
+        // Check if the cloned repo has a .cx directory
+        let clone_cx = clone_dest.join(".cx");
+        if !clone_cx.exists() {
+            eprintln!("Cloned repo has no .cx/ directory. Running `cx init` on it...");
+            super::init::run(&clone_dest)?;
+        }
+
+        clone_dest
+    } else {
+        let local = Path::new(remote_path)
+            .canonicalize()
+            .with_context(|| format!("remote path not found: {}", remote_path))?;
+
+        // Validate that the remote has a .cx directory
+        let remote_cx = local.join(".cx");
+        if !remote_cx.exists() {
+            bail!(
+                "{} is not a cx workspace (no .cx/ directory). Run `cx init` there first.",
+                local.display()
+            );
+        }
+        local
+    };
 
     let mut config = crate::config::load(root).unwrap_or_default();
     let added = crate::config::add_remote(&mut config, name.to_string(), remote.clone());
@@ -25,6 +66,13 @@ pub fn run_add(root: &Path, name: &str, remote_path: &str) -> Result<()> {
     crate::config::save(root, &config)?;
     eprintln!("Added remote '{}' -> {}", name, remote.display());
     Ok(())
+}
+
+/// Check if a string looks like a git URL.
+fn is_git_url(s: &str) -> bool {
+    s.starts_with("https://") || s.starts_with("http://")
+        || s.starts_with("git@") || s.starts_with("ssh://")
+        || s.ends_with(".git")
 }
 
 /// Run `cx remote pull` — pull graphs from all (or a specific) remote.

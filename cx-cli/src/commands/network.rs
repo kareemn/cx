@@ -10,8 +10,17 @@ use std::path::Path;
 pub fn run(root: &Path, json: bool, kind: Option<&str>, direction: Option<&str>, service: Option<&str>) -> Result<()> {
     let graph = super::init::load_graph(root)?;
 
-    // Load taint analysis results if available
-    let taint_calls = load_network_json(root);
+    // Load local taint analysis results
+    let mut taint_calls = load_network_json(root);
+
+    // Load remote network data from .cx/remotes/*.network.json
+    let remote_calls = load_remote_network_json(root);
+
+    // Merge remote calls (prefixed with remote name)
+    taint_calls.extend(remote_calls);
+
+    // Deduplicate by (file, line) — keep highest confidence entry
+    dedup_by_location(&mut taint_calls);
 
     let result = build_network_report(&graph, &taint_calls, kind, direction, service);
 
@@ -32,6 +41,84 @@ pub fn load_network_json(root: &Path) -> Vec<ResolvedNetworkCall> {
         return Vec::new();
     };
     serde_json::from_str(&content).unwrap_or_default()
+}
+
+/// Load network.json files from all pulled remotes in .cx/remotes/.
+/// Prefixes file paths with [remote_name] for disambiguation.
+fn load_remote_network_json(root: &Path) -> Vec<ResolvedNetworkCall> {
+    let remotes_dir = root.join(".cx").join("remotes");
+    let mut all_calls = Vec::new();
+
+    let entries = match std::fs::read_dir(&remotes_dir) {
+        Ok(e) => e,
+        Err(_) => return all_calls,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.ends_with(".network.json") {
+            continue;
+        }
+        let remote_name = name.trim_end_matches(".network.json");
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut calls: Vec<ResolvedNetworkCall> = match serde_json::from_str(&content) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Prefix file paths with remote name for disambiguation
+        for call in &mut calls {
+            call.file = format!("[{}] {}", remote_name, call.file);
+        }
+        all_calls.extend(calls);
+    }
+
+    all_calls
+}
+
+/// Deduplicate network calls by (file, line).
+/// When the same location appears with multiple confidence levels, keep the highest.
+fn dedup_by_location(calls: &mut Vec<ResolvedNetworkCall>) {
+    use std::collections::HashMap;
+    let mut best: HashMap<(String, u32), usize> = HashMap::new();
+
+    // Confidence ordering: TypeConfirmed > LLMClassified > ImportResolved > Heuristic
+    fn confidence_rank(c: cx_extractors::taint::Confidence) -> u8 {
+        match c {
+            cx_extractors::taint::Confidence::TypeConfirmed => 4,
+            cx_extractors::taint::Confidence::LLMClassified => 3,
+            cx_extractors::taint::Confidence::ImportResolved => 2,
+            cx_extractors::taint::Confidence::Heuristic => 1,
+        }
+    }
+
+    let mut keep = vec![false; calls.len()];
+    for (i, call) in calls.iter().enumerate() {
+        let key = (call.file.clone(), call.line);
+        if let Some(&prev_idx) = best.get(&key) {
+            if confidence_rank(call.confidence) > confidence_rank(calls[prev_idx].confidence) {
+                keep[prev_idx] = false;
+                keep[i] = true;
+                best.insert(key, i);
+            }
+            // else: keep the previous one, skip this duplicate
+        } else {
+            keep[i] = true;
+            best.insert(key, i);
+        }
+    }
+
+    let mut i = 0;
+    calls.retain(|_| {
+        let k = keep[i];
+        i += 1;
+        k
+    });
 }
 
 /// Build the full network report from the graph and taint analysis results.
@@ -87,7 +174,14 @@ pub fn build_network_report(
         network_calls.push(entry);
     }
 
-    // Apply direction filter
+    // Apply direction filter to network_calls (not just top-level sections)
+    if let Some(dir) = direction_filter {
+        network_calls.retain(|call| {
+            let call_dir = call["direction"].as_str().unwrap_or("outbound");
+            call_dir == dir
+        });
+    }
+
     let show_outbound = direction_filter.is_none()
         || direction_filter == Some("outbound");
     let show_inbound = direction_filter.is_none()
@@ -95,10 +189,10 @@ pub fn build_network_report(
 
     let mut result = serde_json::Map::new();
 
-    if show_outbound {
+    if show_outbound || direction_filter.is_none() {
         result.insert("network_calls".to_string(), serde_json::Value::Array(network_calls));
     }
-    if show_inbound {
+    if show_inbound || direction_filter.is_none() {
         result.insert("exposed_apis".to_string(), serde_json::Value::Array(exposed_apis));
     }
 
@@ -113,7 +207,9 @@ fn taint_call_to_json(tc: &ResolvedNetworkCall) -> serde_json::Value {
         "kind": tc.net_kind.as_str(),
         "direction": taint_direction(tc.net_kind),
         "callee": tc.callee_fqn,
-        "confidence": format!("{:?}", tc.confidence).to_lowercase(),
+        "confidence": serde_json::to_value(&tc.confidence).ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| "heuristic".to_string()),
         "address_source": tc.address_source,
     });
 
@@ -187,6 +283,9 @@ fn format_address_source(source: &cx_extractors::taint::AddressSource) -> String
             } else {
                 format!("flag(--{})", flag_name)
             }
+        }
+        AddressSource::ServiceDiscovery { service_name, mechanism } => {
+            format!("service-discovery({}, {})", mechanism, service_name)
         }
         AddressSource::Dynamic { hint } => {
             if hint.is_empty() {
@@ -281,7 +380,9 @@ fn collect_connects_edges(
             if let Some(tc) = taint_match {
                 entry["callee"] = serde_json::Value::String(tc.callee_fqn.clone());
                 entry["confidence"] = serde_json::Value::String(
-                    format!("{:?}", tc.confidence).to_lowercase()
+                    serde_json::to_value(&tc.confidence).ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| "heuristic".to_string())
                 );
                 entry["address_source"] = serde_json::to_value(&tc.address_source)
                     .unwrap_or(serde_json::Value::Null);
@@ -620,7 +721,9 @@ fn print_human_readable(report: &serde_json::Value) {
                 let direction = call["direction"].as_str().unwrap_or("outbound");
                 let confidence = call.get("confidence").and_then(|v| v.as_str());
                 let conf_tag = match confidence {
-                    Some("typeconfirmed") => " [type-confirmed]",
+                    Some("type_confirmed") => " [type-confirmed]",
+                    Some("llm_classified") => " [llm-classified]",
+                    Some("import_resolved") => " [import-resolved]",
                     Some("heuristic") => " [heuristic]",
                     _ => "",
                 };
@@ -832,6 +935,16 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
         let report = build_network_report(&graph, &[], None, None, None);
         // Just ensure it doesn't panic
         print_human_readable(&report);
+    }
+
+    #[test]
+    fn format_service_discovery() {
+        let source = cx_extractors::taint::AddressSource::ServiceDiscovery {
+            service_name: "payment-service".to_string(),
+            mechanism: "consul".to_string(),
+        };
+        let formatted = format_address_source(&source);
+        assert_eq!(formatted, "service-discovery(consul, payment-service)");
     }
 
     #[test]
