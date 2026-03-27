@@ -40,6 +40,7 @@ pub fn run(root: &Path, json: bool, kind: Option<&str>, direction: Option<&str>,
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
+        print_summary_header(&result);
         print_human_readable(&result);
     }
 
@@ -59,10 +60,21 @@ pub fn load_network_json(root: &Path) -> Vec<ResolvedNetworkCall> {
 /// Check whether a file path looks like test, archive, example, or vendor noise.
 fn is_noise_path(path: &str) -> bool {
     let p = path.to_lowercase();
-    p.contains("/test/") || p.contains("/tests/") || p.ends_with("_test.go")
-        || p.contains("/archive/") || p.contains("/examples/") || p.contains("/vendor/")
+    // Test directories and files
+    p.contains("/test/") || p.contains("/tests/") || p.contains("e2e_test/")
+        || p.contains("/testutil/") || p.contains("/testdata/")
+        || p.ends_with("_test.go") || p.contains("test_")
+        // Non-production directories
+        || p.contains("/archive/") || p.contains("/examples/") || p.contains("/example/")
+        || p.contains("/vendor/") || p.contains("/third_party/")
+        // Build artifacts and bundled code
         || p.contains("/dist/") || p.contains("/build/") || p.contains("/node_modules/")
         || p.ends_with(".min.js")
+        // WASM build output and demo files
+        || p.contains("wasm/build/") || p.contains("/wasm/") || p.contains("demo/")
+        // Paths starting with archive/ or examples/ (no leading /)
+        || p.starts_with("archive/") || p.starts_with("examples/") || p.starts_with("demo/")
+        || p.starts_with("e2e_test/") || p.starts_with("test/")
 }
 
 /// Load network.json files from all pulled remotes in .cx/remotes/.
@@ -183,7 +195,13 @@ pub fn build_network_report(
         network_calls.push(entry);
     }
 
-    // Apply direction filter
+    // Apply direction filter to network_calls entries
+    if let Some(dir) = direction_filter {
+        network_calls.retain(|call| {
+            call["direction"].as_str().unwrap_or("outbound") == dir
+        });
+    }
+
     let show_outbound = direction_filter.is_none()
         || direction_filter == Some("outbound");
     let show_inbound = direction_filter.is_none()
@@ -191,10 +209,10 @@ pub fn build_network_report(
 
     let mut result = serde_json::Map::new();
 
-    if show_outbound {
+    if show_outbound || direction_filter.is_none() {
         result.insert("network_calls".to_string(), serde_json::Value::Array(network_calls));
     }
-    if show_inbound {
+    if show_inbound || direction_filter.is_none() {
         result.insert("exposed_apis".to_string(), serde_json::Value::Array(exposed_apis));
     }
 
@@ -254,6 +272,10 @@ fn find_cross_repo_matches(report: &serde_json::Value, root: &Path) -> Vec<serde
 
     // Load global index for additional endpoint/target data
     load_global_index_data(root, &mut endpoints, &mut outbounds);
+
+    // Filter noise from both sides before matching
+    endpoints.retain(|e| !is_noise_path(&e.file));
+    outbounds.retain(|o| !is_noise_path(&o.file));
 
     // Perform matching
     let matches = match_outbounds_to_endpoints(&outbounds, &endpoints);
@@ -606,10 +628,10 @@ fn match_outbounds_to_endpoints(
 
             let match_type = check_match(outbound, endpoint);
             if let Some(mt) = match_type {
-                // Dedup key: client file+line to server file+line
+                // Dedup key: unique connection pair (collapse repeated matches)
                 let dedup_key = format!(
-                    "{}:{}->{}:{}",
-                    outbound.file, outbound.line, endpoint.file, endpoint.line
+                    "{}:{}->{}:{}:{}",
+                    outbound.file, outbound.line, endpoint.file, endpoint.line, mt
                 );
                 if !seen.insert(dedup_key) {
                     continue;
@@ -675,19 +697,33 @@ fn try_path_match(outbound: &CollectedOutbound, endpoint: &CollectedEndpoint) ->
 
     let ep_path = &endpoint.path;
 
-    // Direct path match in address hint
-    if !outbound.address_hint.is_empty() && outbound.address_hint.contains(ep_path.as_str()) {
+    // Skip generic catch-all paths that match everything
+    if ep_path == "/" || ep_path == "*" || ep_path == "websocket" || ep_path.len() < 3 {
+        return None;
+    }
+
+    // Skip noise paths on either side
+    if is_noise_path(&outbound.file) || is_noise_path(&endpoint.file) {
+        return None;
+    }
+
+    // Direct path match in address hint — require the path to be specific (starts with /)
+    if ep_path.starts_with('/') && !outbound.address_hint.is_empty()
+        && outbound.address_hint.contains(ep_path.as_str())
+    {
         return Some("path".to_string());
     }
 
-    // Check if callee contains the path
-    if !outbound.callee.is_empty() && outbound.callee.contains(ep_path.as_str()) {
+    // Check if callee contains the path — only for specific paths
+    if ep_path.starts_with('/') && !outbound.callee.is_empty()
+        && outbound.callee.contains(ep_path.as_str())
+    {
         return Some("path".to_string());
     }
 
     // Extract path from address hint and compare
     if let Some(hint_path) = extract_url_path(&outbound.address_hint) {
-        if hint_path == *ep_path {
+        if hint_path == *ep_path && hint_path.len() >= 3 {
             return Some("path".to_string());
         }
     }
@@ -774,17 +810,31 @@ fn try_url_match(outbound: &CollectedOutbound, endpoint: &CollectedEndpoint) -> 
         return None;
     }
 
-    let hint_lower = outbound.address_hint.to_lowercase();
+    // Skip noise paths
+    if is_noise_path(&outbound.file) || is_noise_path(&endpoint.file) {
+        return None;
+    }
+
+    // Skip generic/short service names that match too broadly
     let service_lower = endpoint.service.to_lowercase();
+    if service_lower.len() < 4 || matches!(service_lower.as_str(),
+        "main" | "server" | "handler" | "service" | "app" | "http" | "grpc" | "ws") {
+        return None;
+    }
+
+    // Skip catch-all endpoints
+    if endpoint.path == "/" || endpoint.path == "*" {
+        return None;
+    }
+
+    let hint_lower = outbound.address_hint.to_lowercase();
 
     // Match "service-name.svc.cluster.local" pattern
     if hint_lower.contains(".svc.cluster.local") {
-        // Extract service name from the hostname
         let hostname = hint_lower.split("://").last().unwrap_or(&hint_lower);
         let hostname = hostname.split(':').next().unwrap_or(hostname);
         let hostname = hostname.split('/').next().unwrap_or(hostname);
         let svc_name = hostname.split(".svc.cluster.local").next().unwrap_or(hostname);
-        // The svc_name might have a namespace: "service.namespace"
         let bare_name = svc_name.split('.').next().unwrap_or(svc_name);
 
         if bare_name == service_lower || service_lower.contains(bare_name) {
@@ -792,8 +842,8 @@ fn try_url_match(outbound: &CollectedOutbound, endpoint: &CollectedEndpoint) -> 
         }
     }
 
-    // Match direct service name in address (e.g., "productcatalogservice:3550")
-    if hint_lower.contains(&service_lower) {
+    // Match direct service name in address — only for specific service names (>6 chars)
+    if service_lower.len() > 6 && hint_lower.contains(&service_lower) {
         return Some("url".to_string());
     }
 
@@ -1297,6 +1347,63 @@ fn parse_endpoint_name(name: &str) -> (Option<&str>, &str) {
 
     // Otherwise, return as-is
     (None, trimmed)
+}
+
+/// Print a summary header with counts by kind and direction.
+fn print_summary_header(report: &serde_json::Value) {
+    let mut inbound_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut outbound_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut remote_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    if let Some(calls) = report.get("network_calls").and_then(|v| v.as_array()) {
+        for call in calls {
+            let kind = call["kind"].as_str().unwrap_or("unknown");
+            let direction = call["direction"].as_str().unwrap_or("outbound");
+            let display = format_kind(kind).to_string();
+            match direction {
+                "inbound" => *inbound_counts.entry(display).or_insert(0) += 1,
+                _ => *outbound_counts.entry(display).or_insert(0) += 1,
+            }
+            let file = call["file"].as_str().unwrap_or("");
+            if file.starts_with('[') {
+                if let Some(end) = file.find(']') {
+                    let name = &file[1..end];
+                    *remote_counts.entry(name.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    if let Some(apis) = report.get("exposed_apis").and_then(|v| v.as_array()) {
+        for api in apis {
+            let kind = api["kind"].as_str().unwrap_or("unknown");
+            let display = format_kind(kind).to_string();
+            *inbound_counts.entry(display).or_insert(0) += 1;
+        }
+    }
+
+    if inbound_counts.is_empty() && outbound_counts.is_empty() {
+        return;
+    }
+
+    println!("Network Boundaries");
+    if !inbound_counts.is_empty() {
+        let parts: Vec<String> = inbound_counts.iter().map(|(k, v)| format!("{} {}", v, k)).collect();
+        println!("  Inbound:  {}", parts.join(", "));
+    }
+    if !outbound_counts.is_empty() {
+        let parts: Vec<String> = outbound_counts.iter().map(|(k, v)| format!("{} {}", v, k)).collect();
+        println!("  Outbound: {}", parts.join(", "));
+    }
+    if !remote_counts.is_empty() {
+        let parts: Vec<String> = remote_counts.iter().map(|(k, v)| format!("{} ({} calls)", k, v)).collect();
+        println!("  Remotes:  {}", parts.join(", "));
+    }
+    if let Some(conns) = report.get("cross_repo_connections").and_then(|v| v.as_array()) {
+        if !conns.is_empty() {
+            println!("  Cross-repo: {} connection(s)", conns.len());
+        }
+    }
+    println!();
 }
 
 /// Print the network report in human-readable format.
