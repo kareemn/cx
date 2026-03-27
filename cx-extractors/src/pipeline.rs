@@ -3,6 +3,7 @@ use crate::grpc::{self, GrpcClientStub, GrpcScanResult, GrpcServerRegistration};
 use crate::manifest::{self, ManifestInfo};
 use crate::proto::{self, ProtoService};
 use crate::raw_extract::{RawExtractor, RawFileExtraction, RawLang};
+use crate::sink_registry;
 use crate::taint::{self, ResolvedNetworkCall};
 use crate::universal::{ExtractionResult, ParsedFile, UnresolvedCall};
 use cx_core::graph::csr::{CsrGraph, EdgeInput};
@@ -379,7 +380,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
     let id_counter = AtomicU32::new(0);
 
     // Step 2-4: Parse and extract in parallel, also scanning for gRPC patterns
-    type PerFileResult = (ExtractionResult, StringInterner, Vec<String>, GrpcScanResult, Option<RawFileExtraction>, String);
+    type PerFileResult = (ExtractionResult, StringInterner, Vec<String>, GrpcScanResult, Option<RawFileExtraction>, String, Vec<u8>);
     let per_file_results: Vec<PerFileResult> =
         all_repo_files
             .par_iter()
@@ -402,7 +403,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
                     Ok(s) => s,
                     Err(e) => {
                         errors.push(format!("{}: {}", rf.path.display(), e));
-                        return (result, strings, errors, grpc_result, raw_extraction, String::new());
+                        return (result, strings, errors, grpc_result, raw_extraction, String::new(), Vec::new());
                     }
                 };
 
@@ -411,21 +412,21 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
                 let mut parser = tree_sitter::Parser::new();
                 if parser.set_language(&ts_lang).is_err() {
                     errors.push(format!("{}: failed to set language", rf.path.display()));
-                    return (result, strings, errors, grpc_result, raw_extraction, String::new());
+                    return (result, strings, errors, grpc_result, raw_extraction, String::new(), Vec::new());
                 }
 
                 let tree = match parser.parse(&source, None) {
                     Some(t) => t,
                     None => {
                         errors.push(format!("{}: parse failed", rf.path.display()));
-                        return (result, strings, errors, grpc_result, raw_extraction, String::new());
+                        return (result, strings, errors, grpc_result, raw_extraction, String::new(), Vec::new());
                     }
                 };
 
                 // Create extractor
                 let extractor = match grammars::extractor_for_language(lang) {
                     Some(e) => e,
-                    None => return (result, strings, errors, grpc_result, raw_extraction, String::new()),
+                    None => return (result, strings, errors, grpc_result, raw_extraction, String::new(), Vec::new()),
                 };
 
                 // Compute repo-relative path
@@ -475,7 +476,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
                 }
 
                 let path_str_owned = path_str.to_string();
-                (result, strings, errors, grpc_result, raw_extraction, path_str_owned)
+                (result, strings, errors, grpc_result, raw_extraction, path_str_owned, source)
             })
             .collect();
 
@@ -515,7 +516,8 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
     let mut all_unresolved: Vec<UnresolvedCall> = Vec::new();
 
     // Collect raw extractions for taint analysis (run after merge when strings are unified)
-    let mut raw_extractions: Vec<(RawFileExtraction, StringInterner, String)> = Vec::new();
+    // 4th element is the source bytes for later LLM classification.
+    let mut raw_extractions: Vec<(RawFileExtraction, StringInterner, String, Vec<u8>)> = Vec::new();
 
     // Collect gRPC data per repo
     let mut grpc_clients_by_repo: rustc_hash::FxHashMap<u16, Vec<GrpcClientStub>> =
@@ -533,7 +535,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
         })
         .collect();
 
-    for (i, (result, file_strings, errors, grpc_scan, raw_ext, path_str)) in per_file_results.into_iter().enumerate()
+    for (i, (result, file_strings, errors, grpc_scan, raw_ext, path_str, source_bytes)) in per_file_results.into_iter().enumerate()
     {
         all_errors.extend(errors);
 
@@ -610,8 +612,9 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
         }
 
         // Stash raw extraction for taint analysis (with its own string interner)
+        // Preserve source bytes for later LLM classification.
         if let Some(raw) = raw_ext {
-            raw_extractions.push((raw, file_strings, path_str));
+            raw_extractions.push((raw, file_strings, path_str, source_bytes));
         }
     }
 
@@ -811,7 +814,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
         rustc_hash::FxHashMap::default();
     let mut all_const_map: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
 
-    for (raw, file_strings, path_str) in &raw_extractions {
+    for (raw, file_strings, path_str, _source_bytes) in &raw_extractions {
         // Use STRING_NONE as file_id — we extract direct sinks manually with the real path
         let file_id = cx_core::graph::nodes::STRING_NONE;
         let summaries = taint::analyze_file(raw, file_id, file_strings);
@@ -899,6 +902,17 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
         eprintln!("Taint analysis: {} network call(s) with provenance ({} inter-procedural)",
             network_calls.len(),
             network_calls.len().saturating_sub(all_summaries.iter().map(|s| s.direct_sinks.len()).sum::<usize>()));
+    }
+
+    // Step 8b: Extract env vars from Helm/k8s YAML/gotmpl files as network calls
+    let helm_network_calls = extract_helm_env_vars(&infra_files);
+    if !helm_network_calls.is_empty() {
+        eprintln!("Helm env extraction: {} network call(s) from YAML/gotmpl files", helm_network_calls.len());
+        for call in helm_network_calls {
+            if seen.insert((call.file.clone(), call.line)) {
+                network_calls.push(call);
+            }
+        }
     }
 
     // Step 9: Parse manifest files for dependency information
@@ -1454,6 +1468,186 @@ fn remap_flow_source(
     }
 }
 
+/// Scan infra files for YAML/gotmpl env var definitions that look like network addresses.
+/// Returns ResolvedNetworkCall entries for each env var whose value contains a network URL
+/// or `.svc.cluster.local` reference.
+fn extract_helm_env_vars(infra_files: &[RepoFile]) -> Vec<ResolvedNetworkCall> {
+    let mut calls = Vec::new();
+    for rf in infra_files {
+        let path_str = rf.path.to_string_lossy();
+        if !path_str.ends_with(".yaml.gotmpl")
+            && !path_str.ends_with(".yml.gotmpl")
+            && !path_str.ends_with(".yaml")
+            && !path_str.ends_with(".yml")
+        {
+            continue;
+        }
+        // Skip GitHub workflow files — they define env vars for CI, not network targets
+        if path_str.contains(".github/") {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(&rf.path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let rel_path = rf
+            .path
+            .strip_prefix(&rf.root)
+            .unwrap_or(&rf.path)
+            .to_string_lossy()
+            .to_string();
+
+        extract_env_vars_from_yaml(&content, &rel_path, &mut calls);
+    }
+    calls
+}
+
+/// Parse YAML content line-by-line, extracting `name:` / `value:` pairs from env blocks.
+/// For each value that looks like a network address, emit a `ResolvedNetworkCall`.
+fn extract_env_vars_from_yaml(
+    content: &str,
+    file: &str,
+    calls: &mut Vec<ResolvedNetworkCall>,
+) {
+    let mut pending_var_name: Option<String> = None;
+    let mut pending_line: u32 = 0;
+
+    for (i, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        let line_num = (i + 1) as u32;
+
+        // Skip comments and document separators
+        if trimmed.starts_with('#') || trimmed == "---" {
+            continue;
+        }
+
+        // Strip list-item prefix for field matching
+        let field_str = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+
+        if let Some(rest) = field_str.strip_prefix("name:") {
+            let name = rest.trim().trim_matches('"').trim_matches('\'');
+            if !name.is_empty() {
+                pending_var_name = Some(name.to_string());
+                pending_line = line_num;
+            }
+        } else if let Some(rest) = field_str.strip_prefix("value:") {
+            if let Some(var_name) = pending_var_name.take() {
+                let raw = rest.trim().trim_matches('"').trim_matches('\'');
+                // Replace gotmpl expressions with {template} placeholder
+                let cleaned = replace_gotmpl_expressions(raw);
+                if is_network_value(&cleaned) {
+                    let net_kind = infer_category_from_url(&cleaned);
+                    calls.push(ResolvedNetworkCall {
+                        net_kind,
+                        callee_fqn: format!("env:{}", var_name),
+                        address_source: taint::AddressSource::Literal {
+                            value: cleaned,
+                        },
+                        file: file.to_string(),
+                        line: pending_line,
+                        confidence: taint::Confidence::Heuristic,
+                    });
+                }
+            }
+        } else if field_str.starts_with("valueFrom:") {
+            // valueFrom means secret/configmap reference — clear pending but don't extract
+            pending_var_name = None;
+        } else if !trimmed.is_empty()
+            && pending_var_name.is_some()
+            && !trimmed.starts_with('-')
+            && !trimmed.starts_with("value")
+        {
+            // Non-value line after a name: — reset
+            pending_var_name = None;
+        }
+    }
+}
+
+/// Replace Go template expressions `{{ ... }}` with `{template}`.
+fn replace_gotmpl_expressions(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("{{") {
+        result.push_str(&rest[..start]);
+        if let Some(end) = rest[start..].find("}}") {
+            result.push_str("{template}");
+            rest = &rest[start + end + 2..];
+        } else {
+            // Unterminated template — keep remainder as-is
+            result.push_str(&rest[start..]);
+            return result;
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Check if a value looks like a network address.
+fn is_network_value(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("ws://")
+        || lower.starts_with("wss://")
+        || lower.starts_with("grpc://")
+        || lower.starts_with("grpcs://")
+        || lower.starts_with("postgres://")
+        || lower.starts_with("postgresql://")
+        || lower.starts_with("mysql://")
+        || lower.starts_with("redis://")
+        || lower.starts_with("amqp://")
+        || lower.starts_with("amqps://")
+        || lower.starts_with("mongodb://")
+        || lower.starts_with("mongodb+srv://")
+        || lower.contains(".svc.cluster.local")
+        || looks_like_host_port(&lower)
+}
+
+/// Heuristic: does the string look like `host:port` (e.g., `redis:6379`, `kafka:9092`)?
+fn looks_like_host_port(s: &str) -> bool {
+    // Must contain a colon followed by digits, and the part before colon must look like a hostname
+    if let Some(colon) = s.rfind(':') {
+        let host = &s[..colon];
+        let port_str = &s[colon + 1..];
+        // Port must be numeric (possibly followed by a path)
+        let port_part = port_str.split('/').next().unwrap_or(port_str);
+        if port_part.is_empty() {
+            return false;
+        }
+        let all_digits = port_part.chars().all(|c| c.is_ascii_digit());
+        // Host must contain at least one letter and look like a hostname (not a path or template)
+        let has_letter = host.chars().any(|c| c.is_ascii_alphabetic());
+        let not_scheme = !host.contains("//");
+        all_digits && has_letter && not_scheme && !host.is_empty()
+    } else {
+        false
+    }
+}
+
+/// Infer NetworkCategory from the URL scheme or content.
+fn infer_category_from_url(value: &str) -> sink_registry::NetworkCategory {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("ws://") || lower.starts_with("wss://") {
+        sink_registry::NetworkCategory::WebsocketClient
+    } else if lower.starts_with("grpc://") || lower.starts_with("grpcs://") {
+        sink_registry::NetworkCategory::GrpcClient
+    } else if lower.contains("redis") || lower.contains(":6379") {
+        sink_registry::NetworkCategory::Redis
+    } else if lower.contains("kafka") || lower.contains(":9092") {
+        sink_registry::NetworkCategory::KafkaProducer
+    } else if lower.contains("postgres") || lower.contains("mysql") || lower.contains(":5432") || lower.contains(":3306") {
+        sink_registry::NetworkCategory::Database
+    } else {
+        // Default to HttpClient for http://, https://, .svc.cluster.local, or unknown
+        sink_registry::NetworkCategory::HttpClient
+    }
+}
+
 /// Collect all files in a directory, respecting .gitignore.
 fn collect_files(root: &Path) -> crate::Result<Vec<PathBuf>> {
     let walker = ignore::WalkBuilder::new(root)
@@ -1494,6 +1688,8 @@ pub type Result<T> = std::result::Result<T, PipelineError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink_registry;
+    use crate::taint;
     use cx_core::graph::nodes::NodeKind;
     use std::fs;
 
@@ -2081,6 +2277,174 @@ service Auth {
             node_names.iter().any(|n| n.contains("Auth")),
             "proto Surface/Endpoint nodes should be in the graph, got: {:?}",
             node_names
+        );
+    }
+
+    #[test]
+    fn extract_env_vars_from_yaml_basic() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-service
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          env:
+            - name: MEGATTS_URL
+              value: http://ezdubs-tts-streaming-server-{{ .Values.region }}.svc.cluster.local:8000/inference
+            - name: DATABASE_URL
+              value: postgres://db.internal:5432/mydb
+            - name: REDIS_HOST
+              value: redis-master:6379
+            - name: API_ENDPOINT
+              value: https://api.example.com/v1
+            - name: WS_URL
+              value: ws://streaming-server.svc.cluster.local:9090/ws
+            - name: GRPC_TARGET
+              value: grpc://model-server.svc.cluster.local:50051
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: my-secret
+                  key: secret-key
+            - name: PLAIN_STRING
+              value: just-a-string
+            - name: KAFKA_BROKERS
+              value: kafka-0.kafka.svc.cluster.local:9092
+"#;
+
+        let mut calls = Vec::new();
+        extract_env_vars_from_yaml(yaml, "helm/values.yaml", &mut calls);
+
+        // Should find network-looking env vars
+        let fqns: Vec<&str> = calls.iter().map(|c| c.callee_fqn.as_str()).collect();
+        assert!(fqns.contains(&"env:MEGATTS_URL"), "should find MEGATTS_URL, got: {:?}", fqns);
+        assert!(fqns.contains(&"env:DATABASE_URL"), "should find DATABASE_URL, got: {:?}", fqns);
+        assert!(fqns.contains(&"env:REDIS_HOST"), "should find REDIS_HOST, got: {:?}", fqns);
+        assert!(fqns.contains(&"env:API_ENDPOINT"), "should find API_ENDPOINT, got: {:?}", fqns);
+        assert!(fqns.contains(&"env:WS_URL"), "should find WS_URL, got: {:?}", fqns);
+        assert!(fqns.contains(&"env:GRPC_TARGET"), "should find GRPC_TARGET, got: {:?}", fqns);
+        assert!(fqns.contains(&"env:KAFKA_BROKERS"), "should find KAFKA_BROKERS, got: {:?}", fqns);
+
+        // Should NOT find non-network values
+        assert!(!fqns.contains(&"env:SECRET_KEY"), "should not find SECRET_KEY (valueFrom)");
+        assert!(!fqns.contains(&"env:PLAIN_STRING"), "should not find PLAIN_STRING (not network)");
+
+        // Check category inference
+        let megatts = calls.iter().find(|c| c.callee_fqn == "env:MEGATTS_URL").unwrap();
+        assert_eq!(megatts.net_kind, sink_registry::NetworkCategory::HttpClient);
+
+        let db = calls.iter().find(|c| c.callee_fqn == "env:DATABASE_URL").unwrap();
+        assert_eq!(db.net_kind, sink_registry::NetworkCategory::Database);
+
+        let redis = calls.iter().find(|c| c.callee_fqn == "env:REDIS_HOST").unwrap();
+        assert_eq!(redis.net_kind, sink_registry::NetworkCategory::Redis);
+
+        let ws = calls.iter().find(|c| c.callee_fqn == "env:WS_URL").unwrap();
+        assert_eq!(ws.net_kind, sink_registry::NetworkCategory::WebsocketClient);
+
+        let grpc = calls.iter().find(|c| c.callee_fqn == "env:GRPC_TARGET").unwrap();
+        assert_eq!(grpc.net_kind, sink_registry::NetworkCategory::GrpcClient);
+
+        let kafka = calls.iter().find(|c| c.callee_fqn == "env:KAFKA_BROKERS").unwrap();
+        assert_eq!(kafka.net_kind, sink_registry::NetworkCategory::KafkaProducer);
+
+        // Check gotmpl replacement
+        let megatts_addr = match &megatts.address_source {
+            taint::AddressSource::Literal { value } => value.clone(),
+            _ => panic!("expected Literal address source"),
+        };
+        assert!(megatts_addr.contains("{template}"), "gotmpl should be replaced: {}", megatts_addr);
+        assert!(!megatts_addr.contains("{{"), "raw gotmpl should not remain: {}", megatts_addr);
+        assert!(megatts_addr.contains(".svc.cluster.local"), "should preserve svc ref: {}", megatts_addr);
+    }
+
+    #[test]
+    fn replace_gotmpl_expressions_works() {
+        assert_eq!(
+            replace_gotmpl_expressions("http://svc-{{ .Values.region }}.ns.svc.cluster.local:8080"),
+            "http://svc-{template}.ns.svc.cluster.local:8080"
+        );
+        assert_eq!(
+            replace_gotmpl_expressions("plain-value"),
+            "plain-value"
+        );
+        assert_eq!(
+            replace_gotmpl_expressions("{{ .Values.host }}:{{ .Values.port }}"),
+            "{template}:{template}"
+        );
+    }
+
+    #[test]
+    fn is_network_value_detects_urls() {
+        assert!(is_network_value("http://foo.svc.cluster.local:8080"));
+        assert!(is_network_value("https://api.example.com/v1"));
+        assert!(is_network_value("ws://streaming:9090/ws"));
+        assert!(is_network_value("grpc://model:50051"));
+        assert!(is_network_value("redis-master:6379"));
+        assert!(is_network_value("foo.svc.cluster.local"));
+        assert!(!is_network_value("just-a-string"));
+        assert!(!is_network_value(""));
+        assert!(!is_network_value("true"));
+    }
+
+    #[test]
+    fn infer_category_from_url_works() {
+        assert_eq!(infer_category_from_url("http://foo:8080"), sink_registry::NetworkCategory::HttpClient);
+        assert_eq!(infer_category_from_url("https://api.com"), sink_registry::NetworkCategory::HttpClient);
+        assert_eq!(infer_category_from_url("ws://foo:9090"), sink_registry::NetworkCategory::WebsocketClient);
+        assert_eq!(infer_category_from_url("grpc://foo:50051"), sink_registry::NetworkCategory::GrpcClient);
+        assert_eq!(infer_category_from_url("redis-master:6379"), sink_registry::NetworkCategory::Redis);
+        assert_eq!(infer_category_from_url("kafka-0:9092"), sink_registry::NetworkCategory::KafkaProducer);
+        assert_eq!(infer_category_from_url("postgres://db:5432/mydb"), sink_registry::NetworkCategory::Database);
+    }
+
+    #[test]
+    fn helm_env_extraction_integration() {
+        let repo = tempfile::tempdir().unwrap();
+
+        // Need at least one Go file for the pipeline to not short-circuit
+        fs::write(
+            repo.path().join("main.go"),
+            "package main\nfunc main() {}\n",
+        )
+        .unwrap();
+
+        fs::create_dir_all(repo.path().join("deploy")).unwrap();
+        fs::write(
+            repo.path().join("deploy/values.yaml"),
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-svc
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          env:
+            - name: BACKEND_URL
+              value: http://backend.default.svc.cluster.local:8080/api
+"#,
+        )
+        .unwrap();
+
+        let merged = extract_and_merge_repos(&[(repo.path().to_path_buf(), 0)]).unwrap();
+
+        let helm_calls: Vec<&ResolvedNetworkCall> = merged
+            .network_calls
+            .iter()
+            .filter(|c| c.callee_fqn.starts_with("env:"))
+            .collect();
+
+        assert!(
+            helm_calls.iter().any(|c| c.callee_fqn == "env:BACKEND_URL"),
+            "should extract BACKEND_URL from Helm values, got: {:?}",
+            helm_calls.iter().map(|c| &c.callee_fqn).collect::<Vec<_>>()
         );
     }
 }
