@@ -214,7 +214,22 @@ fn find_upstream_paths(graph: &CsrGraph, start: u32, max_depth: u32) -> Vec<Vec<
         next.clear();
     }
 
-    // If no interesting sources found, use all leaf sources (no incoming edges)
+    // Also include all frontier nodes (reached max depth or dead ends)
+    // and any node whose only upstream edges we've already visited
+    if interesting_sources.is_empty() {
+        // Walk all visited nodes and find those with no unvisited upstream
+        for idx in 0..graph.node_count() {
+            if !visited.test(idx) || idx == start {
+                continue;
+            }
+            let has_unvisited_upstream = graph.rev_edges_for(idx).iter()
+                .any(|e| (1u16 << e.kind) & ALL_EDGES != 0 && !visited.test(e.target));
+            if !has_unvisited_upstream {
+                interesting_sources.push(idx);
+            }
+        }
+    }
+    // Fallback: use frontier nodes
     if interesting_sources.is_empty() {
         for &node in &current {
             interesting_sources.push(node);

@@ -410,7 +410,7 @@ mod tests {
             vec![HttpClientCall {
                 path: "/embed".into(),
                 method: "POST".into(),
-                base_url_env_var: Some("SENTENCE_EMBEDDER_BASE_URL".into()),
+                base_url_env_var: Some("EMBEDDER_BASE_URL".into()),
                 file: "embed.go".into(),
                 line: 10,
             }],

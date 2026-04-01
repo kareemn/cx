@@ -19,6 +19,14 @@ pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)]) -> Result<IndexResu
         eprintln!("Resolved {} cross-repo connection(s)", resolved);
     }
 
+    // Backward pass: add Resolves edges linking network targets to their env var sources.
+    // Walks from Connects targets backward through Calls edges to find Configures (env var reads),
+    // and from Configures forward through Calls to find network sinks.
+    let resolves_added = add_resolves_edges(&mut merged);
+    if resolves_added > 0 {
+        eprintln!("Backward pass: {} Resolves edge(s) linking env vars to network calls", resolves_added);
+    }
+
     // LSP integration: try to upgrade Heuristic network calls to TypeConfirmed
     if !merged.network_calls.is_empty() {
         let workspace_root = repos.first().map(|(p, _)| p.as_path());
@@ -161,6 +169,218 @@ fn parse_network_category(kind: &str) -> Option<sink_registry::NetworkCategory> 
 
 /// Try to upgrade heuristic network call classifications using LSP type info.
 /// This is best-effort — if no LSP servers are available, results stay as Heuristic.
+/// Backward pass: add Resolves edges linking network targets to env var sources.
+///
+/// Strategy 1: For each Connects edge (function → resource), find Configures edges
+/// from the SAME function. If found, add a Resolves edge: resource → env_var_resource.
+///
+/// Strategy 2: For each Configures edge (function reads env var), walk forward through
+/// Calls edges to find functions that have Connects edges. Add Resolves from the
+/// Connects target back to the env var.
+///
+/// Strategy 3: Walk backward from Connects source through Calls edges (up to 5 hops)
+/// to find any function with a Configures edge.
+fn add_resolves_edges(merged: &mut MergedResult) -> usize {
+    use cx_core::graph::edges::EdgeKind;
+    use cx_core::graph::nodes::NodeKind;
+
+    let mut new_edges: Vec<cx_core::graph::csr::EdgeInput> = Vec::new();
+
+    // Build node ID → index lookup (node IDs are NOT sequential array indices)
+    let node_by_id: rustc_hash::FxHashMap<u32, usize> = merged.nodes.iter()
+        .enumerate()
+        .map(|(idx, n)| (n.id, idx))
+        .collect();
+
+    // Index: node_id → list of (target_node_id, edge_kind)
+    let mut outgoing: rustc_hash::FxHashMap<u32, Vec<(u32, EdgeKind)>> = rustc_hash::FxHashMap::default();
+    // Index: node_id → list of caller_node_ids (reverse Calls)
+    let mut callers: rustc_hash::FxHashMap<u32, Vec<u32>> = rustc_hash::FxHashMap::default();
+
+    for edge in &merged.edges {
+        outgoing.entry(edge.source).or_default().push((edge.target, edge.kind));
+        if edge.kind == EdgeKind::Calls {
+            callers.entry(edge.target).or_default().push(edge.source);
+        }
+    }
+
+    // Collect existing Resolves edges to avoid duplicates
+    let mut existing_resolves: rustc_hash::FxHashSet<(u32, u32)> = rustc_hash::FxHashSet::default();
+    for edge in &merged.edges {
+        if edge.kind == EdgeKind::Resolves {
+            existing_resolves.insert((edge.source, edge.target));
+        }
+    }
+
+    // Strategy 1: Same-function Connects + Configures
+    // If a function has both Connects→X and Configures→Y, add X→Resolves→Y
+    for (&func_id, edges) in &outgoing {
+        let node_idx = match node_by_id.get(&func_id) {
+            Some(&idx) => idx,
+            None => continue,
+        };
+        let node = &merged.nodes[node_idx];
+        if node.kind != NodeKind::Symbol as u8 {
+            continue;
+        }
+
+        let connects_targets: Vec<u32> = edges.iter()
+            .filter(|(_, k)| *k == EdgeKind::Connects)
+            .map(|(t, _)| *t)
+            .collect();
+        let configures_targets: Vec<u32> = edges.iter()
+            .filter(|(_, k)| *k == EdgeKind::Configures)
+            .map(|(t, _)| *t)
+            .collect();
+
+        // Link each Connects target to each Configures target (env var) in the same function
+        for &conn_target in &connects_targets {
+            for &conf_target in &configures_targets {
+                // Only link if the Configures target looks like a network address env var
+                let conf_name = node_by_id.get(&conf_target)
+                    .map(|&idx| merged.strings.get(merged.nodes[idx].name))
+                    .unwrap_or("");
+                if is_network_env_var(conf_name) && !existing_resolves.contains(&(conn_target, conf_target)) {
+                    new_edges.push(cx_core::graph::csr::EdgeInput::new(
+                        conn_target, conf_target, EdgeKind::Resolves,
+                    ));
+                    existing_resolves.insert((conn_target, conf_target));
+                }
+            }
+        }
+    }
+
+    // Strategy 2: Walk backward from Connects source through Calls (up to 5 hops)
+    // to find functions with Configures edges that feed the network call
+    let connects_edges: Vec<(u32, u32)> = merged.edges.iter()
+        .filter(|e| e.kind == EdgeKind::Connects)
+        .map(|e| (e.source, e.target))
+        .collect();
+    for (conn_source, conn_target) in &connects_edges {
+        let conn_target = *conn_target;
+        let conn_source = *conn_source;
+
+        // BFS backward through callers
+        let mut visited = rustc_hash::FxHashSet::default();
+        visited.insert(conn_source);
+        let mut frontier = vec![conn_source];
+
+        for _depth in 0..5 {
+            let mut next_frontier = Vec::new();
+            for &func_id in &frontier {
+                if let Some(caller_ids) = callers.get(&func_id) {
+                    for &caller_id in caller_ids {
+                        if !visited.insert(caller_id) {
+                            continue;
+                        }
+                        next_frontier.push(caller_id);
+
+                        // Check if this caller has Configures edges
+                        if let Some(caller_edges) = outgoing.get(&caller_id) {
+                            for &(target, kind) in caller_edges {
+                                if kind == EdgeKind::Configures {
+                                    let conf_name = node_by_id.get(&target)
+                                        .map(|&idx| merged.strings.get(merged.nodes[idx].name))
+                                        .unwrap_or("");
+                                    if is_network_env_var(conf_name)
+                                        && !existing_resolves.contains(&(conn_target, target))
+                                    {
+                                        new_edges.push(cx_core::graph::csr::EdgeInput::new(
+                                            conn_target, target, EdgeKind::Resolves,
+                                        ));
+                                        existing_resolves.insert((conn_target, target));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+    }
+
+    // Strategy 3: For Configures edges where there's NO Connects edge in the same function,
+    // walk FORWARD through Calls to find functions that make network calls (have Connects).
+    // This handles: NewASRClient reads ASR_WS_URI → connect() does the websocket.Dial
+    let configures_edges: Vec<(u32, u32)> = merged.edges.iter()
+        .filter(|e| e.kind == EdgeKind::Configures)
+        .map(|e| (e.source, e.target))
+        .collect();
+    for (reader_func, env_var_node) in &configures_edges {
+        let env_var_node = *env_var_node;
+        let reader_func = *reader_func;
+        let env_name = node_by_id.get(&env_var_node)
+            .map(|&idx| merged.strings.get(merged.nodes[idx].name))
+            .unwrap_or("");
+        if !is_network_env_var(env_name) {
+            continue;
+        }
+
+        // Does this function also have a Connects edge? If so, Strategy 1 handled it
+        let has_connects = outgoing.get(&reader_func)
+            .map(|e| e.iter().any(|(_, k)| *k == EdgeKind::Connects))
+            .unwrap_or(false);
+        if has_connects {
+            continue;
+        }
+
+        // Walk forward from the reader function through Calls edges (up to 5 hops)
+        // to find a function that has a Connects edge
+        let mut visited = rustc_hash::FxHashSet::default();
+        visited.insert(reader_func);
+        let mut frontier = vec![reader_func];
+
+        for _depth in 0..5 {
+            let mut next_frontier = Vec::new();
+            for &func_id in &frontier {
+                if let Some(func_edges) = outgoing.get(&func_id) {
+                    for &(target, kind) in func_edges {
+                        if kind == EdgeKind::Calls && visited.insert(target) {
+                            next_frontier.push(target);
+
+                            // Does this called function have Connects edges?
+                            if let Some(callee_edges) = outgoing.get(&target) {
+                                for &(conn_target, ck) in callee_edges {
+                                    if ck == EdgeKind::Connects
+                                        && !existing_resolves.contains(&(conn_target, env_var_node))
+                                    {
+                                        new_edges.push(cx_core::graph::csr::EdgeInput::new(
+                                            conn_target, env_var_node, EdgeKind::Resolves,
+                                        ));
+                                        existing_resolves.insert((conn_target, env_var_node));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+    }
+
+    let count = new_edges.len();
+    merged.edges.extend(new_edges);
+    count
+}
+
+/// Check if an env var name looks like it holds a network address.
+fn is_network_env_var(name: &str) -> bool {
+    let upper = name.to_uppercase();
+    upper.contains("URL") || upper.contains("URI") || upper.contains("ADDR")
+        || upper.contains("HOST") || upper.contains("ENDPOINT")
+        || upper.contains("DATABASE") || upper.contains("REDIS")
+        || upper.contains("KAFKA") || upper.ends_with("_DSN")
+        || upper.contains("CONNECTION")
+}
+
 fn upgrade_via_lsp(merged: &mut MergedResult, workspace_root: &std::path::Path) {
     let mut orchestrator = LspOrchestrator::start(workspace_root);
 

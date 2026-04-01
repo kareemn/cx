@@ -1552,7 +1552,23 @@ fn extract_env_vars_from_yaml(
                 }
             }
         } else if field_str.starts_with("valueFrom:") {
-            // valueFrom means secret/configmap reference — clear pending but don't extract
+            // valueFrom means secret/configmap reference — still extract the env var name
+            // but mark it as coming from a secret/configmap rather than a literal value
+            if let Some(ref var_name) = pending_var_name {
+                let fqn = format!("env:{}", var_name);
+                if !fqn.is_empty() {
+                    calls.push(taint::ResolvedNetworkCall {
+                        net_kind: sink_registry::NetworkCategory::HttpClient, // placeholder
+                        callee_fqn: fqn,
+                        address_source: taint::AddressSource::Dynamic {
+                            hint: format!("secret:{}", var_name),
+                        },
+                        file: file.to_string(),
+                        line: pending_line,
+                        confidence: taint::Confidence::Heuristic,
+                    });
+                }
+            }
             pending_var_name = None;
         } else if !trimmed.is_empty()
             && pending_var_name.is_some()
@@ -2293,8 +2309,8 @@ spec:
       containers:
         - name: app
           env:
-            - name: MEGATTS_URL
-              value: http://ezdubs-tts-streaming-server-{{ .Values.region }}.svc.cluster.local:8000/inference
+            - name: TTS_SERVICE_URL
+              value: http://tts-server-{{ .Values.region }}.tts-server.svc.cluster.local:8000/inference
             - name: DATABASE_URL
               value: postgres://db.internal:5432/mydb
             - name: REDIS_HOST
@@ -2321,7 +2337,7 @@ spec:
 
         // Should find network-looking env vars
         let fqns: Vec<&str> = calls.iter().map(|c| c.callee_fqn.as_str()).collect();
-        assert!(fqns.contains(&"env:MEGATTS_URL"), "should find MEGATTS_URL, got: {:?}", fqns);
+        assert!(fqns.contains(&"env:TTS_SERVICE_URL"), "should find TTS_SERVICE_URL, got: {:?}", fqns);
         assert!(fqns.contains(&"env:DATABASE_URL"), "should find DATABASE_URL, got: {:?}", fqns);
         assert!(fqns.contains(&"env:REDIS_HOST"), "should find REDIS_HOST, got: {:?}", fqns);
         assert!(fqns.contains(&"env:API_ENDPOINT"), "should find API_ENDPOINT, got: {:?}", fqns);
@@ -2330,12 +2346,12 @@ spec:
         assert!(fqns.contains(&"env:KAFKA_BROKERS"), "should find KAFKA_BROKERS, got: {:?}", fqns);
 
         // Should NOT find non-network values
-        assert!(!fqns.contains(&"env:SECRET_KEY"), "should not find SECRET_KEY (valueFrom)");
+        assert!(fqns.contains(&"env:SECRET_KEY"), "should find SECRET_KEY (valueFrom as secret ref)");
         assert!(!fqns.contains(&"env:PLAIN_STRING"), "should not find PLAIN_STRING (not network)");
 
         // Check category inference
-        let megatts = calls.iter().find(|c| c.callee_fqn == "env:MEGATTS_URL").unwrap();
-        assert_eq!(megatts.net_kind, sink_registry::NetworkCategory::HttpClient);
+        let tts_svc = calls.iter().find(|c| c.callee_fqn == "env:TTS_SERVICE_URL").unwrap();
+        assert_eq!(tts_svc.net_kind, sink_registry::NetworkCategory::HttpClient);
 
         let db = calls.iter().find(|c| c.callee_fqn == "env:DATABASE_URL").unwrap();
         assert_eq!(db.net_kind, sink_registry::NetworkCategory::Database);
@@ -2353,13 +2369,13 @@ spec:
         assert_eq!(kafka.net_kind, sink_registry::NetworkCategory::KafkaProducer);
 
         // Check gotmpl replacement
-        let megatts_addr = match &megatts.address_source {
+        let tts_svc_addr = match &tts_svc.address_source {
             taint::AddressSource::Literal { value } => value.clone(),
             _ => panic!("expected Literal address source"),
         };
-        assert!(megatts_addr.contains("{template}"), "gotmpl should be replaced: {}", megatts_addr);
-        assert!(!megatts_addr.contains("{{"), "raw gotmpl should not remain: {}", megatts_addr);
-        assert!(megatts_addr.contains(".svc.cluster.local"), "should preserve svc ref: {}", megatts_addr);
+        assert!(tts_svc_addr.contains("{template}"), "gotmpl should be replaced: {}", tts_svc_addr);
+        assert!(!tts_svc_addr.contains("{{"), "raw gotmpl should not remain: {}", tts_svc_addr);
+        assert!(tts_svc_addr.contains(".svc.cluster.local"), "should preserve svc ref: {}", tts_svc_addr);
     }
 
     #[test]
