@@ -201,7 +201,7 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
              Kinds: http_client, http_server, grpc_client, grpc_server, websocket_client, websocket_server,\n\
                     kafka_producer, kafka_consumer, database, redis, sqs, s3, tcp_dial, tcp_listen, not_network\n\n\
              For 'target': trace the variable chain to its origin. Use the provenance chain provided.\n\
-             - If it resolves to an env var, return the env var name (e.g. \"SENTENCE_EMBEDDER_BASE_URL\")\n\
+             - If it resolves to an env var, return the env var name (e.g. \"DATABASE_URL\")\n\
              - If it resolves to a config key, return the key (e.g. \"db.host\")\n\
              - If it resolves to a literal, return the literal value\n\
              - If it resolves to a field, return type.field (e.g. \"Config.wsURL\")\n\
@@ -844,32 +844,55 @@ pub fn index_single_repo(repo_path: &std::path::Path, repo_id: u16) -> Result<In
     Ok(pipeline::build_index(merged))
 }
 
-/// Merge all per-repo .cxgraph files from .cx/graph/repos/ into a unified graph.
+/// Merge all per-repo .cxgraph files from .cx/graph/repos/ AND remote graphs
+/// from .cx/remotes/*.cxgraph into a unified graph.
 /// Loads the overlay graph and injects cross-repo edges into the merge.
 pub fn merge_per_repo_graphs(root: &std::path::Path) -> Result<cx_core::graph::csr::CsrGraph> {
     let repos_dir = root.join(".cx").join("graph").join("repos");
-    if !repos_dir.exists() {
-        anyhow::bail!("no per-repo graphs found");
+    let remotes_dir = root.join(".cx").join("remotes");
+
+    let mut graph_paths: Vec<std::path::PathBuf> = Vec::new();
+
+    // Load local per-repo graphs
+    if repos_dir.exists() {
+        let mut entries: Vec<_> = std::fs::read_dir(&repos_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|ext| ext == "cxgraph")
+            })
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            graph_paths.push(entry.path());
+        }
     }
 
-    let mut entries: Vec<_> = std::fs::read_dir(&repos_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "cxgraph")
-        })
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-
-    if entries.is_empty() {
-        anyhow::bail!("no .cxgraph files in repos/");
+    // Load remote graphs
+    if remotes_dir.exists() {
+        let mut entries: Vec<_> = std::fs::read_dir(&remotes_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|ext| ext == "cxgraph")
+            })
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            graph_paths.push(entry.path());
+        }
     }
 
-    let mut graphs = Vec::with_capacity(entries.len());
-    for entry in &entries {
-        let graph = cx_core::store::mmap::load_graph(&entry.path())
-            .with_context(|| format!("failed to load {}", entry.path().display()))?;
+    if graph_paths.is_empty() {
+        anyhow::bail!("no .cxgraph files found in repos/ or remotes/");
+    }
+
+    let mut graphs = Vec::with_capacity(graph_paths.len());
+    for path in &graph_paths {
+        let graph = cx_core::store::mmap::load_graph(path)
+            .with_context(|| format!("failed to load {}", path.display()))?;
         graphs.push(graph);
     }
 

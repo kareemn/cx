@@ -319,7 +319,7 @@ mod tests {
             }],
         )];
 
-        // REST: translation-server → tts-service /inference
+        // REST: api-gateway → backend-service /inference
         input.http_client_calls = vec![(
             "api-gateway".into(),
             vec![HttpClientCall {
@@ -378,7 +378,7 @@ mod tests {
             }],
         )];
 
-        // WebSocket: cpp-client → translation-server
+        // WebSocket: native-client → backend-service
         input.ws_clients = vec![(
             "native-client".into(),
             vec![WsClientConnection {

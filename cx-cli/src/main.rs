@@ -51,7 +51,7 @@ enum Commands {
   DependsOn   cross-repo dependency
 
 \x1b[1mExamples:\x1b[0m
-  cx trace AZURE_SPEECH_KEY              full trace with provenance
+  cx trace DATABASE_URL                  full trace with provenance
   cx trace 'env:*'                       overview of all env vars
   cx trace 'env:*_ADDR'                  all address env vars
   cx trace pgxpool.New                   trace a database call (resolves via network.json)

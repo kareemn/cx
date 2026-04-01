@@ -171,24 +171,97 @@ fn pull_remote(root: &Path, name: &str, remote_path: &Path) -> Result<u32> {
 }
 
 /// Rebuild the unified graph by merging local per-repo graphs with remote graphs.
+/// After merging, runs cross-repo env var resolution to create Resolves edges
+/// between matching Resource nodes across repos.
 fn rebuild_unified(root: &Path) -> Result<()> {
+    use cx_core::graph::csr::EdgeInput;
+    use cx_core::graph::edges::{EdgeKind, EDGE_IS_CROSS_REPO};
+    use cx_core::graph::nodes::NodeKind;
+
     let cx_dir = root.join(".cx").join("graph");
+    std::fs::create_dir_all(&cx_dir)?;
     let graph_path = cx_dir.join("base.cxgraph");
 
-    // Try merging per-repo graphs (includes overlay resolution)
-    match crate::indexing::merge_per_repo_graphs(root) {
-        Ok(merged) => {
-            cx_core::store::mmap::write_graph(&merged, &graph_path)?;
-            eprintln!(
-                "Unified graph: {} symbols, {} edges",
-                merged.node_count(),
-                merged.edge_count(),
-            );
-        }
-        Err(_) => {
-            // No per-repo graphs yet — that's fine if we only have remotes
+    // Merge all per-repo + remote graphs
+    let merged = match crate::indexing::merge_per_repo_graphs(root) {
+        Ok(m) => m,
+        Err(_) => return Ok(()), // No graphs yet
+    };
+
+    // Cross-repo env var resolution: find Resource nodes with matching names
+    // across different repos and create Resolves edges between them.
+    // This links code-side os.Getenv("SERVICE_ADDR") to K8s-side SERVICE_ADDR=myservice:8080
+    let mut cross_repo_edges: Vec<EdgeInput> = Vec::new();
+
+    // Build a map: env_var_name → [(node_index, repo_id)]
+    let mut env_var_nodes: rustc_hash::FxHashMap<String, Vec<(u32, u16)>> =
+        rustc_hash::FxHashMap::default();
+
+    for (idx, node) in merged.nodes.iter().enumerate() {
+        if node.kind == NodeKind::Resource as u8 {
+            let name = merged.strings.get(node.name);
+            // Only match env-var-like names (UPPER_CASE_WITH_UNDERSCORES)
+            if !name.is_empty()
+                && name.len() > 1
+                && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            {
+                env_var_nodes
+                    .entry(name.to_string())
+                    .or_default()
+                    .push((idx as u32, node.repo));
+            }
         }
     }
+
+    // For each env var that appears in multiple repos, create Resolves edges
+    for (_name, nodes) in &env_var_nodes {
+        if nodes.len() < 2 {
+            continue;
+        }
+        // Create edges between all cross-repo pairs
+        for i in 0..nodes.len() {
+            for j in (i + 1)..nodes.len() {
+                let (idx_a, repo_a) = nodes[i];
+                let (idx_b, repo_b) = nodes[j];
+                if repo_a == repo_b {
+                    continue;
+                }
+                // Bidirectional Resolves edges
+                let mut edge = EdgeInput::new(idx_a, idx_b, EdgeKind::Resolves);
+                edge.confidence_u8 = 200;
+                edge.flags = EDGE_IS_CROSS_REPO;
+                cross_repo_edges.push(edge);
+
+                let mut edge_rev = EdgeInput::new(idx_b, idx_a, EdgeKind::Resolves);
+                edge_rev.confidence_u8 = 200;
+                edge_rev.flags = EDGE_IS_CROSS_REPO;
+                cross_repo_edges.push(edge_rev);
+            }
+        }
+    }
+
+    let cross_count = cross_repo_edges.len() / 2; // each pair is bidirectional
+
+    // If we found cross-repo matches, rebuild with the new edges
+    let final_graph = if cross_repo_edges.is_empty() {
+        merged
+    } else {
+        // Re-merge with extra edges
+        let graphs = vec![merged];
+        cx_core::graph::csr::CsrGraph::merge(&graphs, cross_repo_edges)
+    };
+
+    cx_core::store::mmap::write_graph(&final_graph, &graph_path)?;
+    eprintln!(
+        "Unified graph: {} symbols, {} edges{}",
+        final_graph.node_count(),
+        final_graph.edge_count(),
+        if cross_count > 0 {
+            format!(" ({} cross-repo env var link(s))", cross_count)
+        } else {
+            String::new()
+        },
+    );
 
     Ok(())
 }

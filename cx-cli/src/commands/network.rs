@@ -14,9 +14,28 @@ pub fn run(root: &Path, json: bool, kind: Option<&str>, direction: Option<&str>,
     let mut taint_calls = load_network_json(root);
 
     // Load remote network data unless --local-only
+    // Filter: only keep remote calls whose env var names match local env var reads
     if !local_only {
+        let local_env_vars: std::collections::HashSet<String> = taint_calls
+            .iter()
+            .filter_map(|c| extract_env_var_name(&c.address_source))
+            .collect();
+
         let remote_calls = load_remote_network_json(root);
-        taint_calls.extend(remote_calls);
+        let filtered: Vec<_> = remote_calls
+            .into_iter()
+            .filter(|c| {
+                // Keep if this remote call's env var matches a local read
+                if let Some(var) = extract_env_var_name(&c.address_source) {
+                    local_env_vars.contains(&var)
+                } else if include_all {
+                    true // --include-all shows everything
+                } else {
+                    false
+                }
+            })
+            .collect();
+        taint_calls.extend(filtered);
     }
 
     // Noise filtering: exclude test/archive/example/vendor paths by default
@@ -55,6 +74,22 @@ pub fn load_network_json(root: &Path) -> Vec<ResolvedNetworkCall> {
         return Vec::new();
     };
     serde_json::from_str(&content).unwrap_or_default()
+}
+
+/// Extract the env var name from an AddressSource, if it mentions one.
+fn extract_env_var_name(source: &cx_extractors::taint::AddressSource) -> Option<String> {
+    use cx_extractors::taint::AddressSource;
+    match source {
+        AddressSource::EnvVar { var_name, .. } => Some(var_name.clone()),
+        AddressSource::Parameter { caller_sources, .. } => {
+            caller_sources.iter().find_map(extract_env_var_name)
+        }
+        AddressSource::FieldAccess { assignment_sources, .. } => {
+            assignment_sources.iter().find_map(extract_env_var_name)
+        }
+        AddressSource::Concat { parts } => parts.iter().find_map(extract_env_var_name),
+        _ => None,
+    }
 }
 
 /// Check whether a file path looks like test, archive, example, or vendor noise.
