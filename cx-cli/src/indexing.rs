@@ -48,7 +48,7 @@ pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)], verbose: bool) -> R
 
 /// Format an AddressSource chain as a human-readable provenance string.
 /// e.g. "self.wsURL (field) <- NewClient.url (param) <- EnvVar(WS_URI)"
-fn format_address_chain(src: &cx_extractors::taint::AddressSource) -> String {
+pub fn format_address_chain(src: &cx_extractors::taint::AddressSource) -> String {
     use cx_extractors::taint::AddressSource;
     match src {
         AddressSource::Literal { value } => format!("\"{}\"", truncate(value, 50)),
@@ -156,17 +156,44 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
         return;
     }
 
+    // ANSI color codes
+    const DIM: &str = "\x1b[2m";
+    const BOLD: &str = "\x1b[1m";
+    const GREEN: &str = "\x1b[32m";
+    const YELLOW: &str = "\x1b[33m";
+    const CYAN: &str = "\x1b[36m";
+    const RED: &str = "\x1b[31m";
+    const MAGENTA: &str = "\x1b[35m";
+    const RESET: &str = "\x1b[0m";
+
     let total_batches = (heuristic_indices.len() + 9) / 10;
-    eprintln!("LLM: classifying {} heuristic call(s) via Claude CLI ({} batch(es) of 10)...",
-        heuristic_indices.len(), total_batches);
+    eprintln!(
+        "\n{BOLD}LLM{RESET}  classifying {CYAN}{}{RESET} heuristic calls via Claude CLI  {DIM}({} batches of 10){RESET}\n",
+        heuristic_indices.len(), total_batches,
+    );
 
     let mut upgraded = 0u32;
     let mut not_network = 0u32;
     let mut failed_batches = 0u32;
     let mut parse_failures = 0u32;
+    let batch_start_time = std::time::Instant::now();
 
     for (batch_num, batch) in heuristic_indices.chunks(10).enumerate() {
-        eprint!("\r  batch {}/{}", batch_num + 1, total_batches);
+        // Show what we're sending in this batch
+        let files_in_batch: Vec<String> = batch.iter().map(|&i| {
+            let c = &network_calls[i];
+            format!("{}:{}", c.file, c.line)
+        }).collect();
+        let batch_preview: String = if files_in_batch.len() <= 3 {
+            files_in_batch.join(", ")
+        } else {
+            format!("{}, {} +{} more",
+                files_in_batch[0], files_in_batch[1], files_in_batch.len() - 2)
+        };
+        eprint!(
+            "  {DIM}[{}/{}]{RESET} {YELLOW}querying{RESET} {DIM}{}{RESET}",
+            batch_num + 1, total_batches, batch_preview,
+        );
 
         let mut prompt = String::from(
             "Classify these network call sites and resolve their targets. For each, respond with ONLY a JSON array.\n\
@@ -197,20 +224,37 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
 
         prompt.push_str("Respond ONLY with a JSON array.\n");
 
+        let call_start = std::time::Instant::now();
         let result = std::process::Command::new("claude")
             .args(["-p", &prompt, "--output-format", "json", "--model", "haiku"])
             .output();
+        let call_elapsed = call_start.elapsed();
 
         let output = match result {
             Ok(o) if o.status.success() => o,
-            _ => {
+            Ok(o) => {
                 failed_batches += 1;
-                if verbose {
-                    eprintln!("  batch {}/{}: claude CLI failed", batch_num + 1, total_batches);
-                }
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let reason = if !stderr.is_empty() {
+                    stderr.lines().last().unwrap_or("").trim().to_string()
+                } else if !stdout.is_empty() {
+                    stdout.lines().last().unwrap_or("").trim().to_string()
+                } else {
+                    format!("exit code {}", o.status)
+                };
+                eprintln!("  {RED}failed{RESET} {DIM}({:.1}s) {}{RESET}", call_elapsed.as_secs_f64(), reason);
+                continue;
+            }
+            Err(e) => {
+                failed_batches += 1;
+                eprintln!("  {RED}failed{RESET} {DIM}({:.1}s) {}{RESET}", call_elapsed.as_secs_f64(), e);
                 continue;
             }
         };
+
+        // Clear the "querying" line and print batch header
+        eprintln!("  {DIM}({:.1}s){RESET}", call_elapsed.as_secs_f64());
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let result_text = if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&stdout) {
@@ -227,7 +271,7 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
         } else { Vec::new() };
 
         if classifications.is_empty() && verbose {
-            eprintln!("  batch {}/{}: no parseable JSON array in response", batch_num + 1, total_batches);
+            eprintln!("         {RED}no parseable JSON in response{RESET}");
         }
 
         for entry in &classifications {
@@ -244,12 +288,11 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
 
             let call_idx = batch[idx];
             let call_loc = format!("{}:{}", network_calls[call_idx].file, network_calls[call_idx].line);
-            let chain = format_address_chain(&network_calls[call_idx].address_source);
 
             if kind == "not_network" || kind.is_empty() {
                 not_network += 1;
                 if verbose {
-                    eprintln!("    {} -> not_network  [{}]", call_loc, chain);
+                    eprintln!("         {DIM}{} -> skip (not network){RESET}", call_loc);
                 }
                 continue;
             }
@@ -258,22 +301,44 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
                 network_calls[call_idx].net_kind = cat;
                 network_calls[call_idx].confidence = Confidence::LLMClassified;
                 upgraded += 1;
-                if verbose {
-                    eprintln!("    {} -> {} {} target={} ({})  [{}]",
-                        call_loc, kind, direction, target, target_source, chain);
-                }
+
+                // Color the kind based on direction
+                let kind_colored = match direction {
+                    "outbound" => format!("{MAGENTA}{}{RESET}", kind),
+                    "inbound" => format!("{CYAN}{}{RESET}", kind),
+                    _ => kind.to_string(),
+                };
+                // Color the target based on source type
+                let target_colored = match target_source {
+                    "literal" => format!("{GREEN}\"{}\"{RESET}", target),
+                    "env_var" => format!("{YELLOW}${}{RESET}", target),
+                    "config" => format!("{CYAN}{}{RESET}", target),
+                    "dynamic" => format!("{DIM}{}{RESET}", target),
+                    _ => target.to_string(),
+                };
+                let arrow = if direction == "inbound" {
+                    format!("{CYAN}<-{RESET}")
+                } else {
+                    format!("{MAGENTA}->{RESET}")
+                };
+                eprintln!(
+                    "         {DIM}{}{RESET}  {kind_colored} {arrow} {target_colored} {DIM}({target_source}){RESET}",
+                    call_loc,
+                );
             } else {
                 parse_failures += 1;
                 if verbose {
-                    eprintln!("    {} -> unknown kind '{}'  [{}]", call_loc, kind, chain);
+                    eprintln!("         {DIM}{}{RESET}  {RED}unknown: {}{RESET}", call_loc, kind);
                 }
             }
         }
     }
 
-    eprintln!(); // clear the \r progress line
-    eprintln!("LLM: {} upgraded, {} not_network, {} failed batches, {} parse errors",
-        upgraded, not_network, failed_batches, parse_failures);
+    let total_elapsed = batch_start_time.elapsed();
+    eprintln!(
+        "\n{BOLD}LLM{RESET}  {GREEN}{} classified{RESET}, {DIM}{} not network, {} failed, {} errors{RESET}  {DIM}({:.1}s){RESET}\n",
+        upgraded, not_network, failed_batches, parse_failures, total_elapsed.as_secs_f64(),
+    );
 }
 
 fn parse_network_category(kind: &str) -> Option<sink_registry::NetworkCategory> {
@@ -771,6 +836,7 @@ fn add_cross_repo_edge(
 
 /// Index a single repo without cross-repo resolution.
 /// Returns the IndexResult containing only this repo's graph.
+#[allow(dead_code)] // Used when cx remote is re-added
 pub fn index_single_repo(repo_path: &std::path::Path, repo_id: u16) -> Result<IndexResult> {
     let repos = vec![(repo_path.to_path_buf(), repo_id)];
     let merged = pipeline::extract_and_merge_repos(&repos)
@@ -856,6 +922,23 @@ fn find_node_at(
     }
 
     best.map(|(id, _)| id)
+}
+
+/// Load the unified graph from .cx/graph/base.cxgraph.
+/// Falls back to merging per-repo graphs if base.cxgraph doesn't exist.
+pub fn load_graph(root: &std::path::Path) -> Result<cx_core::graph::csr::CsrGraph> {
+    let graph_path = root.join(".cx").join("graph").join("base.cxgraph");
+    if graph_path.exists() {
+        return cx_core::store::mmap::load_graph(&graph_path).context("failed to load graph");
+    }
+
+    // Try layered loading (per-repo graphs + overlay)
+    let repos_dir = root.join(".cx").join("graph").join("repos");
+    if repos_dir.exists() {
+        return merge_per_repo_graphs(root);
+    }
+
+    anyhow::bail!("index not found: run `cx build` first")
 }
 
 #[cfg(test)]

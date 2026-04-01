@@ -8,7 +8,7 @@ use std::path::Path;
 
 /// Run `cx network` — list all detected network calls and exposed APIs with provenance.
 pub fn run(root: &Path, json: bool, kind: Option<&str>, direction: Option<&str>, service: Option<&str>, local_only: bool, include_all: bool) -> Result<()> {
-    let graph = super::init::load_graph(root)?;
+    let graph = crate::indexing::load_graph(root)?;
 
     // Load local taint analysis results
     let mut taint_calls = load_network_json(root);
@@ -1610,8 +1610,8 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 "#,
         )
         .unwrap();
-        super::super::init::run(dir.path(), false).unwrap();
-        let graph = super::super::init::load_graph(dir.path()).unwrap();
+        crate::commands::build::run(dir.path(), &[], false).unwrap();
+        let graph = crate::indexing::load_graph(dir.path()).unwrap();
         (dir, graph)
     }
 
@@ -1696,8 +1696,8 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
         fs::write(dir.path().join("empty.txt"), "").unwrap();
         // init might fail on empty project, so use a Go file
         fs::write(dir.path().join("main.go"), "package main\n\nfunc main() {}\n").unwrap();
-        super::super::init::run(dir.path(), false).unwrap();
-        let graph = super::super::init::load_graph(dir.path()).unwrap();
+        crate::commands::build::run(dir.path(), &[], false).unwrap();
+        let graph = crate::indexing::load_graph(dir.path()).unwrap();
         let report = build_network_report(&graph, &[], None, None, None);
         assert!(report.is_object());
     }

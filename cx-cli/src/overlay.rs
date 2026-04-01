@@ -60,6 +60,7 @@ impl OverlayGraph {
     }
 
     /// Save to overlay.json.
+    #[allow(dead_code)] // Used when cx remote is re-added
     pub fn save(&self, root: &Path) -> Result<()> {
         let dir = root.join(".cx").join("graph");
         std::fs::create_dir_all(&dir)?;
@@ -71,6 +72,7 @@ impl OverlayGraph {
     }
 
     /// Remove all edges involving a given repo (before re-adding updated ones).
+    #[allow(dead_code)] // Used when cx remote is re-added
     pub fn remove_repo(&mut self, repo_id: u16) {
         self.edges
             .retain(|e| e.source_repo != repo_id && e.target_repo != repo_id);
@@ -81,6 +83,7 @@ impl OverlayGraph {
     /// For each outgoing target/client in the new repo, finds matching APIs/servers
     /// in other repos via the index. For each exposed API/server in the new repo,
     /// finds matching clients/targets in other repos.
+    #[allow(dead_code)] // Used when cx remote is re-added
     pub fn resolve_repo_against_index(
         &mut self,
         repo_id: u16,

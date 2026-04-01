@@ -9,7 +9,7 @@ use std::path::Path;
 
 /// Run the MCP server: JSON-RPC 2.0 over stdio with Content-Length framing.
 pub fn run(root: &Path) -> Result<()> {
-    let graph = crate::commands::init::load_graph(root)?;
+    let graph = crate::indexing::load_graph(root)?;
     let mut finder = PathFinder::new(graph.node_count());
 
     let stdin = std::io::stdin();
@@ -195,82 +195,6 @@ fn dispatch_tool(
             }))
             .map_err(|e| e.to_string())
         }
-        "cx_depends" => {
-            let target = args
-                .get("target")
-                .and_then(|v| v.as_str())
-                .ok_or("missing 'target' parameter")?;
-
-            let start = graph
-                .nodes
-                .iter()
-                .position(|n| graph.strings.get(n.name) == target)
-                .map(|i| i as u32)
-                .ok_or_else(|| format!("symbol not found: {}", target))?;
-
-            let direction = match args.get("direction").and_then(|v| v.as_str()) {
-                Some("upstream") => cx_core::query::depends::DependsDirection::Upstream,
-                _ => cx_core::query::depends::DependsDirection::Downstream,
-            };
-
-            let result = cx_core::query::depends::depends(graph, start, direction, ALL_EDGES, 10);
-            let deps: Vec<serde_json::Value> = result
-                .nodes
-                .iter()
-                .map(|&id| {
-                    let node = graph.node(id);
-                    serde_json::json!({
-                        "name": graph.strings.get(node.name),
-                        "file": if node.file != u32::MAX { Some(graph.strings.get(node.file)) } else { None },
-                    })
-                })
-                .collect();
-
-            serde_json::to_string(&serde_json::json!({ "dependencies": deps }))
-                .map_err(|e| e.to_string())
-        }
-        "cx_context" => {
-            let ctx = crate::commands::context::build_context(graph);
-            serde_json::to_string(&ctx).map_err(|e| e.to_string())
-        }
-        "cx_search" => {
-            let query = args
-                .get("query")
-                .and_then(|v| v.as_str())
-                .ok_or("missing 'query' parameter")?;
-            let results = crate::commands::search::search_graph(graph, query, 20);
-            let output: Vec<serde_json::Value> = results
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "name": r.name,
-                        "kind": r.kind,
-                        "file": r.file,
-                        "line": r.line,
-                    })
-                })
-                .collect();
-            serde_json::to_string(&output).map_err(|e| e.to_string())
-        }
-        "cx_resolve" => {
-            let query = args
-                .get("query")
-                .and_then(|v| v.as_str())
-                .ok_or("missing 'query' parameter")?;
-            let results = crate::commands::search::search_graph(graph, query, 10);
-            let output: Vec<serde_json::Value> = results
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "name": r.name,
-                        "kind": r.kind,
-                        "file": r.file,
-                        "line": r.line,
-                    })
-                })
-                .collect();
-            serde_json::to_string(&output).map_err(|e| e.to_string())
-        }
         "cx_network" => {
             let kind = args.get("kind").and_then(|v| v.as_str());
             let direction = args.get("direction").and_then(|v| v.as_str());
@@ -299,52 +223,6 @@ fn tool_definitions() -> Vec<serde_json::Value> {
                     "max_depth": { "type": "integer", "default": 20 }
                 },
                 "required": ["from"]
-            }
-        }),
-        serde_json::json!({
-            "name": "cx_depends",
-            "description": "Get transitive dependencies for a service or symbol.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string", "description": "Service or symbol name" },
-                    "direction": { "type": "string", "enum": ["downstream", "upstream"], "default": "downstream" },
-                    "depth": { "type": "integer", "default": 3 }
-                },
-                "required": ["target"]
-            }
-        }),
-        serde_json::json!({
-            "name": "cx_context",
-            "description": "Get structured summary of a service.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "service": { "type": "string", "description": "Service name (optional)" }
-                }
-            }
-        }),
-        serde_json::json!({
-            "name": "cx_search",
-            "description": "Fuzzy symbol search.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Search query" }
-                },
-                "required": ["query"]
-            }
-        }),
-        serde_json::json!({
-            "name": "cx_resolve",
-            "description": "Resolve a qualified name to specific symbols.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Qualified name to resolve" },
-                    "kind": { "type": "string", "description": "Filter by kind (Symbol, Endpoint, etc.)" }
-                },
-                "required": ["query"]
             }
         }),
         serde_json::json!({
@@ -395,14 +273,14 @@ mod tests {
             "package main\n\nfunc main() { helper() }\nfunc helper() {}\n",
         )
         .unwrap();
-        crate::commands::init::run(dir.path(), false).unwrap();
+        crate::commands::build::run(dir.path(), &[], false).unwrap();
         dir
     }
 
     #[test]
     fn mcp_server_tool_listing() {
         let dir = setup_mcp_root();
-        let graph = crate::commands::init::load_graph(dir.path()).unwrap();
+        let graph = crate::indexing::load_graph(dir.path()).unwrap();
         let mut finder = PathFinder::new(graph.node_count());
 
         let req = r#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
@@ -410,20 +288,17 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
 
         let tools = v["result"]["tools"].as_array().unwrap();
-        assert!(tools.len() >= 6, "should have at least 6 tools");
+        assert!(tools.len() >= 2, "should have at least 2 tools");
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"cx_path"));
-        assert!(names.contains(&"cx_depends"));
-        assert!(names.contains(&"cx_context"));
-        assert!(names.contains(&"cx_search"));
-        assert!(names.contains(&"cx_resolve"));
+        assert!(names.contains(&"cx_network"));
     }
 
     #[test]
     fn mcp_cx_path_call() {
         let dir = setup_mcp_root();
-        let graph = crate::commands::init::load_graph(dir.path()).unwrap();
+        let graph = crate::indexing::load_graph(dir.path()).unwrap();
         let mut finder = PathFinder::new(graph.node_count());
 
         let req = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"cx_path","arguments":{"from":"main"}},"id":2}"#;
@@ -438,19 +313,16 @@ mod tests {
     }
 
     #[test]
-    fn mcp_cx_context_call() {
+    fn mcp_cx_network_call() {
         let dir = setup_mcp_root();
-        let graph = crate::commands::init::load_graph(dir.path()).unwrap();
+        let graph = crate::indexing::load_graph(dir.path()).unwrap();
         let mut finder = PathFinder::new(graph.node_count());
 
-        let req = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"cx_context","arguments":{}},"id":3}"#;
+        let req = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"cx_network","arguments":{}},"id":3}"#;
         let resp = handle_request(req, &graph, &mut finder, dir.path());
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
 
         assert!(v.get("error").is_none(), "should not error: {}", resp);
-        let content = v["result"]["content"][0]["text"].as_str().unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
-        assert!(parsed.get("summary").is_some());
     }
 
     #[test]
@@ -474,7 +346,7 @@ mod tests {
     #[test]
     fn mcp_invalid_json() {
         let dir = setup_mcp_root();
-        let graph = crate::commands::init::load_graph(dir.path()).unwrap();
+        let graph = crate::indexing::load_graph(dir.path()).unwrap();
         let mut finder = PathFinder::new(graph.node_count());
 
         let resp = handle_request("not json at all{{{", &graph, &mut finder, dir.path());
@@ -485,7 +357,7 @@ mod tests {
     #[test]
     fn mcp_unknown_tool() {
         let dir = setup_mcp_root();
-        let graph = crate::commands::init::load_graph(dir.path()).unwrap();
+        let graph = crate::indexing::load_graph(dir.path()).unwrap();
         let mut finder = PathFinder::new(graph.node_count());
 
         let req = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}},"id":5}"#;
@@ -501,7 +373,7 @@ mod tests {
     #[test]
     fn mcp_query_after_error() {
         let dir = setup_mcp_root();
-        let graph = crate::commands::init::load_graph(dir.path()).unwrap();
+        let graph = crate::indexing::load_graph(dir.path()).unwrap();
         let mut finder = PathFinder::new(graph.node_count());
 
         // First: invalid request

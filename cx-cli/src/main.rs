@@ -16,60 +16,61 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Index the current directory
-    Init {
+    /// Build the graph for one or more paths
+    Build {
+        /// Paths to the repositories to build (defaults to current directory)
+        paths: Vec<String>,
         /// Show detailed LSP and LLM classification progress
         #[arg(long, short)]
         verbose: bool,
     },
-    /// Add another repo to the graph
-    Add {
-        /// Path to the repo to add
-        path: String,
-    },
-    /// Show service structure
-    Context,
-    /// Search for symbols
-    Search {
-        /// Search query
-        query: String,
-    },
-    /// Inspect a symbol's edges
-    Inspect {
-        /// Symbol name to inspect
-        symbol: String,
-    },
-    /// Show edge summary or list edges
-    Edges {
-        /// Filter by edge kind (e.g., Calls, Imports, Contains)
+    /// Trace the lineage of a network call or configuration variable
+    #[command(after_help = "\x1b[1mTarget syntax:\x1b[0m
+  env:DATABASE_URL       trace a specific env var
+  env:AZURE_*            glob -- all env vars matching AZURE_*
+  env:*                  all env vars (compact summary)
+  call:client.go:Dial    trace a call site in a file
+  writer.go:27           trace the function at a file:line
+  pgxpool.New            trace callee from network.json (external lib)
+  NewAzureASR            trace a function (fuzzy suggests on miss)
+
+\x1b[1mNode types in the graph:\x1b[0m
+  Symbol      functions, methods, variables
+  Resource    env vars (UPPER_CASE), connection targets (redis, kafka)
+  Endpoint    HTTP routes, gRPC services
+  Module      packages, modules (Go package, Python module)
+  Deployable  services, containers
+
+\x1b[1mEdge types you'll see in traces:\x1b[0m
+  Calls       function calls another function
+  Configures  function reads an env var / config value
+  Connects    function makes a network connection
+  Resolves    env var resolves to a connection target
+  Contains    module contains a symbol
+  Imports     file imports a module
+  DependsOn   cross-repo dependency
+
+\x1b[1mExamples:\x1b[0m
+  cx trace AZURE_SPEECH_KEY              full trace with provenance
+  cx trace 'env:*'                       overview of all env vars
+  cx trace 'env:*_ADDR'                  all address env vars
+  cx trace pgxpool.New                   trace a database call (resolves via network.json)
+  cx trace writer.go:27                  trace the function at a specific line")]
+    Trace {
+        /// Target to trace (env:VAR, call:file:Func, or symbol name)
+        target: String,
+        /// Show only upstream paths (who feeds into this?)
         #[arg(long)]
-        kind: Option<String>,
-        /// Max edges to show
-        #[arg(long, default_value = "20")]
-        limit: usize,
-    },
-    /// Trace execution path from/to a symbol
-    Path {
-        /// Symbol to trace from (downstream + upstream)
+        upstream: bool,
+        /// Show only downstream paths (what does this feed into?)
         #[arg(long)]
-        from: Option<String>,
-        /// Symbol to trace to (find all paths reaching this symbol)
-        #[arg(long)]
-        to: Option<String>,
+        downstream: bool,
         /// Max traversal depth
         #[arg(long, default_value = "20")]
         max_depth: u32,
-    },
-    /// Show transitive dependencies
-    Depends {
-        /// Symbol or service name
-        symbol: String,
-        /// Show upstream (what depends on this) instead of downstream
+        /// Output as JSON
         #[arg(long)]
-        upstream: bool,
-        /// Max depth
-        #[arg(long, default_value = "10")]
-        max_depth: u32,
+        json: bool,
     },
     /// List all detected network calls and exposed APIs
     Network {
@@ -92,36 +93,8 @@ enum Commands {
         #[arg(long)]
         include_all: bool,
     },
-    /// Re-index repos that have changed since last index
-    Refresh,
-    /// Manage remote graph sources for cross-team queries
-    Remote {
-        #[command(subcommand)]
-        action: RemoteAction,
-    },
     /// Start MCP server (JSON-RPC over stdio)
     Mcp,
-}
-
-#[derive(Subcommand)]
-enum RemoteAction {
-    /// Add a remote graph source
-    Add {
-        /// Name for this remote
-        name: String,
-        /// Local path to the remote cx workspace
-        path: String,
-    },
-    /// Pull graphs from configured remotes
-    Pull {
-        /// Pull only from this specific remote
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// Ensure local graph is ready for sharing
-    Push,
-    /// List all configured remotes
-    List,
 }
 
 fn main() {
@@ -136,20 +109,14 @@ fn main() {
     let root = std::env::current_dir().expect("failed to get current directory");
 
     let result = match cli.command {
-        Commands::Init { verbose } => commands::init::run(&root, verbose),
-        Commands::Add { ref path } => commands::add::run(&root, path),
-        Commands::Context => commands::context::run(&root),
-        Commands::Search { ref query } => commands::search::run(&root, query),
-        Commands::Inspect { ref symbol } => commands::inspect::run(&root, symbol),
-        Commands::Edges { ref kind, limit } => commands::edges::run(&root, kind.as_deref(), limit),
-        Commands::Path { ref from, ref to, max_depth } => {
-            commands::path::run(&root, from.as_deref(), to.as_deref(), max_depth)
-        }
-        Commands::Depends {
-            ref symbol,
+        Commands::Build { ref paths, verbose } => commands::build::run(&root, paths, verbose),
+        Commands::Trace {
+            ref target,
             upstream,
+            downstream,
             max_depth,
-        } => commands::depends::run(&root, symbol, upstream, max_depth),
+            json,
+        } => commands::trace::run(&root, target, upstream, downstream, max_depth, json),
         Commands::Network {
             json,
             ref kind,
@@ -157,18 +124,15 @@ fn main() {
             ref service,
             local_only,
             include_all,
-        } => commands::network::run(&root, json, kind.as_deref(), direction.as_deref(), service.as_deref(), local_only, include_all),
-        Commands::Refresh => commands::refresh::run(&root),
-        Commands::Remote { action } => match action {
-            RemoteAction::Add { ref name, ref path } => {
-                commands::remote::run_add(&root, name, path)
-            }
-            RemoteAction::Pull { ref name } => {
-                commands::remote::run_pull(&root, name.as_deref())
-            }
-            RemoteAction::Push => commands::remote::run_push(&root),
-            RemoteAction::List => commands::remote::run_list(&root),
-        },
+        } => commands::network::run(
+            &root,
+            json,
+            kind.as_deref(),
+            direction.as_deref(),
+            service.as_deref(),
+            local_only,
+            include_all,
+        ),
         Commands::Mcp => mcp::run(&root),
     };
 

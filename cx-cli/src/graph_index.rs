@@ -66,6 +66,7 @@ impl GlobalIndex {
     }
 
     /// Remove all entries for a given repo_id (before re-adding updated ones).
+    #[allow(dead_code)] // Used when cx remote is re-added
     pub fn remove_repo(&mut self, repo_id: u16) {
         for entries in self.exposed_apis.values_mut() {
             entries.retain(|e| e.repo_id != repo_id);

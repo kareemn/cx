@@ -922,14 +922,14 @@ pub fn propagate(
     }
 
     // Worklist: propagate Parameter sources through callers
-    let mut worklist: Vec<(StringId, u8, usize)> = Vec::new(); // (func_name, param_idx, sink_idx)
+    let mut param_worklist: Vec<(StringId, u8, usize)> = Vec::new(); // (func_name, param_idx, sink_idx)
 
     // Find all Parameter sources in direct sinks and enqueue
     for (idx, sink_ref) in direct_sink_refs.iter().enumerate() {
         if let AddressSource::Parameter { func, param_idx, .. } = &sink_ref.address_source {
             let func_id = strings.intern_lookup(func);
             if let Some(fid) = func_id {
-                worklist.push((fid, *param_idx, idx));
+                param_worklist.push((fid, *param_idx, idx));
             }
         }
     }
@@ -937,11 +937,11 @@ pub fn propagate(
     let mut visited: FxHashSet<(StringId, u8)> = FxHashSet::default();
     let mut depth = 0u32;
 
-    while !worklist.is_empty() && depth < max_depth {
+    while !param_worklist.is_empty() && depth < max_depth {
         let next_worklist = Vec::new();
         depth += 1;
 
-        for (func_name, param_idx, sink_idx) in worklist.drain(..) {
+        for (func_name, param_idx, sink_idx) in param_worklist.drain(..) {
             if !visited.insert((func_name, param_idx)) {
                 continue;
             }
@@ -972,7 +972,21 @@ pub fn propagate(
             }
         }
 
-        worklist = next_worklist;
+        param_worklist = next_worklist;
+    }
+
+    // FieldAccess propagation: for each sink whose address_source is FieldAccess
+    // with empty assignment_sources, scan ALL functions' flow facts for FieldStore
+    // facts that write to the same (type, field) and trace backward through the
+    // stored value. This resolves e.g. self.wsURL across function boundaries.
+    for sink_ref in &mut direct_sink_refs {
+        propagate_field_access(
+            &mut sink_ref.address_source,
+            flow_facts_map,
+            strings,
+            const_map,
+            max_depth,
+        );
     }
 
     results
@@ -1010,6 +1024,86 @@ fn trace_caller_arg(
 
     AddressSource::Dynamic {
         hint: "caller-arg-not-found".to_string(),
+    }
+}
+
+/// Recursively propagate FieldAccess sources across function boundaries.
+///
+/// For each FieldAccess with empty assignment_sources, scans ALL functions'
+/// flow facts for FieldStore facts that write to the same (type, field) pair,
+/// traces backward through the stored value, and populates assignment_sources.
+fn propagate_field_access(
+    source: &mut AddressSource,
+    flow_facts_map: &FxHashMap<StringId, Vec<FlowFact>>,
+    strings: &StringInterner,
+    const_map: &FxHashMap<StringId, StringId>,
+    max_depth: u32,
+) {
+    match source {
+        AddressSource::FieldAccess {
+            type_name,
+            field,
+            assignment_sources,
+        } => {
+            if !assignment_sources.is_empty() {
+                // Already resolved (within-function tracing found it) — recurse into children
+                for child in assignment_sources.iter_mut() {
+                    propagate_field_access(child, flow_facts_map, strings, const_map, max_depth);
+                }
+                return;
+            }
+
+            // Look up StringIds for type_name and field
+            let type_id = strings.intern_lookup(type_name);
+            let field_id = strings.intern_lookup(field);
+            let (Some(type_id), Some(field_id)) = (type_id, field_id) else {
+                return;
+            };
+
+            // Scan all functions' flow facts for FieldStore to this (type, field)
+            let mut found = Vec::new();
+            for facts in flow_facts_map.values() {
+                for fact in facts {
+                    if let FlowSource::FieldStore {
+                        receiver,
+                        field: store_field,
+                        value,
+                    } = &fact.source
+                    {
+                        if *receiver == type_id && *store_field == field_id {
+                            let traced = trace_backward(
+                                facts,
+                                *value,
+                                fact.byte_offset,
+                                strings,
+                                const_map,
+                                max_depth,
+                                &mut FxHashSet::default(),
+                            );
+                            found.push(traced);
+                        }
+                    }
+                }
+            }
+
+            *assignment_sources = found;
+
+            // Recurse into newly found sources
+            for child in assignment_sources.iter_mut() {
+                propagate_field_access(child, flow_facts_map, strings, const_map, max_depth);
+            }
+        }
+        AddressSource::Parameter { caller_sources, .. } => {
+            for child in caller_sources.iter_mut() {
+                propagate_field_access(child, flow_facts_map, strings, const_map, max_depth);
+            }
+        }
+        AddressSource::Concat { parts } => {
+            for part in parts.iter_mut() {
+                propagate_field_access(part, flow_facts_map, strings, const_map, max_depth);
+            }
+        }
+        _ => {}
     }
 }
 
