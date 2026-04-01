@@ -10,8 +10,8 @@ use std::path::PathBuf;
 /// 2. Run resolution engine (gRPC, REST, env→Helm→k8s, Docker image, WebSocket)
 /// 3. Optionally upgrade heuristic results via LSP
 /// 4. Build the unified CSR graph
-pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)], verbose: bool) -> Result<IndexResult> {
-    let mut merged = pipeline::extract_and_merge_repos(repos)
+pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)], verbose: bool, custom_sinks: &cx_extractors::custom_sinks::CustomSinkConfig) -> Result<IndexResult> {
+    let mut merged = pipeline::extract_and_merge_repos(repos, custom_sinks)
         .context("failed to extract repos")?;
 
     let resolved = resolve_cross_repo(&mut merged);
@@ -839,7 +839,7 @@ fn add_cross_repo_edge(
 #[allow(dead_code)] // Used when cx remote is re-added
 pub fn index_single_repo(repo_path: &std::path::Path, repo_id: u16) -> Result<IndexResult> {
     let repos = vec![(repo_path.to_path_buf(), repo_id)];
-    let merged = pipeline::extract_and_merge_repos(&repos)
+    let merged = pipeline::extract_and_merge_repos(&repos, &cx_extractors::custom_sinks::CustomSinkConfig::default())
         .context("failed to extract repo")?;
     Ok(pipeline::build_index(merged))
 }
@@ -988,7 +988,7 @@ func CallService() {
             (client_repo.path().to_path_buf(), 1u16),
         ];
 
-        let result = index_repos_with_resolution(&repos, false).unwrap();
+        let result = index_repos_with_resolution(&repos, false, &cx_extractors::custom_sinks::CustomSinkConfig::default()).unwrap();
         let graph = &result.graph;
 
         // Should have a DependsOn edge from client → server
@@ -1047,7 +1047,7 @@ spec:
         .unwrap();
 
         let repos = vec![(repo.path().to_path_buf(), 0u16)];
-        let result = index_repos_with_resolution(&repos, false).unwrap();
+        let result = index_repos_with_resolution(&repos, false, &cx_extractors::custom_sinks::CustomSinkConfig::default()).unwrap();
 
         // Verify the K8s env bindings were extracted
         // The resolution should find PRODUCT_CATALOG_SERVICE_ADDR → productcatalogservice:3550

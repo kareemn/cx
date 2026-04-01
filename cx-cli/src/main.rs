@@ -72,6 +72,34 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Add a remote repo's pre-built graph (local path or git URL)
+    #[command(after_help = "\x1b[1mExamples:\x1b[0m
+  cx add ../other-service               local path
+  cx add /abs/path/to/repo              absolute path
+  cx add git@github.com:org/repo.git    clone via git")]
+    Add {
+        /// Path to repo or git URL
+        path: String,
+    },
+    /// Refresh graphs from all registered remotes
+    Pull {
+        /// Only pull a specific remote by name
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Show unresolved network calls and generate sink config
+    #[command(after_help = "\x1b[1mExamples:\x1b[0m
+  cx fix                show what's unresolved
+  cx fix --check        show unresolved + dynamic sources
+  cx fix --init         generate .cx/config/sinks.toml template")]
+    Fix {
+        /// Generate .cx/config/sinks.toml from unresolved calls
+        #[arg(long)]
+        init: bool,
+        /// Show detailed unresolved info including dynamic sources
+        #[arg(long)]
+        check: bool,
+    },
     /// List all detected network calls and exposed APIs
     Network {
         /// Output as JSON
@@ -110,6 +138,9 @@ fn main() {
 
     let result = match cli.command {
         Commands::Build { ref paths, verbose } => commands::build::run(&root, paths, verbose),
+        Commands::Add { ref path } => commands::add::run(&root, path),
+        Commands::Pull { ref name } => commands::add::run_pull(&root, name.as_deref()),
+        Commands::Fix { init, check } => commands::fix::run(&root, init, check),
         Commands::Trace {
             ref target,
             upstream,

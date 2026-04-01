@@ -450,6 +450,7 @@ dependencies = [
  "streaming-iterator",
  "tempfile",
  "thiserror",
+ "toml",
  "tree-sitter",
  "tree-sitter-c",
  "tree-sitter-cpp",

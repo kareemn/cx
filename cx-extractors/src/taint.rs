@@ -700,6 +700,7 @@ pub fn analyze_file(
     raw: &RawFileExtraction,
     file_id: StringId,
     strings: &StringInterner,
+    custom_sinks: &crate::custom_sinks::CustomSinkConfig,
 ) -> Vec<FunctionFlowSummary> {
     let flow_facts_by_func = extract_flow_facts(raw, strings);
     let const_map: FxHashMap<StringId, StringId> = raw
@@ -736,6 +737,21 @@ pub fn analyze_file(
 
             // Try exact FQN match first (if we had LSP, the callee would be fully qualified)
             let (fqn_candidates, resolved_via_import) = build_fqn_candidates(receiver, callee, raw, strings);
+
+            // Check custom sinks first (user overrides win), then built-in registry
+            let short_name = if receiver.is_empty() {
+                callee.to_string()
+            } else {
+                format!("{}.{}", receiver, callee)
+            };
+
+            let custom_match = crate::custom_sinks::lookup_custom_sink(&short_name, custom_sinks)
+                .or_else(|| {
+                    fqn_candidates.iter().find_map(|fqn| {
+                        crate::custom_sinks::lookup_custom_sink(fqn, custom_sinks)
+                    })
+                });
+
             let sink_entry = fqn_candidates
                 .iter()
                 .find_map(|fqn| sink_registry::lookup_sink(fqn));
@@ -747,7 +763,10 @@ pub fn analyze_file(
                 ""
             };
 
-            let (net_kind, addr_arg_idx, confidence) = if let Some(entry) = sink_entry {
+            let (net_kind, addr_arg_idx, confidence) = if let Some((cat, arg, _dir)) = custom_match {
+                // Custom sink from .cx/config/sinks.toml — high confidence
+                (cat, arg, Confidence::ImportResolved)
+            } else if let Some(entry) = sink_entry {
                 let conf = if resolved_via_import {
                     Confidence::ImportResolved
                 } else {
@@ -1133,7 +1152,7 @@ pub fn analyze_raw_file(
     strings: &mut StringInterner,
 ) -> Vec<ResolvedNetworkCall> {
     let file_id = strings.intern(file_path);
-    let summaries = analyze_file(raw, file_id, strings);
+    let summaries = analyze_file(raw, file_id, strings, &crate::custom_sinks::CustomSinkConfig::default());
 
     summaries
         .into_iter()

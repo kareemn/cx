@@ -55,7 +55,17 @@ pub fn run(root: &Path, paths: &[String], verbose: bool) -> Result<()> {
         eprintln!("  [{}] {}", id, path.display());
     }
 
-    let result = crate::indexing::index_repos_with_resolution(&repos, verbose)?;
+    // Load custom sink definitions from .cx/config/sinks.toml
+    let custom_sinks = cx_extractors::custom_sinks::CustomSinkConfig::load(root);
+    if !custom_sinks.is_empty() {
+        eprintln!(
+            "Custom sinks: {} sink(s), {} endpoint(s) from .cx/config/sinks.toml",
+            custom_sinks.sinks.len(),
+            custom_sinks.endpoints.len(),
+        );
+    }
+
+    let result = crate::indexing::index_repos_with_resolution(&repos, verbose, &custom_sinks)?;
 
     let elapsed = start.elapsed();
 

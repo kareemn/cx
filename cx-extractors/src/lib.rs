@@ -1,4 +1,5 @@
 pub mod connection_patterns;
+pub mod custom_sinks;
 pub mod database;
 pub mod dockerfile;
 pub mod envvar;

@@ -90,7 +90,6 @@ pub fn git_head_hash(repo_path: &Path) -> Option<String> {
 }
 
 /// Add a remote to the config if not already present by name. Returns true if added.
-#[allow(dead_code)] // Used when cx remote is re-added
 pub fn add_remote(config: &mut CxConfig, name: String, path: PathBuf) -> bool {
     if config.remotes.iter().any(|r| r.name == name) {
         return false;

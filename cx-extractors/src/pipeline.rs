@@ -255,7 +255,7 @@ pub fn index_directory(root: &Path) -> crate::Result<IndexResult> {
 
 /// Run the indexing pipeline across multiple repos, producing a single unified graph.
 pub fn index_repos(repos: &[(PathBuf, u16)]) -> crate::Result<IndexResult> {
-    let merged = extract_and_merge_repos(repos)?;
+    let merged = extract_and_merge_repos(repos, &crate::custom_sinks::CustomSinkConfig::default())?;
     Ok(build_index(merged))
 }
 
@@ -279,7 +279,7 @@ pub fn build_index(merged: MergedResult) -> IndexResult {
 ///
 /// This does everything except building the CSR graph, so callers can inject
 /// additional edges (e.g., from the gRPC resolution engine) before calling `build_index`.
-pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<MergedResult> {
+pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)], custom_sinks: &crate::custom_sinks::CustomSinkConfig) -> crate::Result<MergedResult> {
     // Step 1: Collect files from all repos (including .proto files)
     let mut all_repo_files: Vec<RepoFile> = Vec::new();
     let mut proto_files: Vec<RepoFile> = Vec::new();
@@ -817,7 +817,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)]) -> crate::Result<Merged
     for (raw, file_strings, path_str, _source_bytes) in &raw_extractions {
         // Use STRING_NONE as file_id — we extract direct sinks manually with the real path
         let file_id = cx_core::graph::nodes::STRING_NONE;
-        let summaries = taint::analyze_file(raw, file_id, file_strings);
+        let summaries = taint::analyze_file(raw, file_id, file_strings, custom_sinks);
 
         // Build string remap cache for this file's interner → merged interner
         let mut str_remap: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
@@ -2222,7 +2222,7 @@ func callService() {
         )
         .unwrap();
 
-        let merged = extract_and_merge_repos(&[(repo.path().to_path_buf(), 0)]).unwrap();
+        let merged = extract_and_merge_repos(&[(repo.path().to_path_buf(), 0)], &crate::custom_sinks::CustomSinkConfig::default()).unwrap();
 
         let all_servers: Vec<&str> = merged
             .grpc_servers
@@ -2269,7 +2269,7 @@ service Auth {
         )
         .unwrap();
 
-        let merged = extract_and_merge_repos(&[(repo.path().to_path_buf(), 0)]).unwrap();
+        let merged = extract_and_merge_repos(&[(repo.path().to_path_buf(), 0)], &crate::custom_sinks::CustomSinkConfig::default()).unwrap();
 
         let all_services: Vec<&str> = merged
             .proto_services
@@ -2449,7 +2449,7 @@ spec:
         )
         .unwrap();
 
-        let merged = extract_and_merge_repos(&[(repo.path().to_path_buf(), 0)]).unwrap();
+        let merged = extract_and_merge_repos(&[(repo.path().to_path_buf(), 0)], &crate::custom_sinks::CustomSinkConfig::default()).unwrap();
 
         let helm_calls: Vec<&ResolvedNetworkCall> = merged
             .network_calls
