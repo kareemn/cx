@@ -205,7 +205,7 @@ func doWork() {}
 "#,
         )
         .unwrap();
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
         dir
     }
 
@@ -271,7 +271,7 @@ func doWork() {}
         )
         .unwrap();
 
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
         let graph = super::super::init::load_graph(dir.path()).unwrap();
 
         let output = inspect_symbol(&graph, "Run");

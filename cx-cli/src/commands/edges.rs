@@ -132,7 +132,7 @@ func helper() {}
 "#,
         )
         .unwrap();
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
         let graph = super::super::init::load_graph(dir.path()).unwrap();
         (dir, graph)
     }
@@ -201,7 +201,7 @@ func helper() {}
         source.push_str("}\n");
         fs::write(dir.path().join("main.go"), &source).unwrap();
 
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
         let graph = super::super::init::load_graph(dir.path()).unwrap();
 
         // Count Calls edges

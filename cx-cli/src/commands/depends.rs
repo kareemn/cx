@@ -73,7 +73,7 @@ mod tests {
             "package main\n\nfunc a() { b() }\nfunc b() {}\n",
         )
         .unwrap();
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
         assert!(run(dir.path(), "a", false, 10).is_ok());
     }
 
@@ -85,7 +85,7 @@ mod tests {
             "package main\n\nfunc a() { b() }\nfunc b() {}\n",
         )
         .unwrap();
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
         assert!(run(dir.path(), "b", true, 10).is_ok());
     }
 }

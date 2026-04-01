@@ -275,7 +275,7 @@ mod tests {
             "package main\n\nfunc a() { b() }\nfunc b() { c() }\nfunc c() {}\n",
         )
         .unwrap();
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
 
         // Just verify it doesn't panic
         let result = run(dir.path(), Some("a"), None, 10);
@@ -286,7 +286,7 @@ mod tests {
     fn path_symbol_not_found() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("main.go"), "package main\nfunc main() {}\n").unwrap();
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
 
         let result = run(dir.path(), Some("nonexistent"), None, 10);
         assert!(result.is_ok());
@@ -300,7 +300,7 @@ mod tests {
             "package main\n\nfunc a() { b() }\nfunc b() { c() }\nfunc c() {}\n",
         )
         .unwrap();
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
 
         let result = run(dir.path(), None, Some("c"), 10);
         assert!(result.is_ok());

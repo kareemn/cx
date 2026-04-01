@@ -123,7 +123,7 @@ mod tests {
             "package main\nfunc main() {}\n",
         )
         .unwrap();
-        super::super::init::run(main_dir.path()).unwrap();
+        super::super::init::run(main_dir.path(), false).unwrap();
 
         // Create other repo
         fs::write(
@@ -192,7 +192,7 @@ mod tests {
         )
         .unwrap();
 
-        super::super::init::run(main_dir.path()).unwrap();
+        super::super::init::run(main_dir.path(), false).unwrap();
         run(main_dir.path(), repo_a.path().to_str().unwrap()).unwrap();
         run(main_dir.path(), repo_b.path().to_str().unwrap()).unwrap();
 
@@ -230,7 +230,7 @@ mod tests {
         )
         .unwrap();
 
-        super::super::init::run(main_dir.path()).unwrap();
+        super::super::init::run(main_dir.path(), false).unwrap();
         run(main_dir.path(), other_dir.path().to_str().unwrap()).unwrap();
         run(main_dir.path(), other_dir.path().to_str().unwrap()).unwrap();
 
@@ -254,7 +254,7 @@ mod tests {
         )
         .unwrap();
 
-        super::super::init::run(main_dir.path()).unwrap();
+        super::super::init::run(main_dir.path(), false).unwrap();
         run(main_dir.path(), other_dir.path().to_str().unwrap()).unwrap();
 
         let graph = super::super::init::load_graph(main_dir.path()).unwrap();
@@ -300,7 +300,7 @@ mod tests {
         )
         .unwrap();
 
-        super::super::init::run(main_dir.path()).unwrap();
+        super::super::init::run(main_dir.path(), false).unwrap();
         run(main_dir.path(), other_dir.path().to_str().unwrap()).unwrap();
 
         let index_path = main_dir.path().join(".cx").join("graph").join("index.json");

@@ -6,7 +6,7 @@ use std::time::Instant;
 ///
 /// Creates both the per-repo graph in repos/ and the unified base.cxgraph.
 /// Also initializes the global index (index.json).
-pub fn run(root: &Path) -> Result<()> {
+pub fn run(root: &Path, verbose: bool) -> Result<()> {
     let start = Instant::now();
 
     eprintln!("Indexing {}...", root.display());
@@ -34,7 +34,7 @@ pub fn run(root: &Path) -> Result<()> {
         .map(|(i, r)| (r.path.clone(), i as u16))
         .collect();
 
-    let result = crate::indexing::index_repos_with_resolution(&repos)?;
+    let result = crate::indexing::index_repos_with_resolution(&repos, verbose)?;
 
     let elapsed = start.elapsed();
 
@@ -145,7 +145,7 @@ mod tests {
         )
         .unwrap();
 
-        run(dir.path()).unwrap();
+        run(dir.path(), false).unwrap();
 
         let graph_path = dir.path().join(".cx").join("graph").join("base.cxgraph");
         assert!(graph_path.exists(), "graph file should exist");
@@ -165,7 +165,7 @@ mod tests {
         )
         .unwrap();
 
-        run(dir.path()).unwrap();
+        run(dir.path(), false).unwrap();
 
         let repos_dir = dir.path().join(".cx").join("graph").join("repos");
         assert!(repos_dir.exists(), "repos/ directory should exist");
@@ -195,7 +195,7 @@ mod tests {
         )
         .unwrap();
 
-        run(dir.path()).unwrap();
+        run(dir.path(), false).unwrap();
 
         let index_path = dir.path().join(".cx").join("graph").join("index.json");
         assert!(index_path.exists(), "index.json should exist");
@@ -211,7 +211,7 @@ mod tests {
         )
         .unwrap();
 
-        run(dir.path()).unwrap();
+        run(dir.path(), false).unwrap();
 
         let config_path = dir.path().join(".cx").join("config.toml");
         assert!(config_path.exists(), "config.toml should exist");
@@ -234,7 +234,7 @@ func world() { hello() }
         )
         .unwrap();
 
-        run(dir.path()).unwrap();
+        run(dir.path(), false).unwrap();
 
         let graph = load_graph(dir.path()).unwrap();
         assert!(graph.node_count() > 0, "should have nodes");

@@ -112,7 +112,7 @@ func startServer() {}
 "#,
         )
         .unwrap();
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
         dir
     }
 

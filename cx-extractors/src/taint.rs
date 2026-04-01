@@ -624,14 +624,44 @@ fn resolve_source(
         FlowSource::FieldAccess { receiver, field } => {
             let type_name = strings.get(*receiver);
             let field_name = strings.get(*field);
+
+            // Scan flow_facts for FieldStore facts that assign to the same receiver.field
+            let mut assignment_sources = Vec::new();
+            for fact in flow_facts {
+                if let FlowSource::FieldStore {
+                    receiver: store_recv,
+                    field: store_field,
+                    value,
+                } = &fact.source
+                {
+                    if *store_recv == *receiver && *store_field == *field {
+                        let traced = trace_backward(
+                            flow_facts, *value, fact.byte_offset,
+                            strings, const_map, depth, visited,
+                        );
+                        assignment_sources.push(traced);
+                    }
+                }
+            }
+
             AddressSource::FieldAccess {
                 type_name: type_name.to_string(),
                 field: field_name.to_string(),
-                assignment_sources: Vec::new(),
+                assignment_sources,
             }
         }
-        FlowSource::FieldStore { .. } => AddressSource::Dynamic {
-            hint: "field-store".to_string(),
+        FlowSource::FieldStore { receiver, field, value } => {
+            // Trace the stored value backward
+            let type_name = strings.get(*receiver);
+            let field_name = strings.get(*field);
+            let traced = trace_backward(
+                flow_facts, *value, u32::MAX, strings, const_map, depth, visited,
+            );
+            AddressSource::FieldAccess {
+                type_name: type_name.to_string(),
+                field: field_name.to_string(),
+                assignment_sources: vec![traced],
+            }
         },
         FlowSource::StringConcat { parts } => {
             let resolved: Vec<AddressSource> = parts

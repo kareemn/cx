@@ -10,7 +10,7 @@ use std::path::PathBuf;
 /// 2. Run resolution engine (gRPC, REST, env→Helm→k8s, Docker image, WebSocket)
 /// 3. Optionally upgrade heuristic results via LSP
 /// 4. Build the unified CSR graph
-pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)]) -> Result<IndexResult> {
+pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)], verbose: bool) -> Result<IndexResult> {
     let mut merged = pipeline::extract_and_merge_repos(repos)
         .context("failed to extract repos")?;
 
@@ -31,7 +31,7 @@ pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)]) -> Result<IndexResu
     if !merged.network_calls.is_empty() {
         let workspace_root = repos.first().map(|(p, _)| p.as_path());
         if let Some(root) = workspace_root {
-            upgrade_via_lsp(&mut merged, root);
+            upgrade_via_lsp(&mut merged, root, verbose);
         }
     }
 
@@ -39,11 +39,75 @@ pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)]) -> Result<IndexResu
     if !merged.network_calls.is_empty() {
         let workspace_root = repos.first().map(|(p, _)| p.as_path());
         if let Some(root) = workspace_root {
-            upgrade_via_llm(&mut merged.network_calls, root);
+            upgrade_via_llm(&mut merged.network_calls, root, verbose);
         }
     }
 
     Ok(pipeline::build_index(merged))
+}
+
+/// Format an AddressSource chain as a human-readable provenance string.
+/// e.g. "self.wsURL (field) <- NewClient.url (param) <- EnvVar(WS_URI)"
+fn format_address_chain(src: &cx_extractors::taint::AddressSource) -> String {
+    use cx_extractors::taint::AddressSource;
+    match src {
+        AddressSource::Literal { value } => format!("\"{}\"", truncate(value, 50)),
+        AddressSource::EnvVar { var_name, k8s_value } => {
+            if let Some(v) = k8s_value {
+                format!("env({}) = \"{}\"", var_name, truncate(v, 40))
+            } else {
+                format!("env({})", var_name)
+            }
+        }
+        AddressSource::ConfigKey { key, file } => {
+            if let Some(f) = file {
+                format!("config({}, {})", key, f)
+            } else {
+                format!("config({})", key)
+            }
+        }
+        AddressSource::Parameter { func, param_idx, caller_sources } => {
+            let base = format!("{}.param[{}]", func, param_idx);
+            if caller_sources.is_empty() {
+                base
+            } else {
+                let callers: Vec<String> = caller_sources.iter()
+                    .map(format_address_chain)
+                    .collect();
+                format!("{} <- [{}]", base, callers.join(", "))
+            }
+        }
+        AddressSource::FieldAccess { type_name, field, assignment_sources } => {
+            let base = format!("{}.{}", type_name, field);
+            if assignment_sources.is_empty() {
+                base
+            } else {
+                let assigns: Vec<String> = assignment_sources.iter()
+                    .map(format_address_chain)
+                    .collect();
+                format!("{} <- [{}]", base, assigns.join(", "))
+            }
+        }
+        AddressSource::Concat { parts } => {
+            let pieces: Vec<String> = parts.iter()
+                .map(format_address_chain)
+                .collect();
+            pieces.join(" + ")
+        }
+        AddressSource::Flag { flag_name, default_value } => {
+            if let Some(d) = default_value {
+                format!("flag({}, default=\"{}\")", flag_name, d)
+            } else {
+                format!("flag({})", flag_name)
+            }
+        }
+        AddressSource::ServiceDiscovery { service_name, mechanism } => {
+            format!("svc_discovery({}, {})", service_name, mechanism)
+        }
+        AddressSource::Dynamic { hint } => {
+            if hint.is_empty() { "dynamic".to_string() } else { format!("dynamic({})", hint) }
+        }
+    }
 }
 
 /// Extract ~30 lines of source context around a call site for LLM analysis.
@@ -60,7 +124,7 @@ fn extract_call_context(file_path: &str, line: u32, workspace_root: &std::path::
 /// Upgrade heuristic network calls via Claude CLI with source context.
 /// Sends function context to Haiku and asks for both classification AND target resolution.
 /// Silently skips if `claude` CLI is not available.
-fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetworkCall>, workspace_root: &std::path::Path) {
+fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetworkCall>, workspace_root: &std::path::Path, verbose: bool) {
     // Check if claude CLI is available
     let claude_check = std::process::Command::new("claude")
         .arg("--version")
@@ -69,7 +133,12 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
         .status();
     match claude_check {
         Ok(s) if s.success() => {}
-        _ => return,
+        _ => {
+            if verbose {
+                eprintln!("LLM: claude CLI not found, skipping");
+            }
+            return;
+        }
     }
 
     // Collect heuristic calls
@@ -81,31 +150,48 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
         .collect();
 
     if heuristic_indices.is_empty() {
+        if verbose {
+            eprintln!("LLM: no heuristic calls remaining, skipping");
+        }
         return;
     }
 
-    eprintln!("LLM: classifying {} heuristic call(s) via Claude CLI...", heuristic_indices.len());
+    let total_batches = (heuristic_indices.len() + 9) / 10;
+    eprintln!("LLM: classifying {} heuristic call(s) via Claude CLI ({} batch(es) of 10)...",
+        heuristic_indices.len(), total_batches);
 
     let mut upgraded = 0u32;
-    for batch in heuristic_indices.chunks(10) {
+    let mut not_network = 0u32;
+    let mut failed_batches = 0u32;
+    let mut parse_failures = 0u32;
+
+    for (batch_num, batch) in heuristic_indices.chunks(10).enumerate() {
+        eprint!("\r  batch {}/{}", batch_num + 1, total_batches);
+
         let mut prompt = String::from(
             "Classify these network call sites and resolve their targets. For each, respond with ONLY a JSON array.\n\
              Each entry: {\"idx\": N, \"kind\": \"...\", \"direction\": \"inbound|outbound\", \"target\": \"...\", \"target_source\": \"...\"}\n\n\
              Kinds: http_client, http_server, grpc_client, grpc_server, websocket_client, websocket_server,\n\
-                    kafka_producer, kafka_consumer, database, redis, sqs, s3, tcp_dial, tcp_listen, not_network\n\
-             Target: the resolved URL, hostname, env var, or \"dynamic\" if unresolvable\n\
-             Target source: literal|env_var|config|parameter|field|concat|service_discovery|dynamic\n\n"
+                    kafka_producer, kafka_consumer, database, redis, sqs, s3, tcp_dial, tcp_listen, not_network\n\n\
+             For 'target': trace the variable chain to its origin. Use the provenance chain provided.\n\
+             - If it resolves to an env var, return the env var name (e.g. \"SENTENCE_EMBEDDER_BASE_URL\")\n\
+             - If it resolves to a config key, return the key (e.g. \"db.host\")\n\
+             - If it resolves to a literal, return the literal value\n\
+             - If it resolves to a field, return type.field (e.g. \"Config.wsURL\")\n\
+             - If it resolves to a parameter, return func.param[N] (e.g. \"NewClient.param[0]\")\n\
+             - Only use \"dynamic\" if truly unresolvable after following the chain\n\n\
+             For 'target_source': literal|env_var|config|parameter|field|concat|service_discovery|flag|dynamic\n\n"
         );
 
         for (batch_idx, &call_idx) in batch.iter().enumerate() {
             let call = &network_calls[call_idx];
             let context = extract_call_context(&call.file, call.line, workspace_root)
                 .unwrap_or_default();
-            let hint = serde_json::to_string(&call.address_source).unwrap_or_default();
+            let chain = format_address_chain(&call.address_source);
             prompt.push_str(&format!(
-                "[{}] {}:{} (callee: {}, current: {}, hint: {})\n{}\n\n",
+                "[{}] {}:{} callee={} current_kind={}\n  provenance: {}\n{}\n\n",
                 batch_idx, call.file, call.line, call.callee_fqn,
-                call.net_kind.as_str(), hint, context
+                call.net_kind.as_str(), chain, context
             ));
         }
 
@@ -117,7 +203,13 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
 
         let output = match result {
             Ok(o) if o.status.success() => o,
-            _ => continue,
+            _ => {
+                failed_batches += 1;
+                if verbose {
+                    eprintln!("  batch {}/{}: claude CLI failed", batch_num + 1, total_batches);
+                }
+                continue;
+            }
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -134,23 +226,54 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
             } else { Vec::new() }
         } else { Vec::new() };
 
+        if classifications.is_empty() && verbose {
+            eprintln!("  batch {}/{}: no parseable JSON array in response", batch_num + 1, total_batches);
+        }
+
         for entry in &classifications {
             let idx = entry.get("idx").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
             let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-            if idx >= batch.len() || kind == "not_network" || kind.is_empty() { continue; }
+            let direction = entry.get("direction").and_then(|v| v.as_str()).unwrap_or("?");
+            let target = entry.get("target").and_then(|v| v.as_str()).unwrap_or("?");
+            let target_source = entry.get("target_source").and_then(|v| v.as_str()).unwrap_or("?");
+
+            if idx >= batch.len() {
+                parse_failures += 1;
+                continue;
+            }
+
+            let call_idx = batch[idx];
+            let call_loc = format!("{}:{}", network_calls[call_idx].file, network_calls[call_idx].line);
+            let chain = format_address_chain(&network_calls[call_idx].address_source);
+
+            if kind == "not_network" || kind.is_empty() {
+                not_network += 1;
+                if verbose {
+                    eprintln!("    {} -> not_network  [{}]", call_loc, chain);
+                }
+                continue;
+            }
 
             if let Some(cat) = parse_network_category(kind) {
-                let call_idx = batch[idx];
                 network_calls[call_idx].net_kind = cat;
                 network_calls[call_idx].confidence = Confidence::LLMClassified;
                 upgraded += 1;
+                if verbose {
+                    eprintln!("    {} -> {} {} target={} ({})  [{}]",
+                        call_loc, kind, direction, target, target_source, chain);
+                }
+            } else {
+                parse_failures += 1;
+                if verbose {
+                    eprintln!("    {} -> unknown kind '{}'  [{}]", call_loc, kind, chain);
+                }
             }
         }
     }
 
-    if upgraded > 0 {
-        eprintln!("LLM: upgraded {} call(s) to LLMClassified", upgraded);
-    }
+    eprintln!(); // clear the \r progress line
+    eprintln!("LLM: {} upgraded, {} not_network, {} failed batches, {} parse errors",
+        upgraded, not_network, failed_batches, parse_failures);
 }
 
 fn parse_network_category(kind: &str) -> Option<sink_registry::NetworkCategory> {
@@ -381,24 +504,46 @@ fn is_network_env_var(name: &str) -> bool {
         || upper.contains("CONNECTION")
 }
 
-fn upgrade_via_lsp(merged: &mut MergedResult, workspace_root: &std::path::Path) {
+fn upgrade_via_lsp(merged: &mut MergedResult, workspace_root: &std::path::Path, verbose: bool) {
     let mut orchestrator = LspOrchestrator::start(workspace_root);
 
     if !orchestrator.has_servers() {
+        if verbose {
+            eprintln!("LSP: no language servers found on PATH, skipping");
+        }
         return;
     }
 
+    let active = orchestrator.active_languages();
     eprintln!("LSP: attempting to upgrade heuristic network calls...");
-    let mut upgraded = 0;
+    if verbose {
+        let names: Vec<&str> = active.iter().map(|l| l.language_id()).collect();
+        eprintln!("  servers: {}", names.join(", "));
+    }
+
+    let heuristic_count = merged.network_calls.iter()
+        .filter(|c| c.confidence == Confidence::Heuristic)
+        .count();
+    let total = heuristic_count;
+    let mut processed = 0usize;
+    let mut upgraded = 0u32;
+    let mut skipped_no_lang = 0u32;
+    let mut skipped_no_hover = 0u32;
+    let mut skipped_no_sink = 0u32;
 
     for call in &mut merged.network_calls {
         if call.confidence != Confidence::Heuristic {
             continue;
         }
+        processed += 1;
 
         // Try to resolve the callee FQN via LSP hover
         let file_path = std::path::Path::new(&call.file);
         if LspOrchestrator::language_for_file(file_path).is_none() {
+            skipped_no_lang += 1;
+            if verbose {
+                eprintln!("  [{}/{}] skip {}:{} (unsupported language)", processed, total, call.file, call.line);
+            }
             continue;
         }
 
@@ -411,16 +556,28 @@ fn upgrade_via_lsp(merged: &mut MergedResult, workspace_root: &std::path::Path) 
             // Check if the hover type matches a known sink in the registry
             let hover_text = &hover.contents;
             if sink_registry::lookup_sink(hover_text).is_some() {
+                if verbose {
+                    eprintln!("  [{}/{}] UPGRADED {}:{} -> TypeConfirmed ({})", processed, total, call.file, call.line, hover_text);
+                }
                 call.callee_fqn = hover_text.clone();
                 call.confidence = Confidence::TypeConfirmed;
                 upgraded += 1;
+            } else {
+                skipped_no_sink += 1;
+                if verbose {
+                    eprintln!("  [{}/{}] skip {}:{} (hover '{}' not in sink registry)", processed, total, call.file, call.line, truncate(hover_text, 60));
+                }
+            }
+        } else {
+            skipped_no_hover += 1;
+            if verbose {
+                eprintln!("  [{}/{}] skip {}:{} (no hover data)", processed, total, call.file, call.line);
             }
         }
     }
 
-    if upgraded > 0 {
-        eprintln!("LSP: upgraded {} call(s) to TypeConfirmed", upgraded);
-    }
+    eprintln!("LSP: {} upgraded, {} no hover, {} no sink match, {} unsupported language",
+        upgraded, skipped_no_hover, skipped_no_sink, skipped_no_lang);
 
     orchestrator.shutdown();
 }
@@ -748,7 +905,7 @@ func CallService() {
             (client_repo.path().to_path_buf(), 1u16),
         ];
 
-        let result = index_repos_with_resolution(&repos).unwrap();
+        let result = index_repos_with_resolution(&repos, false).unwrap();
         let graph = &result.graph;
 
         // Should have a DependsOn edge from client → server
@@ -807,7 +964,7 @@ spec:
         .unwrap();
 
         let repos = vec![(repo.path().to_path_buf(), 0u16)];
-        let result = index_repos_with_resolution(&repos).unwrap();
+        let result = index_repos_with_resolution(&repos, false).unwrap();
 
         // Verify the K8s env bindings were extracted
         // The resolution should find PRODUCT_CATALOG_SERVICE_ADDR → productcatalogservice:3550

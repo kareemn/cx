@@ -132,7 +132,7 @@ mod tests {
         )
         .unwrap();
 
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
 
         // Refresh should succeed with no changes
         run(dir.path()).unwrap();
@@ -152,7 +152,7 @@ mod tests {
         )
         .unwrap();
 
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
 
         // Clear git hash to force re-index
         let mut config = crate::config::load(dir.path()).unwrap();

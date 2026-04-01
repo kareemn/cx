@@ -86,7 +86,7 @@ func helper() {}
         )
         .unwrap();
 
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
         let graph = super::super::init::load_graph(dir.path()).unwrap();
         let ctx = build_context(&graph);
 
@@ -127,7 +127,7 @@ func helper() {}
         )
         .unwrap();
 
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
         let graph = super::super::init::load_graph(dir.path()).unwrap();
         let ctx = build_context(&graph);
 

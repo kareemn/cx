@@ -1610,7 +1610,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 "#,
         )
         .unwrap();
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
         let graph = super::super::init::load_graph(dir.path()).unwrap();
         (dir, graph)
     }
@@ -1696,7 +1696,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
         fs::write(dir.path().join("empty.txt"), "").unwrap();
         // init might fail on empty project, so use a Go file
         fs::write(dir.path().join("main.go"), "package main\n\nfunc main() {}\n").unwrap();
-        super::super::init::run(dir.path()).unwrap();
+        super::super::init::run(dir.path(), false).unwrap();
         let graph = super::super::init::load_graph(dir.path()).unwrap();
         let report = build_network_report(&graph, &[], None, None, None);
         assert!(report.is_object());

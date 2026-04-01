@@ -395,7 +395,7 @@ mod tests {
             "package main\n\nfunc main() { helper() }\nfunc helper() {}\n",
         )
         .unwrap();
-        crate::commands::init::run(dir.path()).unwrap();
+        crate::commands::init::run(dir.path(), false).unwrap();
         dir
     }
 

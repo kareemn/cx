@@ -17,7 +17,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Index the current directory
-    Init,
+    Init {
+        /// Show detailed LSP and LLM classification progress
+        #[arg(long, short)]
+        verbose: bool,
+    },
     /// Add another repo to the graph
     Add {
         /// Path to the repo to add
@@ -132,7 +136,7 @@ fn main() {
     let root = std::env::current_dir().expect("failed to get current directory");
 
     let result = match cli.command {
-        Commands::Init => commands::init::run(&root),
+        Commands::Init { verbose } => commands::init::run(&root, verbose),
         Commands::Add { ref path } => commands::add::run(&root, path),
         Commands::Context => commands::context::run(&root),
         Commands::Search { ref query } => commands::search::run(&root, query),

@@ -37,7 +37,7 @@ pub fn run_add(root: &Path, name: &str, remote_path: &str) -> Result<()> {
         let clone_cx = clone_dest.join(".cx");
         if !clone_cx.exists() {
             eprintln!("Cloned repo has no .cx/ directory. Running `cx init` on it...");
-            super::init::run(&clone_dest)?;
+            super::init::run(&clone_dest, false)?;
         }
 
         clone_dest
