@@ -90,6 +90,23 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Compare network boundaries between current state and a baseline
+    #[command(after_help = "\x1b[1mExamples:\x1b[0m
+  cx diff --save             save current state as baseline
+  cx diff                    compare current vs baseline
+  cx diff --branch main      compare current vs another branch
+  cx diff --json             machine-readable output")]
+    Diff {
+        /// Save current state as baseline for future diffs
+        #[arg(long)]
+        save: bool,
+        /// Compare against a git branch (checks it out temporarily)
+        #[arg(long)]
+        branch: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show unresolved network calls and generate sink config
     #[command(after_help = "\x1b[1mExamples:\x1b[0m
   cx fix                show what's unresolved
@@ -124,6 +141,15 @@ enum Commands {
         #[arg(long)]
         include_all: bool,
     },
+    /// Install cx skill for Claude Code
+    #[command(after_help = "\x1b[1mExamples:\x1b[0m
+  cx skill                  install to .claude/skills/ in current repo
+  cx skill --global         install to ~/.claude/skills/ for all repos")]
+    Skill {
+        /// Install globally to ~/.claude/skills/ instead of repo-local
+        #[arg(long, short)]
+        global: bool,
+    },
     /// Start MCP server (JSON-RPC over stdio)
     Mcp,
 }
@@ -143,6 +169,7 @@ fn main() {
         Commands::Build { ref paths, verbose, model_only } => commands::build::run(&root, paths, verbose, model_only),
         Commands::Add { ref path } => commands::add::run(&root, path),
         Commands::Pull { ref name } => commands::add::run_pull(&root, name.as_deref()),
+        Commands::Diff { save, ref branch, json } => commands::diff::run(&root, save, branch.as_deref(), json),
         Commands::Fix { init, check } => commands::fix::run(&root, init, check),
         Commands::Trace {
             ref target,
@@ -167,6 +194,7 @@ fn main() {
             local_only,
             include_all,
         ),
+        Commands::Skill { global } => commands::skill::run(global),
         Commands::Mcp => mcp::run(&root),
     };
 
