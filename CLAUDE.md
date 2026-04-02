@@ -1,4 +1,4 @@
-# CX - Distributed Code Intelligence for Network Boundary Analysis
+# CX — Service topology, derived from code
 
 ## Project Overview
 Read ARCHITECTURE.md for full design. This file contains working instructions.

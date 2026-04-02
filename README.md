@@ -1,4 +1,4 @@
-# cx — Distributed Code Intelligence for Network Boundary Analysis
+# cx — Service topology, derived from code
 
 ## Mission
 
