@@ -150,6 +150,41 @@ fn load_context_md(workspace_root: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(&path).ok()
 }
 
+/// A cached LLM classification result, keyed by file:line:callee.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct CachedClassification {
+    kind: String,
+    direction: String,
+    target: String,
+    target_source: String,
+    context_hash: u64,
+}
+
+/// Simple hash of a string for cache invalidation.
+fn hash_context(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Load LLM classification cache from .cx/graph/llm_cache.json.
+fn load_llm_cache(workspace_root: &std::path::Path) -> std::collections::HashMap<String, CachedClassification> {
+    let path = workspace_root.join(".cx").join("graph").join("llm_cache.json");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return std::collections::HashMap::new();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+/// Save LLM classification cache to .cx/graph/llm_cache.json.
+fn save_llm_cache(workspace_root: &std::path::Path, cache: &std::collections::HashMap<String, CachedClassification>) {
+    let path = workspace_root.join(".cx").join("graph").join("llm_cache.json");
+    if let Ok(json) = serde_json::to_string_pretty(cache) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetworkCall>, workspace_root: &std::path::Path, verbose: bool) {
     // Check if claude CLI is available
     let claude_check = std::process::Command::new("claude")
@@ -167,7 +202,34 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
         }
     }
 
-    // Collect heuristic calls
+    // Load LLM cache and apply cached results before collecting heuristic indices
+    let mut llm_cache = load_llm_cache(workspace_root);
+    let mut cache_hits = 0u32;
+
+    for call in network_calls.iter_mut() {
+        if call.confidence != Confidence::Heuristic {
+            continue;
+        }
+        let key = format!("{}:{}:{}", call.file, call.line, call.callee_fqn);
+        let context = extract_call_context(&call.file, call.line, workspace_root)
+            .unwrap_or_default();
+        let ctx_hash = hash_context(&context);
+
+        if let Some(cached) = llm_cache.get(&key) {
+            if cached.context_hash == ctx_hash {
+                // Cache hit — apply without LLM call
+                if cached.kind != "not_network" && !cached.kind.is_empty() {
+                    if let Some(cat) = parse_network_category(&cached.kind) {
+                        call.net_kind = cat;
+                        call.confidence = Confidence::LLMClassified;
+                    }
+                }
+                cache_hits += 1;
+            }
+        }
+    }
+
+    // Collect remaining heuristic calls (not resolved by cache)
     let heuristic_indices: Vec<usize> = network_calls
         .iter()
         .enumerate()
@@ -176,7 +238,9 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
         .collect();
 
     if heuristic_indices.is_empty() {
-        if verbose {
+        if cache_hits > 0 {
+            eprintln!("LLM: {} call(s) resolved from cache, 0 new", cache_hits);
+        } else if verbose {
             eprintln!("LLM: no heuristic calls remaining, skipping");
         }
         return;
@@ -446,6 +510,18 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
             let call_idx = br.call_indices[idx];
             let call_loc = format!("{}:{}", network_calls[call_idx].file, network_calls[call_idx].line);
 
+            // Cache this result
+            let context = extract_call_context(&network_calls[call_idx].file, network_calls[call_idx].line, workspace_root)
+                .unwrap_or_default();
+            let cache_key = format!("{}:{}:{}", network_calls[call_idx].file, network_calls[call_idx].line, network_calls[call_idx].callee_fqn);
+            llm_cache.insert(cache_key, CachedClassification {
+                kind: kind.to_string(),
+                direction: direction.to_string(),
+                target: target.to_string(),
+                target_source: target_source.to_string(),
+                context_hash: hash_context(&context),
+            });
+
             if kind == "not_network" || kind.is_empty() {
                 not_network += 1;
                 if verbose {
@@ -489,9 +565,17 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
         }
     }
 
+    // Save updated cache
+    save_llm_cache(workspace_root, &llm_cache);
+
     let total_elapsed = batch_start_time.elapsed();
+    let cache_str = if cache_hits > 0 {
+        format!("{DIM}{} cached, {RESET}", cache_hits)
+    } else {
+        String::new()
+    };
     eprintln!(
-        "\n{BOLD}LLM{RESET}  {GREEN}{} classified{RESET}, {DIM}{} not network, {} failed, {} errors{RESET}  {DIM}({:.1}s){RESET}\n",
+        "\n{BOLD}LLM{RESET}  {cache_str}{GREEN}{} classified{RESET}, {DIM}{} not network, {} failed, {} errors{RESET}  {DIM}({:.1}s){RESET}\n",
         upgraded, not_network, failed_batches, parse_failures, total_elapsed.as_secs_f64(),
     );
 }

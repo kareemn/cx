@@ -222,54 +222,57 @@ fn print_diff(diff: &NetworkDiff, before_label: &str) {
     }
 }
 
-/// Build a temporary graph snapshot for a different branch.
+/// Get network.json from another branch. Tries in order:
+/// 1. `git show` — instant if network.json is committed on that branch
+/// 2. Worktree-based build — non-destructive (doesn't touch working directory)
 fn build_branch_snapshot(root: &Path, branch: &str) -> Result<Vec<ResolvedNetworkCall>> {
-    // Stash current changes, checkout branch, build, read network.json, return
-    let current_branch = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(root)
-        .output()
-        .context("failed to get current branch")?;
-    let current = String::from_utf8_lossy(&current_branch.stdout).trim().to_string();
-
-    // Stash
-    let _ = std::process::Command::new("git")
-        .args(["stash", "--include-untracked"])
+    // Strategy 1: read committed network.json via git show (instant)
+    let git_show = std::process::Command::new("git")
+        .args(["show", &format!("{}:.cx/graph/network.json", branch)])
         .current_dir(root)
         .output();
 
-    // Checkout target branch
-    let checkout = std::process::Command::new("git")
-        .args(["checkout", branch])
-        .current_dir(root)
-        .output()
-        .context("failed to checkout branch")?;
-    if !checkout.status.success() {
-        // Restore
-        let _ = std::process::Command::new("git")
-            .args(["checkout", &current])
-            .current_dir(root)
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["stash", "pop"])
-            .current_dir(root)
-            .output();
-        anyhow::bail!("failed to checkout branch: {}", branch);
+    if let Ok(output) = git_show {
+        if output.status.success() {
+            let content = String::from_utf8_lossy(&output.stdout);
+            if let Ok(calls) = serde_json::from_str::<Vec<ResolvedNetworkCall>>(&content) {
+                eprintln!("Reading network.json from branch '{}' (committed)", branch);
+                return Ok(calls);
+            }
+        }
     }
 
-    // Build on the target branch
-    eprintln!("Building graph on branch '{}'...", branch);
-    let custom = cx_extractors::custom_sinks::CustomSinkConfig::load(root);
-    let repos = vec![(root.to_path_buf(), 0u16)];
+    // Strategy 2: build in a temporary worktree (non-destructive)
+    eprintln!("network.json not committed on '{}', building via worktree...", branch);
+    let worktree_dir = root.join(".cx").join("tmp-worktree");
+
+    // Clean up any stale worktree
+    if worktree_dir.exists() {
+        let _ = std::process::Command::new("git")
+            .args(["worktree", "remove", "--force", worktree_dir.to_str().unwrap_or(".")])
+            .current_dir(root)
+            .output();
+    }
+
+    let add_result = std::process::Command::new("git")
+        .args(["worktree", "add", "--detach", worktree_dir.to_str().unwrap_or("."), branch])
+        .current_dir(root)
+        .output()
+        .context("failed to create worktree")?;
+
+    if !add_result.status.success() {
+        let stderr = String::from_utf8_lossy(&add_result.stderr);
+        anyhow::bail!("failed to create worktree for branch '{}': {}", branch, stderr.trim());
+    }
+
+    // Build in the worktree
+    let custom = cx_extractors::custom_sinks::CustomSinkConfig::load(&worktree_dir);
+    let repos = vec![(worktree_dir.clone(), 0u16)];
     let result = crate::indexing::index_repos_with_resolution(&repos, false, &custom, false);
 
-    // Checkout back
+    // Cleanup worktree
     let _ = std::process::Command::new("git")
-        .args(["checkout", &current])
-        .current_dir(root)
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["stash", "pop"])
+        .args(["worktree", "remove", "--force", worktree_dir.to_str().unwrap_or(".")])
         .current_dir(root)
         .output();
 

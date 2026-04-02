@@ -141,6 +141,15 @@ enum Commands {
         #[arg(long)]
         include_all: bool,
     },
+    /// Manage cx post-commit git hook
+    Hook {
+        /// Install the post-commit hook
+        #[arg(long)]
+        install: bool,
+        /// Remove the post-commit hook
+        #[arg(long)]
+        remove: bool,
+    },
     /// Install cx skill for Claude Code
     #[command(after_help = "\x1b[1mExamples:\x1b[0m
   cx skill                  install to .claude/skills/ in current repo
@@ -194,6 +203,7 @@ fn main() {
             local_only,
             include_all,
         ),
+        Commands::Hook { install, remove } => commands::hook::run(&root, install, remove),
         Commands::Skill { global } => commands::skill::run(global),
         Commands::Mcp => mcp::run(&root),
     };

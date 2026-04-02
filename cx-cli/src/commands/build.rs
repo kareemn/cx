@@ -156,7 +156,31 @@ pub fn run(root: &Path, paths: &[String], verbose: bool, model_only: bool) -> Re
         );
     }
 
+    // Write .cx/.gitignore so `git add .cx/` only picks up the right files
+    write_gitignore(root);
+
     Ok(())
+}
+
+/// Write .cx/.gitignore if it doesn't exist.
+/// Ensures `git add .cx/` commits network.json and config/ but not derived artifacts.
+fn write_gitignore(root: &Path) {
+    let path = root.join(".cx").join(".gitignore");
+    if path.exists() {
+        return;
+    }
+    let content = "\
+# Derived artifacts — rebuild with cx build
+graph/base.cxgraph
+graph/repos/
+graph/index.json
+graph/overlay.json
+graph/network.baseline.json
+graph/llm_cache.json
+remotes/
+tmp-worktree/
+";
+    let _ = std::fs::write(&path, content);
 }
 
 #[cfg(test)]
