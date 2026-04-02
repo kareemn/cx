@@ -2,9 +2,7 @@
 
 ## Mission
 
-cx is the **structural map** for distributed systems. It answers one question with 100% accuracy:
-
-> **"What are every single incoming API and outgoing network call in this codebase, where does each connection target come from, and how do all these services connect to each other across repos, languages, and infrastructure?"**
+cx is the **structural map** for distributed systems. It finds every incoming API and outgoing network call in a codebase, traces where each connection target comes from, and maps how services connect across repos, languages, and infrastructure.
 
 cx works like git: local-first, distributed, collaborative. Each team builds their repo's graph independently. Teams add remotes to pull other repos' graphs and build the complete cross-service topology. The graph is never a static document — it's a living, compiler-derived artifact that improves with each index run and can be tuned by teams to reach 100% coverage.
 
@@ -29,7 +27,8 @@ cx traces this entire chain: **code → env var → K8s value → DNS name → t
 ## Quick Start
 
 ```bash
-cargo install cx-cli
+git clone https://github.com/kareemn/cx && cd cx
+cargo install --path cx-cli
 
 cd ~/code/my-service
 cx build
