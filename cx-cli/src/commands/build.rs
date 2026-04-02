@@ -135,17 +135,24 @@ pub fn run(root: &Path, paths: &[String], verbose: bool, model_only: bool) -> Re
         file_size,
     );
 
-    // Write network calls with provenance to network.json
+    // Write network calls with provenance to network.json.
+    // Filter out Unknown calls — these are permissive filter candidates that the
+    // LLM didn't classify as network (either said not_network or wasn't processed).
     if !result.network_calls.is_empty() {
+        let classified: Vec<_> = result.network_calls.iter()
+            .filter(|c| c.net_kind != cx_extractors::sink_registry::NetworkCategory::Unknown)
+            .collect();
+        let dropped = result.network_calls.len() - classified.len();
         let network_path = cx_dir.join("network.json");
-        let json = serde_json::to_string_pretty(&result.network_calls)
+        let json = serde_json::to_string_pretty(&classified)
             .context("failed to serialize network calls")?;
         std::fs::write(&network_path, json)
             .context("failed to write network.json")?;
         eprintln!(
-            "Network analysis: {} call(s) written to {}",
-            result.network_calls.len(),
+            "Network analysis: {} call(s) written to {} ({} candidates filtered by LLM)",
+            classified.len(),
             network_path.display(),
+            dropped,
         );
     }
 

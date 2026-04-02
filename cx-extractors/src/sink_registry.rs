@@ -24,6 +24,9 @@ pub enum NetworkCategory {
     S3,
     TcpDial,
     TcpListen,
+    /// Unclassified candidate from the permissive filter — the LLM will assign
+    /// the real category (or mark it `not_network`).
+    Unknown,
 }
 
 impl NetworkCategory {
@@ -44,6 +47,7 @@ impl NetworkCategory {
             Self::S3 => "s3",
             Self::TcpDial => "tcp_dial",
             Self::TcpListen => "tcp_listen",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -64,6 +68,7 @@ impl NetworkCategory {
             "s3" => Self::S3,
             "tcp_dial" => Self::TcpDial,
             "tcp_listen" => Self::TcpListen,
+            "unknown" => Self::Unknown,
             _ => Self::HttpClient, // fallback
         }
     }
@@ -895,6 +900,155 @@ pub fn heuristic_classify_call(
     }
 
     None
+}
+
+// ─── Permissive network filter ──────────────────────────────────────────────
+
+/// Keywords in import paths that indicate a network-related package.
+/// Intentionally broad — false positives are OK, the LLM filters them.
+const NETWORK_IMPORT_KEYWORDS: &[&str] = &[
+    // Protocols / transports
+    "http", "grpc", "websocket", "ws", "socket", "net/", "net.",
+    "tcp", "tls", "ssl", "udp",
+    // Message queues
+    "kafka", "amqp", "rabbit", "nats", "mqtt", "pulsar", "celery",
+    // Databases / caches
+    "redis", "mongo", "sql", "database", "postgres", "mysql", "sqlite",
+    "gorm", "sqlalchemy", "psycopg", "pymysql", "sequelize", "typeorm",
+    "prisma", "knex", "hikari", "jedis", "lettuce", "ioredis", "redisson",
+    // Cloud / infra
+    "sqs", "s3", "boto", "aws-sdk", "cloud.google",
+    // HTTP clients (by package name)
+    "axios", "requests", "aiohttp", "httpx", "urllib", "resty",
+    "okhttp", "retrofit",
+    // RPC / API (not protobuf — that's serialization, grpc keyword covers gRPC)
+    "connectrpc", "tonic", "tarpc", "thrift",
+    // Service mesh / discovery
+    "consul", "eureka", "etcd", "zookeeper",
+];
+
+/// Connection lifecycle method names that are almost always network-related,
+/// regardless of what the receiver is.
+const LIFECYCLE_METHODS: &[&str] = &[
+    "dial", "dialcontext", "dialtimeout", "dialtls",
+    "connect", "connectasync", "open_connection", "create_connection",
+    "listen", "listenandserve", "listenandservetls",
+    "serve", "serveasync", "servehttp",
+    "bind", "accept",
+    "upgrade",
+];
+
+/// Constructor patterns — if the method starts with "new"/"create" and contains
+/// one of these, it's likely constructing a network object.
+const CONSTRUCTOR_OBJECTS: &[&str] = &[
+    "client", "server", "channel", "stub", "connection", "conn",
+    "producer", "consumer", "listener", "dialer", "transport",
+    "socket", "pool", "session",
+];
+
+/// Permissive filter for network call candidates.
+///
+/// Returns `true` if the call *might* be network-related. Designed for high
+/// recall — false positives are expected and will be filtered by the LLM.
+///
+/// Three signals (any one is sufficient):
+///  1. **Address signal**: a string argument looks like a network address
+///  2. **Import signal**: the receiver resolves to an import from a network package
+///  3. **Name signal**: the method name is a connection lifecycle verb or network constructor
+pub fn permissive_network_filter(
+    receiver: &str,
+    callee: &str,
+    first_arg: &str,
+    import_paths_for_receiver: &[&str],
+) -> bool {
+    let meth = callee.to_ascii_lowercase();
+    let recv = receiver.to_ascii_lowercase();
+    let arg = first_arg.to_ascii_lowercase();
+
+    // ── Signal 1: Address argument ──────────────────────────────────────
+    if !arg.is_empty() {
+        // Protocol scheme
+        if arg.contains("://") {
+            return true;
+        }
+        // host:port pattern (at least one char before colon, digits after)
+        if let Some(colon) = arg.rfind(':') {
+            let after = &arg[colon + 1..];
+            if colon > 0 && !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+        // localhost / IP-like
+        if arg.contains("localhost") || looks_like_ip(&arg) {
+            return true;
+        }
+    }
+
+    // ── Signal 2: Import-gated ──────────────────────────────────────────
+    // If the receiver's import path contains a network keyword, this call
+    // is going through a network package.
+    for path in import_paths_for_receiver {
+        let lower = path.to_ascii_lowercase();
+        for kw in NETWORK_IMPORT_KEYWORDS {
+            if lower.contains(kw) {
+                return true;
+            }
+        }
+    }
+
+    // Even without import resolution, the receiver name itself may be a
+    // strong signal (e.g. "httpClient", "grpcConn", "redisPool").
+    if !recv.is_empty() {
+        for kw in NETWORK_IMPORT_KEYWORDS {
+            // Only match keywords >= 3 chars to avoid false positives on "ws", "s3"
+            // from random identifiers. Short keywords require exact-word matching.
+            if kw.len() >= 3 && recv.contains(kw) {
+                return true;
+            }
+        }
+        // Short but high-signal receiver names (exact or prefix/suffix)
+        if recv == "ws" || recv == "s3" || recv == "db" || recv == "mq" {
+            return true;
+        }
+    }
+
+    // ── Signal 3: Method name ───────────────────────────────────────────
+    // Lifecycle verbs
+    for verb in LIFECYCLE_METHODS {
+        if meth == *verb {
+            return true;
+        }
+    }
+
+    // Constructor: new*<object> or create*<object>
+    if meth.starts_with("new") || meth.starts_with("create") {
+        let suffix = if meth.starts_with("new") { &meth[3..] } else { &meth[6..] };
+        for obj in CONSTRUCTOR_OBJECTS {
+            if suffix.contains(obj) {
+                return true;
+            }
+        }
+    }
+
+    // Register patterns: register*server, register*handler, register*service
+    if meth.starts_with("register") {
+        let suffix = &meth[8..];
+        if suffix.contains("server") || suffix.contains("handler")
+            || suffix.contains("service") || suffix.contains("endpoint")
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Quick check for IPv4-like strings (e.g. "10.0.1.5", "0.0.0.0").
+fn looks_like_ip(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 4 && parts.iter().all(|p| {
+        !p.is_empty() && p.len() <= 3 && p.chars().all(|c| c.is_ascii_digit())
+    })
 }
 
 #[cfg(test)]

@@ -14,6 +14,11 @@ pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)], verbose: bool, cust
     let mut merged = pipeline::extract_and_merge_repos(repos, custom_sinks)
         .context("failed to extract repos")?;
 
+    if verbose {
+        eprintln!("Raw extraction: {} total function calls across {} files",
+            merged.raw_call_count, merged.file_count);
+    }
+
     let resolved = resolve_cross_repo(&mut merged);
     if resolved > 0 {
         eprintln!("Resolved {} cross-repo connection(s)", resolved);
@@ -185,51 +190,57 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
         eprintln!("  {DIM}loaded .cx/config/context.md{RESET}");
     }
 
-    let total_batches = (heuristic_indices.len() + 9) / 10;
+    let batch_size: usize = 50;
+    let concurrency: usize = 8;
+    let total_batches = (heuristic_indices.len() + batch_size - 1) / batch_size;
     eprintln!(
-        "\n{BOLD}LLM{RESET}  classifying {CYAN}{}{RESET} heuristic calls via Claude CLI  {DIM}({} batches of 10){RESET}\n",
-        heuristic_indices.len(), total_batches,
+        "\n{BOLD}LLM{RESET}  classifying {CYAN}{}{RESET} heuristic calls via Claude CLI  {DIM}({} batches of {}, {}x parallel){RESET}\n",
+        heuristic_indices.len(), total_batches, batch_size, concurrency,
     );
 
-    let mut upgraded = 0u32;
-    let mut not_network = 0u32;
-    let mut failed_batches = 0u32;
-    let mut parse_failures = 0u32;
-    let batch_start_time = std::time::Instant::now();
+    // ── Phase 1: Build all prompts upfront ──────────────────────────────
 
-    for (batch_num, batch) in heuristic_indices.chunks(10).enumerate() {
-        // Show what we're sending in this batch
+    let system_prompt =
+        "Classify these call sites. Some are confirmed network calls needing re-classification;\n\
+         others (marked current_kind=unknown) are CANDIDATES that may or may not be network calls.\n\
+         For each, respond with ONLY a JSON array.\n\
+         Each entry: {\"idx\": N, \"kind\": \"...\", \"direction\": \"inbound|outbound\", \"target\": \"...\", \"target_source\": \"...\"}\n\n\
+         Kinds: http_client, http_server, grpc_client, grpc_server, websocket_client, websocket_server,\n\
+                kafka_producer, kafka_consumer, database, redis, sqs, s3, tcp_dial, tcp_listen, not_network\n\n\
+         Use 'not_network' for calls that are NOT actually making or receiving network connections\n\
+         (e.g. protobuf serialization, logging, string manipulation, context management).\n\n\
+         For 'target': trace the variable chain to its origin. Use the provenance chain provided.\n\
+         - If it resolves to an env var, return the env var name (e.g. \"DATABASE_URL\")\n\
+         - If it resolves to a config key, return the key (e.g. \"db.host\")\n\
+         - If it resolves to a literal, return the literal value\n\
+         - If it resolves to a field, return type.field (e.g. \"Config.wsURL\")\n\
+         - If it resolves to a parameter, return func.param[N] (e.g. \"NewClient.param[0]\")\n\
+         - Only use \"dynamic\" if truly unresolvable after following the chain\n\n\
+         For 'target_source': literal|env_var|config|parameter|field|concat|service_discovery|flag|dynamic\n\n";
+
+    struct BatchJob {
+        batch_num: usize,
+        call_indices: Vec<usize>,
+        prompt: String,
+        preview: String,
+    }
+
+    let mut jobs: Vec<BatchJob> = Vec::with_capacity(total_batches);
+
+    for (batch_num, batch) in heuristic_indices.chunks(batch_size).enumerate() {
         let files_in_batch: Vec<String> = batch.iter().map(|&i| {
             let c = &network_calls[i];
             format!("{}:{}", c.file, c.line)
         }).collect();
-        let batch_preview: String = if files_in_batch.len() <= 3 {
+        let preview: String = if files_in_batch.len() <= 3 {
             files_in_batch.join(", ")
         } else {
             format!("{}, {} +{} more",
                 files_in_batch[0], files_in_batch[1], files_in_batch.len() - 2)
         };
-        eprint!(
-            "  {DIM}[{}/{}]{RESET} {YELLOW}querying{RESET} {DIM}{}{RESET}",
-            batch_num + 1, total_batches, batch_preview,
-        );
 
-        let mut prompt = String::from(
-            "Classify these network call sites and resolve their targets. For each, respond with ONLY a JSON array.\n\
-             Each entry: {\"idx\": N, \"kind\": \"...\", \"direction\": \"inbound|outbound\", \"target\": \"...\", \"target_source\": \"...\"}\n\n\
-             Kinds: http_client, http_server, grpc_client, grpc_server, websocket_client, websocket_server,\n\
-                    kafka_producer, kafka_consumer, database, redis, sqs, s3, tcp_dial, tcp_listen, not_network\n\n\
-             For 'target': trace the variable chain to its origin. Use the provenance chain provided.\n\
-             - If it resolves to an env var, return the env var name (e.g. \"DATABASE_URL\")\n\
-             - If it resolves to a config key, return the key (e.g. \"db.host\")\n\
-             - If it resolves to a literal, return the literal value\n\
-             - If it resolves to a field, return type.field (e.g. \"Config.wsURL\")\n\
-             - If it resolves to a parameter, return func.param[N] (e.g. \"NewClient.param[0]\")\n\
-             - Only use \"dynamic\" if truly unresolvable after following the chain\n\n\
-             For 'target_source': literal|env_var|config|parameter|field|concat|service_discovery|flag|dynamic\n\n"
-        );
+        let mut prompt = String::from(system_prompt);
 
-        // Inject natural language context about the codebase
         if let Some(ref ctx) = context_md {
             prompt.push_str("Project context (provided by the developer):\n");
             prompt.push_str(ctx);
@@ -250,69 +261,181 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
 
         prompt.push_str("Respond ONLY with a JSON array.\n");
 
-        let call_start = std::time::Instant::now();
-        let result = std::process::Command::new("claude")
-            .args(["-p", &prompt, "--output-format", "json", "--model", "haiku"])
-            .output();
-        let call_elapsed = call_start.elapsed();
+        jobs.push(BatchJob {
+            batch_num,
+            call_indices: batch.to_vec(),
+            prompt,
+            preview,
+        });
+    }
 
-        let output = match result {
-            Ok(o) if o.status.success() => o,
-            Ok(o) => {
-                failed_batches += 1;
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                let reason = if !stderr.is_empty() {
-                    stderr.lines().last().unwrap_or("").trim().to_string()
-                } else if !stdout.is_empty() {
-                    stdout.lines().last().unwrap_or("").trim().to_string()
-                } else {
-                    format!("exit code {}", o.status)
+    // ── Phase 2: Run batches in parallel ────────────────────────────────
+
+    struct BatchResult {
+        batch_num: usize,
+        call_indices: Vec<usize>,
+        preview: String,
+        elapsed: std::time::Duration,
+        outcome: Result<Vec<serde_json::Value>, String>,
+    }
+
+    let batch_start_time = std::time::Instant::now();
+
+    // Semaphore: bounded channel with `concurrency` tokens — created before scope
+    // so it outlives all spawned threads.
+    let (sem_tx, sem_rx) = std::sync::mpsc::sync_channel::<()>(concurrency);
+    for _ in 0..concurrency {
+        sem_tx.send(()).ok();
+    }
+    let sem_rx = std::sync::Mutex::new(sem_rx);
+
+    // Live progress counters (shared across threads)
+    let done_count = std::sync::atomic::AtomicUsize::new(0);
+    let inflight_count = std::sync::atomic::AtomicUsize::new(0);
+    let progress_lock = std::sync::Mutex::new(());  // serializes stderr writes
+
+    let results: Vec<BatchResult> = std::thread::scope(|scope| {
+        let sem_rx_ref = &sem_rx;
+        let sem_tx_ref = &sem_tx;
+        let done_ref = &done_count;
+        let inflight_ref = &inflight_count;
+        let progress_ref = &progress_lock;
+        let start_ref = &batch_start_time;
+
+        let handles: Vec<_> = jobs.into_iter().map(|job| {
+            scope.spawn(move || {
+                // Acquire slot
+                let _permit = sem_rx_ref.lock().unwrap().recv();
+                inflight_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                // Update progress: starting
+                {
+                    let _lock = progress_ref.lock().unwrap();
+                    let done = done_ref.load(std::sync::atomic::Ordering::Relaxed);
+                    let inflight = inflight_ref.load(std::sync::atomic::Ordering::Relaxed);
+                    let elapsed = start_ref.elapsed().as_secs_f64();
+                    eprint!(
+                        "\r  {DIM}[{done}/{total_batches}]{RESET} {YELLOW}{inflight} in-flight{RESET}  {DIM}{elapsed:.0}s{RESET}    ",
+                    );
+                }
+
+                let call_start = std::time::Instant::now();
+                let result = std::process::Command::new("claude")
+                    .args(["-p", &job.prompt, "--output-format", "json", "--model", "haiku"])
+                    .output();
+                let elapsed = call_start.elapsed();
+
+                // Release slot
+                sem_tx_ref.send(()).ok();
+                inflight_ref.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let done = done_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+                // Update progress: completed
+                {
+                    let _lock = progress_ref.lock().unwrap();
+                    let inflight = inflight_ref.load(std::sync::atomic::Ordering::Relaxed);
+                    let wall = start_ref.elapsed().as_secs_f64();
+
+                    // Progress bar
+                    let bar_width = 20usize;
+                    let filled = (done * bar_width) / total_batches;
+                    let bar: String = format!(
+                        "{}{}", "█".repeat(filled), "░".repeat(bar_width - filled),
+                    );
+
+                    eprint!(
+                        "\r  {bar} {DIM}{done}/{total_batches}{RESET}  {YELLOW}{inflight} in-flight{RESET}  {DIM}{wall:.0}s{RESET}    ",
+                    );
+                }
+
+                let outcome = match result {
+                    Ok(o) if o.status.success() => {
+                        let stdout = String::from_utf8_lossy(&o.stdout);
+                        let result_text = if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                            wrapper.get("result").and_then(|v| v.as_str()).unwrap_or(&stdout).to_string()
+                        } else {
+                            stdout.to_string()
+                        };
+                        let classifications: Vec<serde_json::Value> = if let Some(start) = result_text.find('[') {
+                            if let Some(end) = result_text.rfind(']') {
+                                serde_json::from_str(&result_text[start..=end]).unwrap_or_default()
+                            } else { Vec::new() }
+                        } else { Vec::new() };
+                        Ok(classifications)
+                    }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        let stdout = String::from_utf8_lossy(&o.stdout);
+                        let reason = if !stderr.is_empty() {
+                            stderr.lines().last().unwrap_or("").trim().to_string()
+                        } else if !stdout.is_empty() {
+                            stdout.lines().last().unwrap_or("").trim().to_string()
+                        } else {
+                            format!("exit code {}", o.status)
+                        };
+                        Err(reason)
+                    }
+                    Err(e) => Err(e.to_string()),
                 };
-                eprintln!("  {RED}failed{RESET} {DIM}({:.1}s) {}{RESET}", call_elapsed.as_secs_f64(), reason);
-                continue;
-            }
-            Err(e) => {
+
+                BatchResult {
+                    batch_num: job.batch_num,
+                    call_indices: job.call_indices,
+                    preview: job.preview,
+                    elapsed,
+                    outcome,
+                }
+            })
+        }).collect();
+
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Clear progress line
+    eprint!("\r{}\r", " ".repeat(80));
+
+    // ── Phase 3: Apply results (deterministic order) ────────────────────
+
+    let mut upgraded = 0u32;
+    let mut not_network = 0u32;
+    let mut failed_batches = 0u32;
+    let mut parse_failures = 0u32;
+
+    let mut sorted_results = results;
+    sorted_results.sort_by_key(|r| r.batch_num);
+
+    for br in &sorted_results {
+        eprintln!(
+            "  {DIM}[{}/{}]{RESET} {DIM}{}{RESET}  {DIM}({:.1}s){RESET}",
+            br.batch_num + 1, total_batches, br.preview, br.elapsed.as_secs_f64(),
+        );
+
+        let classifications = match &br.outcome {
+            Ok(c) => c,
+            Err(reason) => {
                 failed_batches += 1;
-                eprintln!("  {RED}failed{RESET} {DIM}({:.1}s) {}{RESET}", call_elapsed.as_secs_f64(), e);
+                eprintln!("         {RED}failed: {}{RESET}", reason);
                 continue;
             }
         };
-
-        // Clear the "querying" line and print batch header
-        eprintln!("  {DIM}({:.1}s){RESET}", call_elapsed.as_secs_f64());
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let result_text = if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&stdout) {
-            wrapper.get("result").and_then(|v| v.as_str()).unwrap_or(&stdout).to_string()
-        } else {
-            stdout.to_string()
-        };
-
-        // Extract JSON array
-        let classifications: Vec<serde_json::Value> = if let Some(start) = result_text.find('[') {
-            if let Some(end) = result_text.rfind(']') {
-                serde_json::from_str(&result_text[start..=end]).unwrap_or_default()
-            } else { Vec::new() }
-        } else { Vec::new() };
 
         if classifications.is_empty() && verbose {
             eprintln!("         {RED}no parseable JSON in response{RESET}");
         }
 
-        for entry in &classifications {
+        for entry in classifications {
             let idx = entry.get("idx").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
             let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             let direction = entry.get("direction").and_then(|v| v.as_str()).unwrap_or("?");
             let target = entry.get("target").and_then(|v| v.as_str()).unwrap_or("?");
             let target_source = entry.get("target_source").and_then(|v| v.as_str()).unwrap_or("?");
 
-            if idx >= batch.len() {
+            if idx >= br.call_indices.len() {
                 parse_failures += 1;
                 continue;
             }
 
-            let call_idx = batch[idx];
+            let call_idx = br.call_indices[idx];
             let call_loc = format!("{}:{}", network_calls[call_idx].file, network_calls[call_idx].line);
 
             if kind == "not_network" || kind.is_empty() {
@@ -328,13 +451,11 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
                 network_calls[call_idx].confidence = Confidence::LLMClassified;
                 upgraded += 1;
 
-                // Color the kind based on direction
                 let kind_colored = match direction {
                     "outbound" => format!("{MAGENTA}{}{RESET}", kind),
                     "inbound" => format!("{CYAN}{}{RESET}", kind),
                     _ => kind.to_string(),
                 };
-                // Color the target based on source type
                 let target_colored = match target_source {
                     "literal" => format!("{GREEN}\"{}\"{RESET}", target),
                     "env_var" => format!("{YELLOW}${}{RESET}", target),
@@ -377,6 +498,7 @@ fn parse_network_category(kind: &str) -> Option<sink_registry::NetworkCategory> 
         "database" => Some(Database), "redis" => Some(Redis),
         "sqs" => Some(Sqs), "s3" => Some(S3),
         "tcp_dial" => Some(TcpDial), "tcp_listen" => Some(TcpListen),
+        "unknown" => Some(Unknown),
         _ => None,
     }
 }

@@ -913,6 +913,7 @@ fn taint_direction(cat: cx_extractors::sink_registry::NetworkCategory) -> &'stat
         HttpServer | GrpcServer | WebsocketServer | KafkaConsumer | TcpListen => "inbound",
         HttpClient | GrpcClient | WebsocketClient | KafkaProducer
         | Database | Redis | Sqs | S3 | TcpDial => "outbound",
+        Unknown => "unknown",
     }
 }
 

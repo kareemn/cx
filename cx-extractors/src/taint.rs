@@ -776,7 +776,29 @@ pub fn analyze_file(
             } else if let Some(cat) = sink_registry::heuristic_classify_call(receiver, callee, first_arg_str) {
                 (cat, 0, Confidence::Heuristic) // heuristic defaults to arg 0
             } else {
-                continue; // not a network sink
+                // Permissive filter: gather import paths for the receiver, then check
+                let import_paths: Vec<&str> = if !receiver.is_empty() {
+                    raw.imports.iter().filter_map(|imp| {
+                        let explicit = if imp.alias != STRING_NONE {
+                            Some(strings.get(imp.alias).to_string())
+                        } else {
+                            default_alias_for_lang(strings.get(imp.path), imp.lang)
+                        };
+                        if explicit.as_deref() == Some(receiver) {
+                            Some(strings.get(imp.path))
+                        } else {
+                            None
+                        }
+                    }).collect()
+                } else {
+                    Vec::new()
+                };
+
+                if sink_registry::permissive_network_filter(receiver, callee, first_arg_str, &import_paths) {
+                    (sink_registry::NetworkCategory::Unknown, 0, Confidence::Heuristic)
+                } else {
+                    continue; // not a network candidate
+                }
             };
 
             let address_source = backward_taint(facts, call, addr_arg_idx, strings, &const_map, 10);

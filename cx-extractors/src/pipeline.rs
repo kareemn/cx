@@ -62,6 +62,8 @@ pub struct MergedResult {
     pub k8s_env_bindings: Vec<(String, Vec<K8sEnvBinding>)>,
     /// Parsed dependency manifests: (file_path, manifest).
     pub manifests: Vec<(String, ManifestInfo)>,
+    /// Total raw function calls extracted by tree-sitter (before filtering).
+    pub raw_call_count: usize,
 }
 
 /// An env var binding from a K8s Deployment/StatefulSet/DaemonSet manifest.
@@ -361,6 +363,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)], custom_sinks: &crate::c
             network_calls: vec![],
             k8s_env_bindings: vec![],
             manifests: vec![],
+            raw_call_count: 0,
         });
     }
 
@@ -808,6 +811,8 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)], custom_sinks: &crate::c
     let k8s_env_bindings = keyed_by_repo_name(&repo_names, k8s_env_by_repo);
 
     // Step 8: Run taint analysis — per-file direct sinks + inter-procedural propagation
+    let total_raw_calls: usize = raw_extractions.iter().map(|(raw, _, _, _)| raw.calls.len()).sum();
+
     let mut network_calls: Vec<ResolvedNetworkCall> = Vec::new();
     let mut all_summaries: Vec<taint::FunctionFlowSummary> = Vec::new();
     let mut all_flow_facts: rustc_hash::FxHashMap<u32, Vec<taint::FlowFact>> =
@@ -954,6 +959,7 @@ pub fn extract_and_merge_repos(repos: &[(PathBuf, u16)], custom_sinks: &crate::c
         network_calls,
         k8s_env_bindings,
         manifests,
+        raw_call_count: total_raw_calls,
     })
 }
 
