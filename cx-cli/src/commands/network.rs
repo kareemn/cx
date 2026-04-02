@@ -1831,7 +1831,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
             kind: "websocket_client".to_string(),
             callee: "ws_.async_handshake".to_string(),
             address_hint: "/ws/s2s".to_string(),
-            repo_name: Some("cpp-client".to_string()),
+            repo_name: Some("native-client".to_string()),
         };
         let endpoint = CollectedEndpoint {
             file: "transport/ws.go".to_string(),
@@ -1905,7 +1905,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
                 kind: "websocket_client".to_string(),
                 callee: "connect".to_string(),
                 address_hint: "/ws/s2s".to_string(),
-                repo_name: Some("cpp-client".to_string()),
+                repo_name: Some("native-client".to_string()),
             },
         ];
         let endpoints = vec![
@@ -2006,7 +2006,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
         let remotes_dir = dir.path().join(".cx").join("remotes");
         fs::create_dir_all(&remotes_dir).unwrap();
 
-        // Write a remote network.json for "cpp-client"
+        // Write a remote network.json for "native-client"
         let remote_calls = serde_json::json!([
             {
                 "net_kind": "websocket_client",
@@ -2020,7 +2020,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
             }
         ]);
         fs::write(
-            remotes_dir.join("cpp-client.network.json"),
+            remotes_dir.join("native-client.network.json"),
             serde_json::to_string(&remote_calls).unwrap(),
         ).unwrap();
 
@@ -2041,7 +2041,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
         let matches = find_cross_repo_matches(&report, dir.path());
         assert_eq!(matches.len(), 1, "should find one cross-repo match");
-        assert_eq!(matches[0]["client_repo"], "cpp-client");
+        assert_eq!(matches[0]["client_repo"], "native-client");
         assert_eq!(matches[0]["server_path"], "/ws/s2s");
         assert_eq!(matches[0]["match_type"], "path");
     }
@@ -2107,7 +2107,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
                     "client_line": 188,
                     "client_callee": "ws_.async_handshake",
                     "client_kind": "WebSocket client",
-                    "client_repo": "cpp-client",
+                    "client_repo": "native-client",
                     "server_file": "transport/ws.go",
                     "server_line": 471,
                     "server_path": "/ws/s2s",

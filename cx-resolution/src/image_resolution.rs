@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn exact_image_path_match() {
         let docker = vec![(
-            "tts-service".into(),
+            "backend-service".into(),
             vec![DockerImage {
                 image_ref: "gcr.io/example-org/myapp/tts-server".into(),
                 file: "Dockerfile".into(),
@@ -184,14 +184,14 @@ mod tests {
         let result = match_images(&docker, &k8s);
         assert_eq!(result.len(), 1);
         assert!(result[0].confidence >= 0.95);
-        assert_eq!(result[0].dockerfile_repo, "tts-service");
+        assert_eq!(result[0].dockerfile_repo, "backend-service");
         assert_eq!(result[0].k8s_repo, "infra-k8s-config");
     }
 
     #[test]
     fn name_only_match_lower_confidence() {
         let docker = vec![(
-            "tts-service".into(),
+            "backend-service".into(),
             vec![DockerImage {
                 image_ref: "gcr.io/example-org/myapp/tts-server".into(),
                 file: "Dockerfile".into(),

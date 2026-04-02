@@ -1,5 +1,8 @@
 # CX Architecture Document
 
+> **Current CLI:** `cx build`, `cx trace`, `cx network`, `cx add`, `cx pull`, `cx fix`, `cx mcp`.
+> Some sections below describe planned query primitives (cx_search, cx_depends, cx_resolve, cx_context, cx_impact, cx_diff) that are not yet implemented as standalone commands — their functionality is subsumed by `cx trace` and `cx network`.
+
 ## What CX Is
 
 CX is a distributed code intelligence engine that builds a complete, type-resolved map of how services communicate — across repositories, languages, and infrastructure. It answers one question with 100% accuracy:
@@ -50,8 +53,8 @@ This makes the AI agent dramatically more effective — instead of burning 50k+ 
 Inspired by [Lossless Context Management](https://papers.voltropy.com/LCM) (Voltropy, 2026), CX's graph is a precomputed, hierarchical exploration summary of a codebase's network structure. LCM demonstrates that context management is the primary bottleneck for long-horizon agentic tasks — tools like CX that pre-compute compact graph representations eliminate this bottleneck.
 
 The graph provides multiple resolution levels:
-- `cx context` → top-level service topology (condensed summary)
-- `cx path --from A --to B` → specific call chain between symbols (expanded detail)
+- `cx trace 'env:*'` → compact overview of all env vars (condensed summary)
+- `cx trace DATABASE_URL` → specific provenance chain and paths (expanded detail)
 - `cx network` → all network boundaries with provenance (full resolution)
 
 Every edge is traceable to source code. No information is lost — the graph is lossless, deterministic, and reproducible. An agent can drill from summary to detail without re-analyzing code.
@@ -113,7 +116,7 @@ Higher tiers always take precedence. If Tier 1 resolves a call, Tier 2 and 3 are
 
 5. **Single binary, optional LSP and LLM.** CX compiles to one static Rust binary. It always works standalone with tree-sitter and import-aware FQN resolution. LSP servers (ty, gopls, tsserver, jdtls, clangd) and LLM classification (Claude Haiku) enhance accuracy but are never required. CX always works standalone.
 
-6. **Distributed like git.** Each repo has a `.cx/` directory. Teams build their own graph. `cx remote add/pull/push` shares graphs. Custom parser config (`.cx/config/sinks.toml`, `.cx/config/taxonomy.toml`) is version-controlled and shareable — enabling teams to reach 100% coverage without modifying CX source code.
+6. **Distributed like git.** Each repo has a `.cx/` directory. Teams build their own graph. `cx add` / `cx pull` shares graphs. Custom parser config (`.cx/config/sinks.toml`) is version-controlled and shareable — enabling teams to reach 100% coverage without modifying CX source code.
 
 7. **Network boundaries are the primary concern.** Every incoming API and outgoing network call is detected, classified, and traced to its address source. The graph is structured around network I/O boundaries, not arbitrary code structure.
 
@@ -163,7 +166,7 @@ The on-disk graph format is identical to the in-memory representation. Loading t
 
 ### Rule 5: Parallel Everything During Indexing
 
-`cx init` and `cx add` are the only operations that are allowed to be slow (seconds, not milliseconds). But even these must be as fast as possible:
+`cx build` is the only operation that is allowed to be slow (seconds, not milliseconds). But even it must be as fast as possible:
 - **File parsing: parallel with rayon.** Each file is parsed independently. Tree-sitter parsers are per-thread (not `Send`), so use `rayon::ThreadLocal` for parser pooling.
 - **String interning: concurrent with DashMap during indexing.** After all files are parsed, freeze the concurrent map into the packed `StringInterner` format.
 - **Graph construction: single-threaded merge.** Parallel extractors produce `ExtractionResult` bags. The merge step sorts nodes by (kind, id), computes offsets, packs edges. This is a single O(N log N) sort followed by a linear scan. Do not try to parallelize the merge — it's fast enough and correctness matters more.
@@ -182,13 +185,11 @@ Every PR must maintain these benchmarks (use `criterion` crate):
 | Operation | Target | Notes |
 |-----------|--------|-------|
 | Graph load (mmap) | < 50ms | For 500MB graph file |
-| `cx_path` (5 hops, 100K nodes) | < 1ms | BFS with edge filter |
-| `cx_impact` (depth 5, 100K nodes) | < 5ms | BFS collecting all reachable |
-| `cx_search` (fuzzy, 1M symbols) | < 10ms | String interning makes this fast |
-| `cx_depends` (depth 3, 100K nodes) | < 2ms | Filtered BFS |
-| `cx_diff` (two refs, 100K nodes) | < 20ms | Set difference on node/edge IDs |
-| `cx init` (100K LOC Go repo) | < 2s | Parallel tree-sitter + extractors |
-| `cx init` (1M LOC multi-repo) | < 15s | Parallel across repos |
+| `cx trace` (5 hops, 100K nodes) | < 1ms | BFS with edge filter |
+| `cx network` (all boundaries, 100K nodes) | < 5ms | Graph scan + taint data |
+| `cx build` (100K LOC Go repo) | < 2s | Parallel tree-sitter + extractors |
+| `cx build` (1M LOC multi-repo) | < 15s | Parallel across repos |
+| `cx add` (pre-built remote graph) | < 1s | Copy + cross-repo resolution |
 
 Add `#[bench]` tests for all query functions. Use `criterion` for statistical benchmarking. **Never merge a PR that regresses a benchmark by more than 10%.** Detailed per-milestone benchmarks are specified in the Implementation Milestones section below.
 
@@ -327,7 +328,7 @@ AddressSource::ServiceDiscovery {
 
 ### Performance Target
 
-All queries must complete in under 5ms for a graph with 1 million nodes and 10 million edges. Graph loading from disk (mmap) must complete in under 50ms. `cx init` indexing must process 100,000 lines of code per second.
+All queries must complete in under 5ms for a graph with 1 million nodes and 10 million edges. Graph loading from disk (mmap) must complete in under 50ms. `cx build` indexing must process 100,000 lines of code per second.
 
 ### Format: Compressed Sparse Row (CSR)
 
@@ -662,7 +663,7 @@ impl BitVec {
 ### Parallel Indexing
 
 ```rust
-/// PERFORMANCE CRITICAL: Index files in parallel during `cx init`.
+/// PERFORMANCE CRITICAL: Index files in parallel during `cx build`.
 /// Tree-sitter parsing is CPU-bound and embarrassingly parallel.
 /// Use rayon for parallel iteration over files.
 ///
@@ -865,9 +866,9 @@ This design avoids re-opening files during classification while keeping memory u
 
 13. **SqlMigrationExtractor** — Parses SQL migration files for schema information.
 
-### Auto-Detection on `cx init`
+### Auto-Detection on `cx build`
 
-When `cx init` runs, it scans the repo and auto-detects what's inside:
+When `cx build` runs, it scans the repo and auto-detects what's inside:
 
 **Deployable detection:** Look for `main` packages (Go), Dockerfiles, Helm chart `templates/deployment.yaml`, serverless configs (`serverless.yml`, `lambda.tf`), `Procfile` entries.
 
@@ -1214,50 +1215,40 @@ struct QueryContext {
 }
 ```
 
-MCP config (auto-generated by `cx init`):
+MCP config:
 ```json
 {
   "mcpServers": {
-    "cx": {
-      "command": "cx",
-      "args": ["mcp", "--workspace", "."]
-    }
+    "cx": { "command": "cx", "args": ["mcp"] }
   }
 }
 ```
 
-Tool descriptions are specific enough that the agent knows when to use them:
-```
-tool: cx_impact
-description: "Returns all symbols, services, and resources transitively affected
-              by a change to the specified symbol. Includes config dependencies
-              from Helm charts and environment variables."
-input: { symbol_id: "string", max_depth: "int?", compare_ref: "string?" }
-```
+Current MCP tools:
+
+| Tool | What it does |
+|------|-------------|
+| `cx_path` | Trace execution flow across service boundaries |
+| `cx_network` | All network boundaries with address provenance chains |
 
 ### 2. CLI (Second Priority)
 
 Direct terminal queries for developers:
 ```bash
-cx init                              # index current repo
-cx add <path-or-url>                 # add a repo to the graph
-cx add --role infra <path-or-url>    # add infrastructure repo
-cx remote add <git-url>              # add a remote repo by git URL
-cx context [service]                 # show service structure
-cx path --from <endpoint> --downstream  # trace request flow
-cx impact <symbol>                   # show blast radius
-cx depends <service> --upstream      # show dependencies
-cx diff <branch-a> <branch-b>       # structural diff
-cx log <symbol>                      # edge history
-cx blame <edge>                      # who introduced this
-cx status                            # show index health, gaps, staleness
-cx setup claude-code                 # configure MCP for Claude Code
-cx network                           # show all network boundaries with provenance
-cx network --local-only              # skip cross-repo resolution, show only local calls
-cx network --include-all             # include low-confidence and heuristic-only results
+cx build [paths...]              # index one or more repos
+cx trace <target>                # trace lineage (env var, function, call site)
+cx trace 'env:*'                 # compact overview of all env vars
+cx network                       # all network boundaries with provenance
+cx network --local-only          # skip remote data
+cx network --include-all         # include test/vendor/low-confidence results
+cx add <path-or-git-url>         # add remote repo's pre-built graph
+cx pull                          # refresh remotes
+cx fix                           # show unresolved calls
+cx fix --init                    # generate .cx/config/sinks.toml template
+cx mcp                           # start MCP server
 ```
 
-`cx network` prints a summary header with counts of inbound endpoints, outbound calls, and cross-repo matches, followed by the detailed listing. `cx remote add` accepts a git URL and clones the repo for cross-repo resolution. The `--local-only` flag restricts output to the current repo's calls without pulling remote graphs. The `--include-all` flag disables confidence filtering to show every detected call regardless of classification tier.
+`cx network` prints a summary header with counts of inbound endpoints, outbound calls, and cross-repo matches, followed by the detailed listing. Remote network calls are filtered to only show those matching local env var reads. The `--local-only` flag restricts output to the current repo's calls. The `--include-all` flag shows all results including test/vendor files and unmatched remote data.
 
 ### 3. CI Integration (Third Priority)
 
@@ -1284,7 +1275,7 @@ Hover over a function in the editor and see cross-service dependency chain. Thir
 
 ```bash
 cd ~/code/my-service
-cx init
+cx build
 ```
 
 What happens:
@@ -1308,18 +1299,25 @@ What happens:
 ### On-Disk Directory Structure
 
 ```
-# Per-workspace (inside the repo where `cx init` was run)
+# Per-workspace (inside the repo where `cx build` was run)
 .cx/
-├── config.toml              # workspace config (repos, discovery settings)
-├── mcp.json                 # MCP server config for Claude Code auto-discovery
-└── graph/
-    ├── base.cxgraph         # main graph snapshot (the mmap'd file with header)
-    ├── delta/
-    │   ├── feature-x.delta  # delta overlay for feature/x branch
-    │   └── staging.delta    # delta overlay for staging branch
-    └── prev/                # previous extraction results per file (for incremental updates)
-        ├── abc123.bin       # keyed by file content hash, not path (handles renames)
-        └── ...
+├── config.toml              # workspace config (repos, remotes)
+├── config/
+│   └── sinks.toml           # custom network function definitions
+├── graph/
+│   ├── base.cxgraph         # unified graph (all repos + remotes merged)
+│   ├── network.json         # taint analysis results (provenance chains)
+│   ├── index.json           # global cross-repo index
+│   ├── overlay.json         # cross-repo edges
+│   └── repos/
+│       ├── 0000-my-service.cxgraph
+│       └── 0001-other-repo.cxgraph
+└── remotes/
+    ├── other-service.cxgraph      # pulled from other team
+    ├── other-service.network.json
+    ├── k8s-config.cxgraph         # pulled from infra team
+    └── clones/                    # git-cloned remotes
+        └── k8s-config/
 
 # Global (shared across all workspaces)
 ~/.cx/
@@ -1351,8 +1349,8 @@ Or skip — cx will show env vars as unresolved.
 
 | Stage | Time | Value |
 |-------|------|-------|
-| Single repo, zero config | 30 seconds | `cx context`, `cx search` — faster than grep |
-| Auto-discovered services | 2 minutes | Cross-service queries: `cx path`, `cx impact` |
+| Single repo, zero config | 30 seconds | `cx network`, `cx trace` — faster than grep |
+| Auto-discovered services | 2 minutes | Cross-service queries: `cx trace`, `cx impact` |
 | Infrastructure resolution | 5 minutes | Env vars resolve, deployment topology appears |
 | Team adoption | 30 minutes | `.cx/config.toml` committed, team shares the graph |
 | CI integration | 1 hour | Structural impact comments on every PR |
@@ -1386,7 +1384,7 @@ github_org = "acme-corp"
 auto_discover = true
 ```
 
-New engineer clones, runs `cx init`, has the full topology in under a minute.
+New engineer clones, runs `cx build`, has the full topology in under a minute.
 
 ## Error Handling Strategy
 
@@ -1405,7 +1403,7 @@ enum CxError {
     #[error("graph file version {found} not supported (expected {expected})")]
     VersionMismatch { found: u32, expected: u32 },
 
-    #[error("index not found: run `cx init` first")]
+    #[error("index not found: run 'cx build' first")]
     NoIndex,
 
     #[error("repo not found: {0}")]
@@ -1597,16 +1595,9 @@ cx/
 │       ├── query/
 │       │   ├── mod.rs
 │       │   ├── bfs.rs            # BfsState double-buffer traversal engine
-│       │   ├── path.rs           # cx_path: trace request flows
-│       │   ├── impact.rs         # cx_impact: blast radius analysis
-│       │   ├── depends.rs        # cx_depends: dependency sets
-│       │   ├── diff.rs           # cx_diff: structural diff between refs
-│       │   ├── resolve.rs        # cx_resolve: qualified name resolution with trigram search
-│       │   ├── search.rs         # cx_search: fuzzy symbol search using trigram index
-│       │   ├── trigram.rs        # Trigram index: build, serialize, query
-│       │   ├── context.rs        # cx_context: service summary
-│       │   ├── log.rs            # cx_log: edge history
-│       │   └── blame.rs          # cx_blame: edge attribution
+│       │   ├── path.rs           # PathFinder: trace request flows (cx trace)
+│       │   ├── depends.rs        # Dependency sets (upstream/downstream)
+│       │   └── trigram.rs        # Trigram index for fuzzy matching
 │       ├── git/
 │       │   ├── mod.rs
 │       │   ├── refs.rs           # Branch/tag/commit resolution
@@ -1886,15 +1877,15 @@ BENCH mmap_cold_start:
 
 ### Milestone 2: Tree-Sitter Indexing Pipeline
 
-**What to build:** Parallel file parsing with tree-sitter, the Extractor trait, and the Go language extractor. `cx init` indexes a single Go repo and builds the CSR graph.
+**What to build:** Parallel file parsing with tree-sitter, the Extractor trait, and the Go language extractor. `cx build` indexes a single Go repo and builds the CSR graph.
 
 **Deliverables:**
 - `cx-extractors` crate with `Extractor` trait
 - `TreeSitterExtractor` for Go: extracts functions, methods, types, constants, call sites, imports
 - Parallel indexing pipeline: `ignore` crate for directory walking → rayon parallel parse → merge → CSR build
 - Deployable auto-detection: find `main` packages in Go, associate with Dockerfiles
-- `cx-cli` crate: `cx init` command
-- `cx context` command: prints detected deployables, endpoints, symbols, modules
+- `cx-cli` crate: `cx build` command
+- `cx network` command: prints detected deployables, endpoints, symbols, modules
 
 **Test cases:**
 
@@ -1930,12 +1921,12 @@ TEST detect_env_var_reads:
   PASS: 2 dangling edges with env var names as unresolved references.
 
 TEST cx_init_empty_dir:
-  Run `cx init` in an empty directory.
+  Run `cx build` in an empty directory.
   PASS: exits with error message "no source files found", non-zero exit code.
 
 TEST cx_init_go_repo:
-  Run `cx init` in a Go repo with 10 files, 50 functions, 1 main package.
-  Run `cx context`.
+  Run `cx build` in a Go repo with 10 files, 50 functions, 1 main package.
+  Run `cx network`.
   PASS: output lists 1 deployable, correct function count, correct module structure.
 
 TEST parallel_correctness:
@@ -1948,15 +1939,15 @@ TEST parallel_correctness:
 ```
 BENCH index_small_repo:
   Go repo: 50 files, 5K LOC.
-  TARGET: `cx init` completes in < 500ms (including graph build and disk write).
+  TARGET: `cx build` completes in < 500ms (including graph build and disk write).
 
 BENCH index_medium_repo:
   Go repo: 500 files, 50K LOC.
-  TARGET: `cx init` completes in < 2s.
+  TARGET: `cx build` completes in < 2s.
 
 BENCH index_large_repo:
   Go repo: 5000 files, 500K LOC.
-  TARGET: `cx init` completes in < 10s.
+  TARGET: `cx build` completes in < 10s.
 
 BENCH parse_throughput:
   Parse Go files with tree-sitter in parallel.
@@ -1967,7 +1958,7 @@ BENCH extractor_throughput:
   TARGET: > 200K LOC/second (extractors should be faster than parsing).
 
 BENCH cx_context_latency:
-  Index a 50K LOC repo. Run `cx context`.
+  Index a 50K LOC repo. Run `cx network`.
   TARGET: < 5ms from command invocation to output (graph is already mmap'd).
 
 BENCH cx_search_latency:
@@ -1990,7 +1981,7 @@ BENCH index_scaling:
 
 ### Milestone 3: Cross-Repo Resolution and Path Tracing
 
-**What to build:** Proto extractor, gRPC client/server extractors, cross-repo resolution engine, `cx add`, `cx path`, `cx depends`, and the MCP server.
+**What to build:** Proto extractor, gRPC client/server extractors, cross-repo resolution engine, `cx add`, `cx trace`, `cx trace`, and the MCP server.
 
 **Deliverables:**
 - `ProtoExtractor`: parses `.proto` files, extracts service definitions, RPC methods, message types
@@ -1999,9 +1990,9 @@ BENCH index_scaling:
 - `cx-resolution` crate: matches dangling proto edges across repos
 - Multi-repo graph: single CSR graph spanning multiple repos
 - `cx add <path>` command
-- `cx path` command with `--from` and `--downstream`/`--upstream`
-- `cx depends` command
-- `cx-cli/mcp`: MCP server exposing cx_resolve, cx_path, cx_depends, cx_context, cx_search over JSON-RPC stdio
+- `cx trace` command with `--from` and `--downstream`/`--upstream`
+- `cx trace` command
+- `cx-cli/mcp`: MCP server exposing cx_path, cx_network over JSON-RPC stdio
 
 **Test cases:**
 
@@ -2023,7 +2014,7 @@ TEST grpc_server_detection_go:
 TEST cross_repo_proto_resolution:
   Repo A: Go code calling NewOrderProcessingClient().
   Repo B: Go code calling RegisterOrderProcessingServer(). Same proto.
-  cx init on A, cx add B.
+  cx build on A, cx add B.
   PASS: DependsOn edge from A's deployable to B's deployable, confidence ≥ 0.9.
   PASS: edge provenance chain: [client_stub, proto_match, server_registration].
 
@@ -2032,32 +2023,30 @@ TEST cross_repo_proto_mismatch:
   Repo B's proto has 7 fields.
   PASS: edge still created but with a warning in metadata: "proto field count mismatch".
 
-TEST cx_path_downstream:
-  3 repos: translation-server → asr-service → (terminal, no further deps).
-  translation-server has WS endpoint /ws/translate and gRPC client to asr.
-  asr-service has gRPC server registration.
-  cx path --from "WS /ws/translate" --downstream
-  PASS: output shows: /ws/translate → handleWebSocket → grpc → asr.StreamingRecognize.
-  PASS: output includes boundary_crossings with protocol=gRPC.
+TEST cx_trace_downstream:
+  3 repos: service-a → service-b → (terminal).
+  service-a has WS endpoint /ws/stream and gRPC client to service-b.
+  service-b has gRPC server registration.
+  cx trace handleWebSocket --downstream
+  PASS: output shows: handleWebSocket → grpc → service-b.StreamingRecognize.
   PASS: completeness = 1.0 (no gaps).
 
-TEST cx_path_with_gaps:
-  2 repos: translation-server has gRPC client to asr AND tts.
-  Only asr repo is indexed, tts is not.
-  cx path --from "WS /ws/translate" --downstream
-  PASS: path to asr is fully resolved.
-  PASS: gaps array contains entry for tts: { reason: "service not indexed", hint: "Synthesis proto" }.
-  PASS: completeness < 1.0.
+TEST cx_trace_with_gaps:
+  2 repos: service-a has gRPC client to service-b AND service-c.
+  Only service-b is indexed, service-c is not.
+  cx trace handleWebSocket --downstream
+  PASS: path to service-b is fully resolved.
+  PASS: path to service-c shows dangling edge.
 
-TEST cx_depends_upstream:
+TEST cx_trace_upstream:
   3 repos: A depends on B, B depends on C.
-  cx depends A --upstream
+  cx trace A --upstream
   PASS: returns empty (nothing depends on A).
-  cx depends C --upstream
+  cx trace C --upstream
   PASS: returns B and A (transitively).
 
-TEST cx_depends_downstream:
-  cx depends A --downstream
+TEST cx_trace_downstream_deps:
+  cx trace A --downstream
   PASS: returns B and C (transitively).
 
 TEST mcp_server_tool_listing:
@@ -2097,7 +2086,7 @@ TEST mcp_query_after_error:
 
 TEST extractor_parse_failure_nonfatal:
   Repo with 10 Go files. File 5 has syntax errors (invalid Go).
-  cx init.
+  cx build.
   PASS: other 9 files indexed successfully.
   PASS: cx status reports 1 parse error with file name and reason.
   PASS: graph contains symbols from the 9 good files.
@@ -2131,7 +2120,7 @@ BENCH mcp_roundtrip:
   TARGET: < 10ms for cx_path on 100K node graph.
 
 BENCH multi_repo_index:
-  5 Go repos, 200K total LOC. cx init + cx add for all 5.
+  5 Go repos, 200K total LOC. cx build + cx add for all 5.
   TARGET: < 10s total including resolution pass.
 ```
 
@@ -2518,7 +2507,7 @@ If the graph has wrong edges or missing connections, developers lose trust immed
 
 If onboarding takes more than 5 minutes, developers won't bother. "Just paste files into Claude" has zero setup cost.
 
-**Mitigation:** Progressive disclosure. `cx init` gives value in 30 seconds (single-repo search). Auto-discovery handles cross-repo in the background. Infrastructure repo is one manual step with clear prompting.
+**Mitigation:** Progressive disclosure. `cx build` gives value in 30 seconds (single-repo search). Auto-discovery handles cross-repo in the background. Infrastructure repo is one manual step with clear prompting.
 
 ### Risk: Context windows get cheaper and larger
 

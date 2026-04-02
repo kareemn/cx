@@ -218,13 +218,13 @@ mod tests {
             vec![HttpClientCall {
                 path: "/inference".into(),
                 method: "POST".into(),
-                base_url_env_var: Some("TTS_SERVICE_URL".into()),
+                base_url_env_var: Some("BACKEND_SERVICE_URL".into()),
                 file: "translator.go".into(),
                 line: 42,
             }],
         )];
         input.http_server_routes = vec![(
-            "tts-service".into(),
+            "backend-service".into(),
             vec![HttpServerRoute {
                 path: "/inference".into(),
                 method: "POST".into(),
@@ -234,11 +234,11 @@ mod tests {
             }],
         )];
 
-        // Helm env: TTS_SERVICE_URL → k8s DNS → tts-service
+        // Helm env: BACKEND_SERVICE_URL → k8s DNS → backend-service
         input.env_var_reads = vec![(
             "api-gateway".into(),
             vec![EnvVarRead {
-                var_name: "TTS_SERVICE_URL".into(),
+                var_name: "BACKEND_SERVICE_URL".into(),
                 file: "config.go".into(),
                 line: 10,
             }],
@@ -246,7 +246,7 @@ mod tests {
         input.helm_env_defs = vec![(
             "infra-k8s-config".into(),
             vec![HelmEnvDef {
-                var_name: "TTS_SERVICE_URL".into(),
+                var_name: "BACKEND_SERVICE_URL".into(),
                 value: "http://tts-server-staging.tts-server.svc.cluster.local:8000/inference".into(),
                 file: "values.yaml.gotmpl".into(),
                 line: 42,
@@ -325,13 +325,13 @@ mod tests {
             vec![HttpClientCall {
                 path: "/inference".into(),
                 method: "POST".into(),
-                base_url_env_var: Some("TTS_SERVICE_URL".into()),
+                base_url_env_var: Some("BACKEND_SERVICE_URL".into()),
                 file: "tts_client.go".into(),
                 line: 30,
             }],
         )];
         input.http_server_routes = vec![(
-            "tts-service".into(),
+            "backend-service".into(),
             vec![HttpServerRoute {
                 path: "/inference".into(),
                 method: "POST".into(),
@@ -345,7 +345,7 @@ mod tests {
         input.env_var_reads = vec![(
             "api-gateway".into(),
             vec![EnvVarRead {
-                var_name: "TTS_SERVICE_URL".into(),
+                var_name: "BACKEND_SERVICE_URL".into(),
                 file: "config.go".into(),
                 line: 10,
             }],
@@ -353,7 +353,7 @@ mod tests {
         input.helm_env_defs = vec![(
             "infra-k8s-config".into(),
             vec![HelmEnvDef {
-                var_name: "TTS_SERVICE_URL".into(),
+                var_name: "BACKEND_SERVICE_URL".into(),
                 value: "http://tts-server-staging.tts-server.svc.cluster.local:8000/inference".into(),
                 file: "values.yaml.gotmpl".into(),
                 line: 42,
@@ -362,7 +362,7 @@ mod tests {
 
         // Docker image → k8s
         input.docker_images = vec![(
-            "tts-service".into(),
+            "backend-service".into(),
             vec![image_resolution::DockerImage {
                 image_ref: "gcr.io/example-org/myapp/tts-server".into(),
                 file: "Dockerfile".into(),
