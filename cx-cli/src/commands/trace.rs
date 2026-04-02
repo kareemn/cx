@@ -17,6 +17,19 @@ pub fn run(root: &Path, target: &str, upstream_only: bool, downstream_only: bool
     // Parse target syntax — may resolve to multiple nodes (e.g. env:*)
     let targets = resolve_targets(&graph, target);
     if targets.is_empty() {
+        // Before giving up, check if network.json mentions this target in address sources.
+        // This handles env vars defined in Helm/k8s config that have no graph node
+        // (e.g. MEGATTS_URL in values.yaml.gotmpl with no corresponding os.Getenv in local code).
+        let network_calls = load_network_calls(root);
+        let provenance = find_provenance(target, &network_calls);
+        if !provenance.is_empty() {
+            println!("\x1b[1mNetwork calls referencing {}\x1b[0m \x1b[2m(from taint analysis)\x1b[0m:", target);
+            for line in &provenance {
+                println!("  {}", line);
+            }
+            return Ok(());
+        }
+
         eprintln!("Target not found: {}", target);
         let candidates = fuzzy_match(&graph, target, 5);
         if !candidates.is_empty() {
@@ -291,24 +304,18 @@ fn resolve_targets(graph: &CsrGraph, target: &str) -> Vec<(u32, String)> {
                 for call in &calls {
                     if call.callee_fqn == target || call.callee_fqn.ends_with(target) {
                         // Find the enclosing function node at call.file:call.line
-                        let mut best: Option<(u32, String, u32)> = None;
-                        for (i, n) in graph.nodes.iter().enumerate() {
-                            if n.kind != NodeKind::Symbol as u8 {
-                                continue;
-                            }
-                            let nf = graph.strings.get(n.file);
-                            if nf != call.file {
-                                continue;
-                            }
-                            if n.line <= call.line {
-                                let dist = call.line - n.line;
-                                if best.is_none() || dist < best.as_ref().unwrap().2 {
-                                    best = Some((i as u32, graph.strings.get(n.name).to_string(), dist));
-                                }
-                            }
+                        if let Some(resolved) = find_enclosing_symbol(graph, &call.file, call.line) {
+                            return vec![resolved];
                         }
-                        if let Some((idx, name, _)) = best {
-                            return vec![(idx, name)];
+                    }
+                }
+
+                // Search network.json address_source for env var / config key references
+                // (e.g. MEGATTS_URL defined in Helm values but read via os.Getenv in code)
+                for call in &calls {
+                    if mentions_target(&call.address_source, target) {
+                        if let Some(resolved) = find_enclosing_symbol(graph, &call.file, call.line) {
+                            return vec![resolved];
                         }
                     }
                 }
@@ -348,6 +355,27 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         return false;
     }
     true
+}
+
+/// Find the closest Symbol node at or before `line` in `file`. Returns (node_idx, name).
+fn find_enclosing_symbol(graph: &CsrGraph, file: &str, line: u32) -> Option<(u32, String)> {
+    let mut best: Option<(u32, String, u32)> = None;
+    for (i, n) in graph.nodes.iter().enumerate() {
+        if n.kind != NodeKind::Symbol as u8 {
+            continue;
+        }
+        let nf = graph.strings.get(n.file);
+        if nf != file {
+            continue;
+        }
+        if n.line <= line {
+            let dist = line - n.line;
+            if best.is_none() || dist < best.as_ref().unwrap().2 {
+                best = Some((i as u32, graph.strings.get(n.name).to_string(), dist));
+            }
+        }
+    }
+    best.map(|(idx, name, _)| (idx, name))
 }
 
 /// Heuristic: does this string look like an environment variable name?

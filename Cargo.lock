@@ -461,15 +461,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cx-languages"
-version = "0.1.0"
-dependencies = [
- "cx-core",
- "thiserror",
- "tree-sitter",
-]
-
-[[package]]
 name = "cx-resolution"
 version = "0.1.0"
 dependencies = [

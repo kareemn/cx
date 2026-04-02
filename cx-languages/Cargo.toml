@@ -1,9 +1,0 @@
-[package]
-name = "cx-languages"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-cx-core = { path = "../cx-core" }
-tree-sitter = { workspace = true }
-thiserror = { workspace = true }
