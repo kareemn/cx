@@ -1,7 +1,8 @@
 # CX Architecture Document
 
-> **Current CLI:** `cx build`, `cx trace`, `cx network`, `cx add`, `cx pull`, `cx fix`, `cx mcp`.
-> Some sections below describe planned query primitives (cx_search, cx_depends, cx_resolve, cx_context, cx_impact, cx_diff) that are not yet implemented as standalone commands — their functionality is subsumed by `cx trace` and `cx network`.
+> **Current CLI:** `cx build`, `cx trace`, `cx network`, `cx diff`, `cx add`, `cx pull`, `cx fix`, `cx skill`, `cx mcp`.
+> **Current MCP tools:** `cx_path`, `cx_network`, `cx_diff`, `cx_explain`.
+> Some sections below describe planned query primitives (cx_search, cx_depends, cx_resolve, cx_context, cx_impact) that are not yet implemented as standalone commands — their functionality is subsumed by `cx trace` and `cx network`.
 
 ## What CX Is
 
@@ -1230,21 +1231,27 @@ Current MCP tools:
 |------|-------------|
 | `cx_path` | Trace execution flow across service boundaries |
 | `cx_network` | All network boundaries with address provenance chains |
+| `cx_diff` | Compare current network boundaries against saved baseline |
+| `cx_explain` | Explain why a connection exists — provenance chain with code locations |
 
 ### 2. CLI (Second Priority)
 
 Direct terminal queries for developers:
 ```bash
 cx build [paths...]              # index one or more repos
+cx build --model-only            # skip static analysis, LLM classifies everything
 cx trace <target>                # trace lineage (env var, function, call site)
 cx trace 'env:*'                 # compact overview of all env vars
 cx network                       # all network boundaries with provenance
 cx network --local-only          # skip remote data
-cx network --include-all         # include test/vendor/low-confidence results
+cx diff --save                   # save baseline for future diffs
+cx diff                          # compare current vs baseline
+cx diff --branch main            # compare current vs another branch
 cx add <path-or-git-url>         # add remote repo's pre-built graph
 cx pull                          # refresh remotes
 cx fix                           # show unresolved calls
 cx fix --init                    # generate .cx/config/sinks.toml template
+cx skill                         # install Claude Code skill
 cx mcp                           # start MCP server
 ```
 
@@ -1992,7 +1999,7 @@ BENCH index_scaling:
 - `cx add <path>` command
 - `cx trace` command with `--from` and `--downstream`/`--upstream`
 - `cx trace` command
-- `cx-cli/mcp`: MCP server exposing cx_path, cx_network over JSON-RPC stdio
+- `cx-cli/mcp`: MCP server exposing cx_path, cx_network, cx_diff, cx_explain over JSON-RPC stdio
 
 **Test cases:**
 

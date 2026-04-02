@@ -106,6 +106,7 @@ cx mcp                           Start MCP server (JSON-RPC over stdio)
 cx build                         # index current directory
 cx build ./frontend ./backend    # index multiple repos together
 cx build --verbose               # show LSP + LLM classification progress
+cx build --model-only            # skip static analysis, send all calls to LLM
 ```
 
 Indexes repos with tree-sitter, runs cross-repo resolution (gRPC, REST, K8s env, Docker image, WebSocket matching), optionally upgrades heuristic calls via LSP and LLM.
@@ -154,6 +155,17 @@ cx fix                           # show what's unresolved
 cx fix --check                   # detailed view with dynamic sources
 cx fix --init                    # generate .cx/config/sinks.toml template
 ```
+
+### cx diff
+
+```bash
+cx diff --save                   # save current state as baseline
+cx diff                          # compare current vs saved baseline
+cx diff --branch main            # compare current vs another branch
+cx diff --json                   # machine-readable output
+```
+
+Shows added, removed, and changed network calls between two states. Useful for PR review: "what network boundaries did this change introduce?"
 
 ## Custom Sink Config
 
@@ -269,6 +281,13 @@ For agents that support MCP (Cursor, Gemini CLI, etc.), cx also runs as an MCP s
   }
 }
 ```
+
+| Tool | What it does |
+|------|-------------|
+| `cx_path` | Trace execution flow across service boundaries |
+| `cx_network` | All network boundaries with address provenance chains |
+| `cx_diff` | Compare current network boundaries against saved baseline |
+| `cx_explain` | Explain why a connection exists — full provenance chain with code locations |
 
 ## Architecture
 
