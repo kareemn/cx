@@ -32,6 +32,40 @@
   (#eq? @resource.name "s3")
   (#match? @_method3 "^(New|NewFromConfig)$")) @resource.def
 
+; --- Database connection pools ---
+
+; pgxpool.New(ctx, connString) — PostgreSQL via pgx
+(call_expression
+  function: (selector_expression
+    operand: (identifier) @resource.name
+    field: (field_identifier) @_method_db)
+  (#eq? @resource.name "pgxpool")
+  (#match? @_method_db "^(New|NewWithConfig)$")) @resource.def
+
+; pgx.Connect(ctx, connString) — PostgreSQL via pgx (single conn)
+(call_expression
+  function: (selector_expression
+    operand: (identifier) @resource.name
+    field: (field_identifier) @_method_db2)
+  (#eq? @resource.name "pgx")
+  (#match? @_method_db2 "^(Connect|ConnectConfig)$")) @resource.def
+
+; sql.Open(driver, dsn)
+(call_expression
+  function: (selector_expression
+    operand: (identifier) @resource.name
+    field: (field_identifier) @_method_db3)
+  (#eq? @resource.name "sql")
+  (#eq? @_method_db3 "Open")) @resource.def
+
+; mongo.Connect(ctx, opts)
+(call_expression
+  function: (selector_expression
+    operand: (identifier) @resource.name
+    field: (field_identifier) @_method_db4)
+  (#eq? @resource.name "mongo")
+  (#eq? @_method_db4 "Connect")) @resource.def
+
 ; --- OpenAI SDK as service proxy ---
 
 ; openai.NewClient(option.WithBaseURL(baseURL))

@@ -55,6 +55,14 @@ pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)], verbose: bool, cust
         }
     }
 
+    // Second pass: LLM classification may have added new network calls that now
+    // have Connects edges (from tree-sitter resource queries). Re-run resolves
+    // to link them to env var sources.
+    let resolves_added_2 = add_resolves_edges(&mut merged);
+    if resolves_added_2 > 0 {
+        eprintln!("Backward pass (post-LLM): {} additional Resolves edge(s)", resolves_added_2);
+    }
+
     Ok(pipeline::build_index(merged))
 }
 
