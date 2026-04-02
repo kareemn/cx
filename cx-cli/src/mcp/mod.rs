@@ -206,6 +206,85 @@ fn dispatch_tool(
             );
             serde_json::to_string(&report).map_err(|e| e.to_string())
         }
+        "cx_diff" => {
+            // Compare current network.json against saved baseline
+            let baseline_path = root.join(".cx").join("graph").join("network.baseline.json");
+            let current_path = root.join(".cx").join("graph").join("network.json");
+
+            if !baseline_path.exists() {
+                return Err("No baseline found. Run `cx diff --save` first.".to_string());
+            }
+            if !current_path.exists() {
+                return Err("No network.json found. Run `cx build` first.".to_string());
+            }
+
+            // Delegate to the diff module's JSON output
+            let before: Vec<cx_extractors::taint::ResolvedNetworkCall> =
+                std::fs::read_to_string(&baseline_path)
+                    .ok()
+                    .and_then(|c| serde_json::from_str(&c).ok())
+                    .unwrap_or_default();
+            let after: Vec<cx_extractors::taint::ResolvedNetworkCall> =
+                std::fs::read_to_string(&current_path)
+                    .ok()
+                    .and_then(|c| serde_json::from_str(&c).ok())
+                    .unwrap_or_default();
+
+            // Build diff inline (simple version for MCP)
+            let before_keys: std::collections::HashSet<String> = before.iter()
+                .map(|c| format!("{}:{}:{}", c.file, c.line, c.callee_fqn))
+                .collect();
+            let after_keys: std::collections::HashSet<String> = after.iter()
+                .map(|c| format!("{}:{}:{}", c.file, c.line, c.callee_fqn))
+                .collect();
+
+            let added: Vec<&str> = after_keys.difference(&before_keys).map(|s| s.as_str()).collect();
+            let removed: Vec<&str> = before_keys.difference(&after_keys).map(|s| s.as_str()).collect();
+
+            serde_json::to_string(&serde_json::json!({
+                "added": added,
+                "removed": removed,
+                "added_count": added.len(),
+                "removed_count": removed.len(),
+            }))
+            .map_err(|e| e.to_string())
+        }
+        "cx_explain" => {
+            // Explain why a network call exists — return provenance chain + code locations
+            let target = args.get("target").and_then(|v| v.as_str())
+                .ok_or("missing 'target' parameter")?;
+
+            let taint_calls = crate::commands::network::load_network_json(root);
+
+            // Find calls that mention this target
+            let mut explanations = Vec::new();
+            for call in &taint_calls {
+                let chain = crate::indexing::format_address_chain(&call.address_source);
+                if call.callee_fqn.contains(target)
+                    || call.file.contains(target)
+                    || chain.contains(target)
+                {
+                    explanations.push(serde_json::json!({
+                        "file": call.file,
+                        "line": call.line,
+                        "kind": call.net_kind.as_str(),
+                        "callee": call.callee_fqn,
+                        "confidence": format!("{:?}", call.confidence),
+                        "address_chain": chain,
+                    }));
+                }
+            }
+
+            if explanations.is_empty() {
+                return Err(format!("no network calls found matching '{}'", target));
+            }
+
+            serde_json::to_string(&serde_json::json!({
+                "target": target,
+                "matches": explanations,
+            }))
+            .map_err(|e| e.to_string())
+        }
         _ => Err(format!("unknown tool: {}", name)),
     }
 }
@@ -235,6 +314,25 @@ fn tool_definitions() -> Vec<serde_json::Value> {
                     "direction": { "type": "string", "enum": ["inbound", "outbound"], "description": "Filter by direction" },
                     "service": { "type": "string", "description": "Filter by service/deployable name" }
                 }
+            }
+        }),
+        serde_json::json!({
+            "name": "cx_diff",
+            "description": "Compare current network boundaries against a saved baseline. Shows added and removed network calls. Run `cx diff --save` first to create a baseline.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
+            "name": "cx_explain",
+            "description": "Explain why a network connection exists. Returns the full provenance chain showing how the address is resolved (env var → K8s value → service DNS), the call site location, and classification confidence.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "Symbol, env var, callee name, or file path to explain" }
+                },
+                "required": ["target"]
             }
         }),
     ]
@@ -288,7 +386,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
 
         let tools = v["result"]["tools"].as_array().unwrap();
-        assert!(tools.len() >= 2, "should have at least 2 tools");
+        assert!(tools.len() >= 4, "should have at least 4 tools");
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"cx_path"));
