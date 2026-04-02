@@ -124,6 +124,12 @@ fn extract_call_context(file_path: &str, line: u32, workspace_root: &std::path::
 /// Upgrade heuristic network calls via Claude CLI with source context.
 /// Sends function context to Haiku and asks for both classification AND target resolution.
 /// Silently skips if `claude` CLI is not available.
+/// Load natural language context from .cx/config/context.md if it exists.
+fn load_context_md(workspace_root: &std::path::Path) -> Option<String> {
+    let path = workspace_root.join(".cx").join("config").join("context.md");
+    std::fs::read_to_string(&path).ok()
+}
+
 fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetworkCall>, workspace_root: &std::path::Path, verbose: bool) {
     // Check if claude CLI is available
     let claude_check = std::process::Command::new("claude")
@@ -165,6 +171,12 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
     const RED: &str = "\x1b[31m";
     const MAGENTA: &str = "\x1b[35m";
     const RESET: &str = "\x1b[0m";
+
+    // Load natural language context if available
+    let context_md = load_context_md(workspace_root);
+    if context_md.is_some() {
+        eprintln!("  {DIM}loaded .cx/config/context.md{RESET}");
+    }
 
     let total_batches = (heuristic_indices.len() + 9) / 10;
     eprintln!(
@@ -209,6 +221,13 @@ fn upgrade_via_llm(network_calls: &mut Vec<cx_extractors::taint::ResolvedNetwork
              - Only use \"dynamic\" if truly unresolvable after following the chain\n\n\
              For 'target_source': literal|env_var|config|parameter|field|concat|service_discovery|flag|dynamic\n\n"
         );
+
+        // Inject natural language context about the codebase
+        if let Some(ref ctx) = context_md {
+            prompt.push_str("Project context (provided by the developer):\n");
+            prompt.push_str(ctx);
+            prompt.push_str("\n\n");
+        }
 
         for (batch_idx, &call_idx) in batch.iter().enumerate() {
             let call = &network_calls[call_idx];
