@@ -96,7 +96,7 @@ cx add <path_or_git_url>         Add a remote repo's pre-built graph
 cx pull                          Refresh graphs from registered remotes
 cx fix                           Show unresolved calls, generate sink config
 cx diff                          Compare graph across branches/commits
-cx skill                         Install Claude Code skill (.claude/skills/cx.md)
+cx skill                         Install Claude Code skill (.claude/skills/cx/SKILL.md)
 cx mcp                           Start MCP server (JSON-RPC over stdio)
 ```
 
@@ -252,8 +252,8 @@ cx is designed to be used by AI coding agents as much as by humans. Instead of a
 ### Skill (Claude Code)
 
 ```bash
-cx skill              # writes .claude/skills/cx.md in current repo
-cx skill --global     # writes ~/.claude/skills/cx.md for all repos
+cx skill              # writes .claude/skills/cx/SKILL.md in current repo
+cx skill --global     # writes ~/.claude/skills/cx/SKILL.md for all repos
 ```
 
 The skill teaches Claude Code when and how to use cx commands, how to interpret output, and when to drill deeper. No MCP server, no config — the agent just uses the CLI.

@@ -111,17 +111,17 @@ pub fn run(global: bool) -> Result<()> {
     let target_dir = if global {
         let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
         match home {
-            Ok(h) => Path::new(&h).join(".claude").join("skills"),
+            Ok(h) => Path::new(&h).join(".claude").join("skills").join("cx"),
             Err(_) => bail!("could not determine home directory"),
         }
     } else {
-        Path::new(".claude").join("skills")
+        Path::new(".claude").join("skills").join("cx")
     };
 
     std::fs::create_dir_all(&target_dir)
         .map_err(|e| anyhow::anyhow!("failed to create {}: {}", target_dir.display(), e))?;
 
-    let target_file = target_dir.join("cx.md");
+    let target_file = target_dir.join("SKILL.md");
     std::fs::write(&target_file, SKILL_CONTENT)
         .map_err(|e| anyhow::anyhow!("failed to write {}: {}", target_file.display(), e))?;
 
