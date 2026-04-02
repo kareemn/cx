@@ -307,7 +307,7 @@ mod tests {
 
         // Set up remote with a built graph
         std::fs::write(remote.path().join("main.go"), "package main\nfunc main() {}\n").unwrap();
-        crate::commands::build::run(remote.path(), &[], false).unwrap();
+        crate::commands::build::run(remote.path(), &[], false, false).unwrap();
 
         // Add it
         run(workspace.path(), remote.path().to_str().unwrap()).unwrap();

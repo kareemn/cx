@@ -23,6 +23,9 @@ enum Commands {
         /// Show detailed LSP and LLM classification progress
         #[arg(long, short)]
         verbose: bool,
+        /// Skip static analysis, send all calls to LLM for classification
+        #[arg(long)]
+        model_only: bool,
     },
     /// Trace the lineage of a network call or configuration variable
     #[command(after_help = "\x1b[1mTarget syntax:\x1b[0m
@@ -137,7 +140,7 @@ fn main() {
     let root = std::env::current_dir().expect("failed to get current directory");
 
     let result = match cli.command {
-        Commands::Build { ref paths, verbose } => commands::build::run(&root, paths, verbose),
+        Commands::Build { ref paths, verbose, model_only } => commands::build::run(&root, paths, verbose, model_only),
         Commands::Add { ref path } => commands::add::run(&root, path),
         Commands::Pull { ref name } => commands::add::run_pull(&root, name.as_deref()),
         Commands::Fix { init, check } => commands::fix::run(&root, init, check),

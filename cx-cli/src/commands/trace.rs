@@ -714,7 +714,7 @@ mod tests {
             "package main\n\nfunc a() { b() }\nfunc b() { c() }\nfunc c() {}\n",
         )
         .unwrap();
-        super::super::build::run(dir.path(), &[], false).unwrap();
+        super::super::build::run(dir.path(), &[], false, false).unwrap();
 
         let result = run(dir.path(), "a", false, true, 10, false);
         assert!(result.is_ok());
@@ -728,7 +728,7 @@ mod tests {
             "package main\n\nfunc a() { b() }\nfunc b() {}\n",
         )
         .unwrap();
-        super::super::build::run(dir.path(), &[], false).unwrap();
+        super::super::build::run(dir.path(), &[], false, false).unwrap();
 
         let result = run(dir.path(), "b", true, false, 10, false);
         assert!(result.is_ok());
@@ -742,7 +742,7 @@ mod tests {
             "package main\nfunc main() {}\n",
         )
         .unwrap();
-        super::super::build::run(dir.path(), &[], false).unwrap();
+        super::super::build::run(dir.path(), &[], false, false).unwrap();
 
         let result = run(dir.path(), "nonexistent", false, false, 10, false);
         assert!(result.is_ok());

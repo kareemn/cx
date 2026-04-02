@@ -10,7 +10,7 @@ use std::path::PathBuf;
 /// 2. Run resolution engine (gRPC, REST, env→Helm→k8s, Docker image, WebSocket)
 /// 3. Optionally upgrade heuristic results via LSP
 /// 4. Build the unified CSR graph
-pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)], verbose: bool, custom_sinks: &cx_extractors::custom_sinks::CustomSinkConfig) -> Result<IndexResult> {
+pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)], verbose: bool, custom_sinks: &cx_extractors::custom_sinks::CustomSinkConfig, model_only: bool) -> Result<IndexResult> {
     let mut merged = pipeline::extract_and_merge_repos(repos, custom_sinks)
         .context("failed to extract repos")?;
 
@@ -20,22 +20,29 @@ pub fn index_repos_with_resolution(repos: &[(PathBuf, u16)], verbose: bool, cust
     }
 
     // Backward pass: add Resolves edges linking network targets to their env var sources.
-    // Walks from Connects targets backward through Calls edges to find Configures (env var reads),
-    // and from Configures forward through Calls to find network sinks.
     let resolves_added = add_resolves_edges(&mut merged);
     if resolves_added > 0 {
         eprintln!("Backward pass: {} Resolves edge(s) linking env vars to network calls", resolves_added);
     }
 
-    // LSP integration: try to upgrade Heuristic network calls to TypeConfirmed
-    if !merged.network_calls.is_empty() {
-        let workspace_root = repos.first().map(|(p, _)| p.as_path());
-        if let Some(root) = workspace_root {
-            upgrade_via_lsp(&mut merged, root, verbose);
+    if model_only {
+        // In model-only mode, mark ALL network calls as Heuristic so the LLM processes them all.
+        // This skips LSP upgrade and lets us compare pure-LLM accuracy against the static pipeline.
+        for call in &mut merged.network_calls {
+            call.confidence = cx_extractors::taint::Confidence::Heuristic;
+        }
+    } else {
+        // LSP integration: try to upgrade Heuristic network calls to TypeConfirmed
+        if !merged.network_calls.is_empty() {
+            let workspace_root = repos.first().map(|(p, _)| p.as_path());
+            if let Some(root) = workspace_root {
+                upgrade_via_lsp(&mut merged, root, verbose);
+            }
         }
     }
 
-    // LLM integration: try to resolve unresolved targets via Claude CLI
+    // LLM integration: classify heuristic calls via Claude CLI
+    // In model-only mode, this processes ALL calls. In normal mode, only unresolved ones.
     if !merged.network_calls.is_empty() {
         let workspace_root = repos.first().map(|(p, _)| p.as_path());
         if let Some(root) = workspace_root {
@@ -1030,7 +1037,7 @@ func CallService() {
             (client_repo.path().to_path_buf(), 1u16),
         ];
 
-        let result = index_repos_with_resolution(&repos, false, &cx_extractors::custom_sinks::CustomSinkConfig::default()).unwrap();
+        let result = index_repos_with_resolution(&repos, false, &cx_extractors::custom_sinks::CustomSinkConfig::default(), false).unwrap();
         let graph = &result.graph;
 
         // Should have a DependsOn edge from client → server
@@ -1089,7 +1096,7 @@ spec:
         .unwrap();
 
         let repos = vec![(repo.path().to_path_buf(), 0u16)];
-        let result = index_repos_with_resolution(&repos, false, &cx_extractors::custom_sinks::CustomSinkConfig::default()).unwrap();
+        let result = index_repos_with_resolution(&repos, false, &cx_extractors::custom_sinks::CustomSinkConfig::default(), false).unwrap();
 
         // Verify the K8s env bindings were extracted
         // The resolution should find PRODUCT_CATALOG_SERVICE_ADDR → productcatalogservice:3550

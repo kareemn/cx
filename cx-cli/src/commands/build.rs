@@ -6,7 +6,7 @@ use std::time::Instant;
 ///
 /// If no paths are given, indexes the current directory (like old `cx init`).
 /// If multiple paths are given, indexes all of them with cross-repo resolution.
-pub fn run(root: &Path, paths: &[String], verbose: bool) -> Result<()> {
+pub fn run(root: &Path, paths: &[String], verbose: bool, model_only: bool) -> Result<()> {
     let start = Instant::now();
 
     // Determine which paths to index
@@ -65,7 +65,11 @@ pub fn run(root: &Path, paths: &[String], verbose: bool) -> Result<()> {
         );
     }
 
-    let result = crate::indexing::index_repos_with_resolution(&repos, verbose, &custom_sinks)?;
+    if model_only {
+        eprintln!("Mode: model-only (skipping static classification, all calls go to LLM)");
+    }
+
+    let result = crate::indexing::index_repos_with_resolution(&repos, verbose, &custom_sinks, model_only)?;
 
     let elapsed = start.elapsed();
 
@@ -162,7 +166,7 @@ mod tests {
         )
         .unwrap();
 
-        run(dir.path(), &[], false).unwrap();
+        run(dir.path(), &[], false, false).unwrap();
 
         let graph_path = dir.path().join(".cx").join("graph").join("base.cxgraph");
         assert!(graph_path.exists());
@@ -178,7 +182,7 @@ mod tests {
         )
         .unwrap();
 
-        run(dir.path(), &[".".to_string()], false).unwrap();
+        run(dir.path(), &[".".to_string()], false, false).unwrap();
 
         let graph_path = dir.path().join(".cx").join("graph").join("base.cxgraph");
         assert!(graph_path.exists());
@@ -193,7 +197,7 @@ mod tests {
         )
         .unwrap();
 
-        run(dir.path(), &[], false).unwrap();
+        run(dir.path(), &[], false, false).unwrap();
 
         let graph = crate::indexing::load_graph(dir.path()).unwrap();
         assert!(graph.node_count() > 0);
