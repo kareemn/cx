@@ -95,7 +95,8 @@ cx network                       List all network calls and exposed APIs
 cx add <path_or_git_url>         Add a remote repo's pre-built graph
 cx pull                          Refresh graphs from registered remotes
 cx fix                           Show unresolved calls, generate sink config
-cx diff                          Compare graph across branches/commits
+cx diff                          Compare network boundaries across branches/commits
+cx hook                          Manage post-commit git hook for auto-updates
 cx skill                         Install Claude Code skill (.claude/skills/cx/SKILL.md)
 cx mcp                           Start MCP server (JSON-RPC over stdio)
 ```
@@ -161,11 +162,32 @@ cx fix --init                    # generate .cx/config/sinks.toml template
 ```bash
 cx diff --save                   # save current state as baseline
 cx diff                          # compare current vs saved baseline
-cx diff --branch main            # compare current vs another branch
+cx diff --branch main            # compare current vs another branch (instant if committed)
 cx diff --json                   # machine-readable output
 ```
 
-Shows added, removed, and changed network calls between two states. Useful for PR review: "what network boundaries did this change introduce?"
+Shows added, removed, and changed network calls between two states. If `.cx/graph/network.json` is committed to git, `--branch` reads it via `git show` (instant). Otherwise falls back to a non-destructive worktree-based build.
+
+### cx hook
+
+```bash
+cx hook                          # show hook status
+cx hook --install                # install post-commit hook
+cx hook --remove                 # remove it
+```
+
+Installs `.git/hooks/post-commit` that runs `cx build` in the background after each commit. LLM results are cached in `.cx/graph/llm_cache.json` — only new/changed calls hit the API. Typical post-commit rebuild: ~2s.
+
+### What to commit
+
+`cx build` generates `.cx/.gitignore` so that `git add .cx/` picks up the right files:
+
+| Committed | Ignored |
+|-----------|---------|
+| `graph/network.json` (network calls) | `graph/repos/` (per-repo graphs) |
+| `graph/base.cxgraph` (shareable graph) | `graph/llm_cache.json` (local cache) |
+| `config/sinks.toml` (team config) | `remotes/` (pulled artifacts) |
+| `config/context.md` (team context) | `graph/index.json`, `overlay.json` |
 
 ## Custom Sink Config
 

@@ -1,6 +1,6 @@
 # CX Architecture Document
 
-> **Current CLI:** `cx build`, `cx trace`, `cx network`, `cx diff`, `cx add`, `cx pull`, `cx fix`, `cx skill`, `cx mcp`.
+> **Current CLI:** `cx build`, `cx trace`, `cx network`, `cx diff`, `cx add`, `cx pull`, `cx fix`, `cx hook`, `cx skill`, `cx mcp`.
 > **Current MCP tools:** `cx_path`, `cx_network`, `cx_diff`, `cx_explain`.
 > Some sections below describe planned query primitives (cx_search, cx_depends, cx_resolve, cx_context, cx_impact) that are not yet implemented as standalone commands — their functionality is subsumed by `cx trace` and `cx network`.
 
@@ -84,7 +84,7 @@ This tier is deterministic, fast, and requires no external dependencies. It hand
 
 For calls that Tier 1 cannot resolve (ambiguous receivers, aliased imports, dynamic dispatch), `upgrade_via_llm()` in `indexing.rs` sends source context to Claude Haiku via the `claude` CLI or the Anthropic API. The LLM receives the call site with surrounding context and returns both the call kind and target address.
 
-Results are cached in `.cx/graph/llm_cache.json` or `.cx/cache/llm_classifications.json` to avoid redundant API calls. `apply_llm_classification()` merges LLM results into the existing call data, and `LLMClassification` structs carry the LLM's response alongside the original extraction.
+Results are cached in `.cx/graph/llm_cache.json` keyed by `file:line:callee` with a hash of the source context. On subsequent builds, cached results are applied instantly — only new or changed calls hit the API. This makes post-commit rebuilds fast (~2s) even when the initial build took 15-70s for LLM classification.
 
 This tier is optional. CX never requires an API key or network access to function.
 
@@ -1251,6 +1251,8 @@ cx add <path-or-git-url>         # add remote repo's pre-built graph
 cx pull                          # refresh remotes
 cx fix                           # show unresolved calls
 cx fix --init                    # generate .cx/config/sinks.toml template
+cx hook --install                # install post-commit hook (auto-updates graph)
+cx hook --remove                 # remove it
 cx skill                         # install Claude Code skill
 cx mcp                           # start MCP server
 ```
