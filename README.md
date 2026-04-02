@@ -2,9 +2,11 @@
 
 ## Mission
 
-cx is the **structural map** for distributed systems. It finds every incoming API and outgoing network call in a codebase, traces where each connection target comes from, and maps how services connect across repos, languages, and infrastructure.
+cx is a **structural index** for distributed systems. It crawls your codebases — like a search engine crawls the web — and builds a persistent, queryable graph of every incoming API, outgoing network call, and the provenance chain connecting them. The crawl is expensive (once); queries against the index are instant (forever).
 
-cx works like git: local-first, distributed, collaborative. Each team builds their repo's graph independently. Teams add remotes to pull other repos' graphs and build the complete cross-service topology. The graph is never a static document — it's a living, compiler-derived artifact that improves with each index run and can be tuned by teams to reach 100% coverage.
+cx works like git: local-first, distributed, collaborative. Each team builds their repo's graph independently. Teams add remotes to pull other repos' graphs and build the complete cross-service topology. The graph is a living, versionable artifact that improves with each index run.
+
+The analysis that builds the graph will increasingly be AI-powered — today it's tree-sitter + taint analysis + LLM classification, tomorrow it could be a single model pass. But the graph itself, and the distributed protocol for sharing it across teams, is what makes cx irreplaceable.
 
 cx is designed to scale to **1000+ repos** across an organization.
 
@@ -23,6 +25,31 @@ grpc.Dial(addr)
 ```
 
 cx traces this entire chain: **code → env var → K8s value → DNS name → target service → exposed API.**
+
+## Why not just ask the model?
+
+A sufficiently capable model could read your codebase and answer "what connects to what." But cx answers it:
+
+- **Instantly** — sub-ms graph queries vs 5-30s model inference
+- **Exhaustively** — never skims a file or misses an edge
+- **Deterministically** — same answer every time, diffable across commits
+- **Cheaply** — zero cost per query after the one-time index build
+- **Offline** — no API keys, no rate limits, no network required
+
+cx and AI agents are complementary: cx provides the structural map, the agent provides the reasoning. The agent queries cx to understand *what* connects to *what*, then loads only the relevant files for deep reasoning about *why* and *how to change it*.
+
+## Lossless Context for AI Agents
+
+*Inspired by [Lossless Context Management](https://papers.voltropy.com/LCM) (Voltropy, 2026).*
+
+LLM agents are bottlenecked by context management — spending thousands of tokens grepping and reading files to understand how services connect. cx eliminates this by precomputing a hierarchical, deterministic graph that agents query in milliseconds via MCP.
+
+The graph provides multiple resolution levels:
+- `cx trace 'env:*'` → compact overview of all env vars (condensed summary)
+- `cx trace DATABASE_URL` → specific provenance chain (expanded detail)
+- `cx network` → all network boundaries with provenance (full resolution)
+
+Every edge is traceable to source code. No information is lost — the graph is lossless, deterministic, and reproducible. An agent drills from summary to detail without re-analyzing code.
 
 ## Quick Start
 
@@ -68,6 +95,8 @@ cx network                       List all network calls and exposed APIs
 cx add <path_or_git_url>         Add a remote repo's pre-built graph
 cx pull                          Refresh graphs from registered remotes
 cx fix                           Show unresolved calls, generate sink config
+cx diff                          Compare graph across branches/commits
+cx skill                         Install Claude Code skill (.claude/skills/cx.md)
 cx mcp                           Start MCP server (JSON-RPC over stdio)
 ```
 
@@ -145,7 +174,20 @@ addr_arg = 0
 
 Custom sinks are checked before the built-in registry (user overrides win). Short names like `pgxpool.New` match against full FQNs. Run `cx fix --init` to generate a starter template from unresolved calls.
 
+**Natural language config (planned):** Instead of structured TOML, describe your frameworks in prose via `.cx/config/context.md`. The model reads this during `cx build` and uses it as classification context:
+
+```markdown
+# .cx/config/context.md
+Our service uses pgxpool for PostgreSQL connections.
+The bus.Publish function sends messages to Kafka.
+Internal HTTP calls go through clients.NewHTTPClient.
+```
+
 ## Classification Pipeline
+
+cx is the **index**, not the analyzer. The analysis pipeline that builds the graph is pluggable — what matters is the quality and speed of the resulting graph.
+
+**Today:** tree-sitter extracts structure, then a three-tier pipeline classifies each call:
 
 ```
            ┌──────────────────────────────┐
@@ -162,6 +204,8 @@ Tier 2     │  LLM Classification          │  Optional: claude CLI
 Tier 3     │  Heuristic Fallback          │  Pattern matching
            └──────────────────────────────┘
 ```
+
+**Where this is heading:** As models get faster and cheaper, the pipeline simplifies. Tree-sitter stays (it's free and instant — it reduces what the model needs to look at), but the model becomes the primary classifier and provenance tracer. Static analysis shifts from "primary analyzer" to "ground truth validator."
 
 Every result is tagged with its confidence level:
 - `[import-resolved]` — FQN matched via import alias or custom config
@@ -201,9 +245,22 @@ cx network --local-only          # suppress remote data
 
 Remote network calls are filtered: only env vars that match local code reads are shown. Use `--include-all` for everything.
 
-## MCP Integration
+## AI Agent Integration
 
-cx runs as an MCP server for AI coding agents:
+cx is designed to be used by AI coding agents as much as by humans. Instead of an agent spending thousands of tokens grepping and reading files to understand service topology, it runs `cx trace` or `cx network` and gets the complete answer instantly.
+
+### Skill (Claude Code)
+
+```bash
+cx skill              # writes .claude/skills/cx.md in current repo
+cx skill --global     # writes ~/.claude/skills/cx.md for all repos
+```
+
+The skill teaches Claude Code when and how to use cx commands, how to interpret output, and when to drill deeper. No MCP server, no config — the agent just uses the CLI.
+
+### MCP (other agents)
+
+For agents that support MCP (Cursor, Gemini CLI, etc.), cx also runs as an MCP server:
 
 ```json
 {
@@ -212,11 +269,6 @@ cx runs as an MCP server for AI coding agents:
   }
 }
 ```
-
-| Tool | What it does |
-|------|-------------|
-| `cx_path` | Trace execution flow across service boundaries |
-| `cx_network` | All network boundaries with address provenance chains |
 
 ## Architecture
 
